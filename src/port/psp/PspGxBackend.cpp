@@ -66,7 +66,9 @@ struct PspGxTexture {
 
 PspGxState sState;
 GXFifoObj sFifo;
-u32 sGxDisplayList[262144] __attribute__((aligned(64)));
+// Match the proven OOT PSP backend's 2 MiB direct-list budget.  Transient
+// vertices returned by sceGuGetMemory live inside this same buffer.
+u32 sGxDisplayList[262144 * 2] __attribute__((aligned(64)));
 PspGxTexture sTextureCache[96];
 u32 sTextureCacheBytes;
 u32 sTextureUseCounter;
@@ -76,12 +78,14 @@ u32 sDebugVertexCount;
 u32 sDebugTexturedDrawCalls;
 u32 sDebugTextureLoads;
 u32 sDebugTextureFailures;
+u32 sDebugListSplits;
 
 const int kBufferWidth  = 512;
 const int kScreenWidth  = 480;
 const int kScreenHeight = 272;
 const int kFrameBytes   = kBufferWidth * kScreenHeight * 4;
 const u32 kTextureCacheLimit = 8 * 1024 * 1024;
+const u32 kDisplayListCommandReserve = 4096;
 
 u16 rgbaTo4444(u8 red, u8 green, u8 blue, u8 alpha)
 {
@@ -466,6 +470,25 @@ void submitVertices(PspGxVertex* vertices, u32 count, int primitive)
 	sceGuDrawArray(primitive, format, count, nullptr, vertices);
 }
 
+void reserveDisplayListMemory(u32 byteCount)
+{
+	if (!sState.listOpen) return;
+	u32 allocationSize = (byteCount + 3) & ~3U;
+	u32 requiredSize = allocationSize + 8 + kDisplayListCommandReserve;
+	if ((u32)sceGuCheckList() + requiredSize <= sizeof(sGxDisplayList)) return;
+
+	// GE state and frame/depth buffers persist across direct lists.  Waiting
+	// here also makes it safe for later transient allocations to reuse the
+	// beginning of the list without clobbering vertices still in flight.
+	sceGuFinish();
+	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+	sceGuStart(GU_DIRECT, sGxDisplayList);
+	if (sDebugListSplits < 12) {
+		OSReport("Pikmin PSP GX: continued frame in a fresh GU list (%u-byte vertex request)\n", byteCount);
+	}
+	++sDebugListSplits;
+}
+
 void loadGuPositionMatrix(u32 index)
 {
 	ScePspFMatrix4 converted = positionMatrix(sState.positionMatrices[MIN(index, 9U)]);
@@ -488,6 +511,7 @@ void GXBegin(GXPrimitive type, GXVtxFmt, u16 numVertices)
 	// Keep the original vertices followed by the expanded triangle list.  A
 	// four-vertex GX quad therefore needs room for 4 + 6 vertices, not 4 + 2.
 	u32 allocationCount = type == GX_QUADS ? (u32)numVertices + ((u32)numVertices / 4) * 6 : numVertices;
+	reserveDisplayListMemory(sizeof(PspGxVertex) * allocationCount);
 	sState.vertices = static_cast<PspGxVertex*>(sceGuGetMemory(sizeof(PspGxVertex) * allocationCount));
 }
 

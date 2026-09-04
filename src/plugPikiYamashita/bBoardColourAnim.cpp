@@ -1,6 +1,7 @@
 #include "zen/bBoardColourAnim.h"
 #include "Colour.h"
 #include "DebugLog.h"
+#include "sysMath.h"
 
 /**
  * @todo: Documentation
@@ -29,6 +30,17 @@ static inline void bBoard_readFloatArray(f32** outArray, u8*& data, u32 size)
 	for (u32 i = 0; i < size; i++) {
 		data += 4;
 	}
+}
+
+static inline f32 bBoard_readFloatValue(const f32* values, u32 index)
+{
+#if defined(PLATFORM_PSP)
+	const u8* data = reinterpret_cast<const u8*>(values) + index * sizeof(f32);
+	u32 bits       = (u32(data[0]) << 24) | (u32(data[1]) << 16) | (u32(data[2]) << 8) | u32(data[3]);
+	return u32ToFloat(bits);
+#else
+	return values[index];
+#endif
 }
 
 static inline void bBoard_readColourArray(Colour** outVal, u8*& data, u32 size)
@@ -71,8 +83,8 @@ void zen::bBoardColourAnimData::set(u8* data)
  */
 void zen::bBoardColourAnim::update(f32 timeStep, Colour* primColor, Colour* envColor)
 {
-	f32 currThresh = (mDuration - 1) * mAnimData->mFrameThresholds[mCurrentFrame];
-	f32 nextThresh = (mDuration - 1) * mAnimData->mFrameThresholds[mCurrentFrame + 1];
+	f32 currThresh = (mDuration - 1) * bBoard_readFloatValue(mAnimData->mFrameThresholds, mCurrentFrame);
+	f32 nextThresh = (mDuration - 1) * bBoard_readFloatValue(mAnimData->mFrameThresholds, mCurrentFrame + 1);
 	f32 t          = (mProgress - currThresh) / (nextThresh - currThresh);
 
 	if (t > 1.0f) {

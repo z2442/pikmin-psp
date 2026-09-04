@@ -24,21 +24,160 @@ static u8 lpsCoord[8] ATTRIBUTE_ALIGN(32) = {
 	0, 0, 1, 0, 1, 1, 0, 1,
 };
 
+static inline u16 readDDF_BE16(const u8* data)
+{
+#if defined(PLATFORM_PSP)
+	return (u16(data[0]) << 8) | u16(data[1]);
+#else
+	return *reinterpret_cast<const u16*>(data);
+#endif
+}
+
+static inline u32 readDDF_BE32(const u8* data)
+{
+#if defined(PLATFORM_PSP)
+	return (u32(data[0]) << 24) | (u32(data[1]) << 16) | (u32(data[2]) << 8) | u32(data[3]);
+#else
+	return *reinterpret_cast<const u32*>(data);
+#endif
+}
+
+static inline f32 readDDF_BEFloat(const u8* data)
+{
+	return u32ToFloat(readDDF_BE32(data));
+}
+
+static inline f32 readDDF_ArrayFloat(const f32* values, u32 index)
+{
+#if defined(PLATFORM_PSP)
+	return readDDF_BEFloat(reinterpret_cast<const u8*>(values) + index * sizeof(f32));
+#else
+	return values[index];
+#endif
+}
+
+#if defined(PLATFORM_PSP)
+static inline bool particleVfpuNormalize(Vector3f& vec)
+{
+	u32 lengthSquaredBits;
+	__asm__ volatile(
+	    ".set push\n"
+	    ".set noreorder\n"
+	    "lv.s S000, 0(%[vec])\n"
+	    "lv.s S001, 4(%[vec])\n"
+	    "lv.s S002, 8(%[vec])\n"
+	    "vdot.t S010, C000, C000\n"
+	    "mfv %[lengthSquared], S010\n"
+	    ".set pop\n"
+	    : [lengthSquared] "=r"(lengthSquaredBits)
+	    : [vec] "r"(&vec)
+	    : "memory");
+
+	// Treat zero, denormal, infinity, and NaN as non-normalisable without
+	// passing them through the scalar FPU, whose IUO exception is enabled.
+	u32 exponent = lengthSquaredBits & 0x7F800000;
+	if (exponent == 0 || exponent == 0x7F800000) {
+		return false;
+	}
+
+	__asm__ volatile(
+	    ".set push\n"
+	    ".set noreorder\n"
+	    "lv.s S000, 0(%[vec])\n"
+	    "lv.s S001, 4(%[vec])\n"
+	    "lv.s S002, 8(%[vec])\n"
+	    "mtv %[lengthSquared], S010\n"
+	    "vrsq.s S010, S010\n"
+	    "vscl.t C000, C000, S010\n"
+	    "sv.s S000, 0(%[vec])\n"
+	    "sv.s S001, 4(%[vec])\n"
+	    "sv.s S002, 8(%[vec])\n"
+	    ".set pop\n"
+	    :
+	    : [vec] "r"(&vec), [lengthSquared] "r"(lengthSquaredBits)
+	    : "memory");
+	return true;
+}
+
+static inline void particleVfpuAdd(Vector3f& dest, immut Vector3f& addend)
+{
+	__asm__ volatile(
+	    ".set push\n"
+	    ".set noreorder\n"
+	    "lv.s S000, 0(%[dest])\n"
+	    "lv.s S001, 4(%[dest])\n"
+	    "lv.s S002, 8(%[dest])\n"
+	    "lv.s S010, 0(%[addend])\n"
+	    "lv.s S011, 4(%[addend])\n"
+	    "lv.s S012, 8(%[addend])\n"
+	    "vadd.t C000, C000, C010\n"
+	    "sv.s S000, 0(%[dest])\n"
+	    "sv.s S001, 4(%[dest])\n"
+	    "sv.s S002, 8(%[dest])\n"
+	    ".set pop\n"
+	    :
+	    : [dest] "r"(&dest), [addend] "r"(&addend)
+	    : "memory");
+}
+
+static inline void particleVfpuClear(Vector3f& vec)
+{
+	__asm__ volatile(
+	    "vzero.t C000\n"
+	    "sv.s S000, 0(%[vec])\n"
+	    "sv.s S001, 4(%[vec])\n"
+	    "sv.s S002, 8(%[vec])\n"
+	    :
+	    : [vec] "r"(&vec)
+	    : "memory");
+}
+
+static inline void particleVfpuIntegrate(Vector3f& velocity, immut Vector3f& acceleration, Vector3f& position, f32 drag)
+{
+	__asm__ volatile(
+	    ".set push\n"
+	    ".set noreorder\n"
+	    "lv.s S000, 0(%[velocity])\n"
+	    "lv.s S001, 4(%[velocity])\n"
+	    "lv.s S002, 8(%[velocity])\n"
+	    "lv.s S010, 0(%[acceleration])\n"
+	    "lv.s S011, 4(%[acceleration])\n"
+	    "lv.s S012, 8(%[acceleration])\n"
+	    "lv.s S020, 0(%[position])\n"
+	    "lv.s S021, 4(%[position])\n"
+	    "lv.s S022, 8(%[position])\n"
+	    "lv.s S030, 0(%[drag])\n"
+	    "vscl.t C000, C000, S030\n"
+	    "vadd.t C000, C000, C010\n"
+	    "vadd.t C020, C020, C000\n"
+	    "sv.s S000, 0(%[velocity])\n"
+	    "sv.s S001, 4(%[velocity])\n"
+	    "sv.s S002, 8(%[velocity])\n"
+	    "sv.s S020, 0(%[position])\n"
+	    "sv.s S021, 4(%[position])\n"
+	    "sv.s S022, 8(%[position])\n"
+	    ".set pop\n"
+	    :
+	    : [velocity] "r"(&velocity), [acceleration] "r"(&acceleration), [position] "r"(&position), [drag] "r"(&drag)
+	    : "memory");
+}
+#endif
+
 static inline void readDDF_U32(u32* outVal, u8*& data, u32 size)
 {
-	*outVal = *((u32*)data);
+	*outVal = readDDF_BE32(data);
 	data += size;
 }
 
 static inline void readDDF_Vector(Vector3f* outVec, u8*& data)
 {
-	outVec->set(u32ToFloat(((u32*)data)[0]), u32ToFloat(((u32*)data)[1]), u32ToFloat(((u32*)data)[2]));
+	outVec->set(readDDF_BEFloat(data), readDDF_BEFloat(data + 4), readDDF_BEFloat(data + 8));
 	data += sizeof(Vector3f);
 }
 
 static inline void readDDF_Float(f32* outVal, u8*& data, u32 size)
 {
-	*outVal = u32ToFloat(((u32*)data)[0]);
+	*outVal = readDDF_BEFloat(data);
 	data += size;
 }
 
@@ -58,7 +197,7 @@ static inline void readDDF_FloatArray(f32** outArray, u8*& data, u32 size)
 
 static inline void readDDF_Short(s16* outVal, u8*& data, u32 size)
 {
-	*outVal = *(s16*)data;
+	*outVal = s16(readDDF_BE16(data));
 	data += size;
 }
 
@@ -93,8 +232,8 @@ void zen::particleGenerator::init(u8* data, Texture* tex1, Texture* tex2, immut 
 			mDrawCallBack = &particleGenerator::drawPtclBillboard;
 		} else {
 			STACK_PAD_VAR(1);
-			mLengthScale  = u32ToFloat(((u32*)data)[2]);
-			mPivotOffsetY = u32ToFloat(((u32*)data)[3]);
+			mLengthScale  = readDDF_BEFloat(data + 8);
+			mPivotOffsetY = readDDF_BEFloat(data + 12);
 			mAnimData.set(&data[16]);
 
 #if defined(VERSION_GPIJ01) || defined(VERSION_DPIJ01_PIKIDEMO)
@@ -154,7 +293,7 @@ void zen::particleGenerator::init(u8* data, Texture* tex1, Texture* tex2, immut 
 			}
 		}
 
-		pmSetDDF(&data[((u16*)data)[2]]);
+		pmSetDDF(&data[readDDF_BE16(data + 4)]);
 		mMdlMgr  = mdlMgr;
 		mEmitPos = pos;
 		setCallBack(cb1, cb2);
@@ -349,8 +488,15 @@ void zen::particleGenerator::pmSetDDF(u8* data)
 		readDDF_U8(&mChildSpawnInterval, data, 3);
 	}
 
+#if !defined(PLATFORM_PSP)
 	f32 len;
+#endif
 	if (mParticleFlags & PTCLFLAG_UseVortexField) {
+#if defined(PLATFORM_PSP)
+		if (!particleVfpuNormalize(mVortexCenter)) {
+			pmGetArbitUnitVec(mVortexCenter);
+		}
+#else
 		len = mVortexCenter.x * mVortexCenter.x + mVortexCenter.y * mVortexCenter.y + mVortexCenter.z * mVortexCenter.z;
 		if (len == 0.0f) {
 			pmGetArbitUnitVec(mVortexCenter);
@@ -360,9 +506,15 @@ void zen::particleGenerator::pmSetDDF(u8* data)
 			mVortexCenter.y /= len;
 			mVortexCenter.z /= len;
 		}
+#endif
 	}
 
 	if (mParticleFlags & PTCLFLAG_UseLineField) {
+#if defined(PLATFORM_PSP)
+		if (!particleVfpuNormalize(mLineFieldAxis)) {
+			pmGetArbitUnitVec(mLineFieldAxis);
+		}
+#else
 		len = mLineFieldAxis.x * mLineFieldAxis.x + mLineFieldAxis.y * mLineFieldAxis.y + mLineFieldAxis.z * mLineFieldAxis.z;
 		if (len == 0.0f) {
 			pmGetArbitUnitVec(mLineFieldAxis);
@@ -372,6 +524,7 @@ void zen::particleGenerator::pmSetDDF(u8* data)
 			mLineFieldAxis.y /= len;
 			mLineFieldAxis.z /= len;
 		}
+#endif
 	}
 
 	mScaleRate1 = (mScaleThreshold1 == 0.0f) ? 1.0f : (1.0f - mMinScaleFactor1) / mScaleThreshold1;
@@ -389,10 +542,10 @@ void zen::particleGenerator::pmSetDDF(u8* data)
 f32 zen::particleGenerator::pmIntpManual(f32* frameThresholds, f32* values)
 {
 	int i;
-	for (i = 1; mCurrentFrame > mMaxFrame * frameThresholds[i]; i++) {
+	for (i = 1; mCurrentFrame > mMaxFrame * readDDF_ArrayFloat(frameThresholds, i); i++) {
 		;
 	}
-	return values[i - 1];
+	return readDDF_ArrayFloat(values, i - 1);
 }
 
 /**
@@ -403,11 +556,14 @@ f32 zen::particleGenerator::pmIntpLinear(f32* frameThresholds, f32* values)
 {
 	int i;
 	f32 ratio = f32(mCurrentFrame) / f32(mMaxFrame);
-	for (i = 1; ratio > frameThresholds[i]; i++) {
+	for (i = 1; ratio > readDDF_ArrayFloat(frameThresholds, i); i++) {
 		;
 	}
-	return (values[i] * (ratio - frameThresholds[i - 1]) + values[i - 1] * (frameThresholds[i] - ratio))
-	     / (frameThresholds[i] - frameThresholds[i - 1]);
+	f32 previousThreshold = readDDF_ArrayFloat(frameThresholds, i - 1);
+	f32 nextThreshold     = readDDF_ArrayFloat(frameThresholds, i);
+	return (readDDF_ArrayFloat(values, i) * (ratio - previousThreshold)
+	        + readDDF_ArrayFloat(values, i - 1) * (nextThreshold - ratio))
+	     / (nextThreshold - previousThreshold);
 }
 
 /**
@@ -467,6 +623,11 @@ void zen::particleGenerator::PtclsGen(zen::particleMdl* ptcl)
 	emitDir.x = mEmitDir.x;
 	emitDir.y = mEmitDir.y;
 	emitDir.z = mEmitDir.z;
+#if defined(PLATFORM_PSP)
+	if (!particleVfpuNormalize(emitDir)) {
+		pmGetArbitUnitVec(emitDir);
+	}
+#else
 	scale     = emitDir.x * emitDir.x + emitDir.y * emitDir.y + emitDir.z * emitDir.z;
 	if (scale == 0.0f) {
 		pmGetArbitUnitVec(emitDir);
@@ -476,6 +637,7 @@ void zen::particleGenerator::PtclsGen(zen::particleMdl* ptcl)
 		emitDir.y /= scale;
 		emitDir.z /= scale;
 	}
+#endif
 
 	tmp4.x = mEmissionBoxSize.x;
 	tmp4.y = mEmissionBoxSize.y;
@@ -540,7 +702,11 @@ void zen::particleGenerator::PtclsGen(zen::particleMdl* ptcl)
 			ptclVel.y = emitDir.y + tmp5.y;
 			ptclVel.z = emitDir.z + tmp5.z;
 
+#if defined(PLATFORM_PSP)
+			particleVfpuNormalize(ptclVel);
+#else
 			ptclVel.normalize();
+#endif
 
 			scale = initVel + RandShift(initVel * mInitialVelocityJitter);
 			ptclVel.x *= scale;
@@ -628,7 +794,11 @@ void zen::particleGenerator::PtclsGen(zen::particleMdl* ptcl)
 		}
 	}
 
+#if defined(PLATFORM_PSP)
+	particleVfpuAdd(ptclVel, mEmitVelocity);
+#else
 	ptclVel.add(mEmitVelocity);
+#endif
 
 	ptcl->mLocalPosition.x = ptclPos.x;
 	ptcl->mLocalPosition.y = ptclPos.y;
@@ -796,11 +966,18 @@ void zen::particleGenerator::UpdatePtclsStatus(f32 timeStep)
 		if (ptcl->mAge + 1 >= ptcl->mLifeTime) {
 			pmPutParticle(ptcl);
 		} else {
+#if defined(PLATFORM_PSP)
+			particleVfpuClear(ptcl->mAcceleration);
+#else
 			ptcl->mAcceleration.x = ptcl->mAcceleration.y = ptcl->mAcceleration.z = 0.0f;
+#endif
 			if (ptcl->mAge >= mFreePtclMotionTime) {
 				pmCalcAccel(ptcl);
 			}
 
+#if defined(PLATFORM_PSP)
+			particleVfpuIntegrate(ptcl->mVelocity, ptcl->mAcceleration, ptcl->mLocalPosition, dragFactor);
+#else
 			ptcl->mVelocity.x *= dragFactor;
 			ptcl->mVelocity.y *= dragFactor;
 			ptcl->mVelocity.z *= dragFactor;
@@ -808,6 +985,7 @@ void zen::particleGenerator::UpdatePtclsStatus(f32 timeStep)
 			ptcl->mVelocity.x += ptcl->mAcceleration.x;
 			ptcl->mVelocity.y += ptcl->mAcceleration.y;
 			ptcl->mVelocity.z += ptcl->mAcceleration.z;
+#endif
 
 			if (mParticleFlags & PTCLFLAG_ClampVelocity) {
 				f32 speed
@@ -820,9 +998,11 @@ void zen::particleGenerator::UpdatePtclsStatus(f32 timeStep)
 				}
 			}
 
+#if !defined(PLATFORM_PSP)
 			ptcl->mLocalPosition.x += ptcl->mVelocity.x;
 			ptcl->mLocalPosition.y += ptcl->mVelocity.y;
 			ptcl->mLocalPosition.z += ptcl->mVelocity.z;
+#endif
 
 			f32 normalisedAge = f32(ptcl->mAge) / f32(ptcl->mLifeTime);
 			if (normalisedAge < mScaleThreshold1) {
