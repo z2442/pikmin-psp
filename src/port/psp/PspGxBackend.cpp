@@ -4,6 +4,7 @@
 #include <pspgu.h>
 #include <pspgum.h>
 #include <pspdisplay.h>
+#include <pspge.h>
 #include <pspkernel.h>
 
 #include <malloc.h>
@@ -442,6 +443,15 @@ ScePspFMatrix4 positionMatrix(const Mtx source)
 	return result;
 }
 
+ScePspFMatrix4 identityMatrix()
+{
+	ScePspFMatrix4 result;
+	f32* output = reinterpret_cast<f32*>(&result);
+	memset(output, 0, sizeof(result));
+	output[0] = output[5] = output[10] = output[15] = 1.0f;
+	return result;
+}
+
 void submitVertices(PspGxVertex* vertices, u32 count, int primitive)
 {
 	if (!vertices || count == 0) {
@@ -459,8 +469,9 @@ void submitVertices(PspGxVertex* vertices, u32 count, int primitive)
 void loadGuPositionMatrix(u32 index)
 {
 	ScePspFMatrix4 converted = positionMatrix(sState.positionMatrices[MIN(index, 9U)]);
-	sceGumMatrixMode(GU_MODEL);
-	sceGumLoadMatrix(&converted);
+	// Draws are submitted with sceGuDrawArray, not sceGumDrawArray.  Send the
+	// matrix directly to the GE rather than only updating GUM's software stack.
+	sceGuSetMatrix(GU_MODEL, &converted);
 }
 
 } // namespace
@@ -554,8 +565,8 @@ void PspGXEnd(void)
 {
 	if (!sState.inPrimitive) return;
 	if (sState.verticesPretransformed) {
-		sceGumMatrixMode(GU_MODEL);
-		sceGumLoadIdentity();
+		ScePspFMatrix4 identity = identityMatrix();
+		sceGuSetMatrix(GU_MODEL, &identity);
 	}
 	if (sState.primitive == GX_QUADS) {
 		u32 sourceCount = sState.vertexCount;
@@ -586,6 +597,7 @@ GXFifoObj* GXInit(void*, u32)
 	sState.clearColour = 0xff000000;
 	sState.clearDepth = 0;
 	sceGuInit();
+	sceDisplaySetMode(0, kScreenWidth, kScreenHeight);
 	sceGuStart(GU_DIRECT, sGxDisplayList);
 	sceGuDrawBuffer(GU_PSM_8888, (void*)0, kBufferWidth);
 	sceGuDispBuffer(kScreenWidth, kScreenHeight, (void*)kFrameBytes, kBufferWidth);
@@ -597,8 +609,23 @@ GXFifoObj* GXInit(void*, u32)
 	sceGuEnable(GU_SCISSOR_TEST);
 	sceGuShadeModel(GU_SMOOTH);
 	sceGuFrontFace(GU_CW);
+	// Match the working OOT PSP renderer: sceGuDrawArray consumes GE matrix
+	// state directly, so initialise it with sceGuSetMatrix rather than GUM's
+	// deferred software stacks.
+	ScePspFMatrix4 identity = identityMatrix();
+	sceGuSetMatrix(GU_PROJECTION, &identity);
+	sceGuSetMatrix(GU_VIEW, &identity);
+	sceGuSetMatrix(GU_MODEL, &identity);
+	sceGuFinish();
+	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+	sceDisplayWaitVblankStart();
+	sceGuDisplay(GU_TRUE);
+	void* displayBuffer = reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(sceGeEdramGetAddr()) | 0x40000000U) + kFrameBytes);
+	sceDisplaySetFrameBuf(displayBuffer, kBufferWidth, GU_PSM_8888, PSP_DISPLAY_SETBUF_NEXTFRAME);
+	sceGuStart(GU_DIRECT, sGxDisplayList);
 	sState.guInitialised = true;
 	sState.listOpen = true;
+	sState.displayEnabled = true;
 	for (u32 i = 0; i < ARRAY_SIZE(sState.positionMatrices); ++i) {
 		memset(sState.positionMatrices[i], 0, sizeof(Mtx));
 		sState.positionMatrices[i][0][0] = 1.0f;
@@ -611,8 +638,7 @@ GXFifoObj* GXInit(void*, u32)
 void GXSetProjection(const Mtx44 matrix, GXProjectionType)
 {
 	ScePspFMatrix4 converted = projectionMatrix(matrix);
-	sceGumMatrixMode(GU_PROJECTION);
-	sceGumLoadMatrix(&converted);
+	sceGuSetMatrix(GU_PROJECTION, &converted);
 	sState.transform3D = true;
 }
 
