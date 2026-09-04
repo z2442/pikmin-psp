@@ -813,6 +813,31 @@ KSegment::KSegment()
 
 f32 gs_fTolerance = 0.00001f;
 
+#if defined(PLATFORM_PSP)
+static f32 sqrDistancePointSegmentSafe(immut Vector3f& point, immut Vector3f& origin, immut Vector3f& direction, f32* outT)
+{
+	f32 directionLengthSquared = direction.squaredLength();
+	f32 t                      = 0.0f;
+
+	if (directionLengthSquared >= gs_fTolerance) {
+		Vector3f originToPoint = point - origin;
+		t                      = originToPoint.DP(direction) / directionLengthSquared;
+		if (t < 0.0f) {
+			t = 0.0f;
+		} else if (t > 1.0f) {
+			t = 1.0f;
+		}
+	}
+
+	if (outT) {
+		*outT = t;
+	}
+
+	Vector3f difference = point - (origin + direction * t);
+	return difference.squaredLength();
+}
+#endif
+
 /**
  * @todo: Documentation
  */
@@ -1325,6 +1350,35 @@ f32 sqrDistance(KSegment& segment1, KSegment& segment2, f32* outP3, f32* outP4)
 	f32 sqrLenSeg2        = segment2.Direction().squaredLength();
 	f32 dotOrigToOrigSeg1 = origToOrig.DP(segment1.Direction());
 	f32 sqrDistOrigToOrig = origToOrig.squaredLength();
+
+#if defined(PLATFORM_PSP)
+	// Collision meshes can contain collapsed edges. The original algorithm
+	// assumes both directions are non-zero and otherwise divides by their
+	// squared lengths in its parallel-segment path.
+	if (sqrLenSeg1 < gs_fTolerance) {
+		f32 segment2T;
+		f32 sqrDist = sqrDistancePointSegmentSafe(segment1.Origin(), segment2.Origin(), segment2.Direction(), &segment2T);
+		if (outP3) {
+			*outP3 = 0.0f;
+		}
+		if (outP4) {
+			*outP4 = segment2T;
+		}
+		return sqrDist;
+	}
+
+	if (sqrLenSeg2 < gs_fTolerance) {
+		f32 segment1T;
+		f32 sqrDist = sqrDistancePointSegmentSafe(segment2.Origin(), segment1.Origin(), segment1.Direction(), &segment1T);
+		if (outP3) {
+			*outP3 = segment1T;
+		}
+		if (outP4) {
+			*outP4 = 0.0f;
+		}
+		return sqrDist;
+	}
+#endif
 
 	f32 absDet = absF(sqrLenSeg1 * sqrLenSeg2 - dotSegSeg * dotSegSeg);
 
@@ -2474,6 +2528,42 @@ f32 sqrDistance(immut Vector3f& point, KTri& tri, f32* outBaryU, f32* outBaryV)
 	f32 absDet             = absF(sqrLenEdge0 * sqrLenEdge1 - dotEdge0Edge1 * dotEdge0Edge1);
 	f32 u                  = dotEdge0Edge1 * dotDirEdge1 - sqrLenEdge1 * dotDirEdge0;
 	f32 v                  = dotEdge0Edge1 * dotDirEdge0 - sqrLenEdge0 * dotDirEdge1;
+
+#if defined(PLATFORM_PSP)
+	// A zero-area triangle has no invertible barycentric basis. Measure
+	// against all three edges instead; the helper also handles point edges.
+	if (absDet < gs_fTolerance) {
+		f32 edgeT;
+		f32 bestU    = 0.0f;
+		f32 bestV    = 0.0f;
+		f32 bestDist = sqrDistancePointSegmentSafe(point, tri.Origin(), tri.Edge0(), &edgeT);
+		bestU        = edgeT;
+
+		f32 edgeDist = sqrDistancePointSegmentSafe(point, tri.Origin(), tri.Edge1(), &edgeT);
+		if (edgeDist < bestDist) {
+			bestDist = edgeDist;
+			bestU    = 0.0f;
+			bestV    = edgeT;
+		}
+
+		Vector3f edgeOrigin    = tri.Origin() + tri.Edge0();
+		Vector3f edgeDirection = tri.Edge1() - tri.Edge0();
+		edgeDist               = sqrDistancePointSegmentSafe(point, edgeOrigin, edgeDirection, &edgeT);
+		if (edgeDist < bestDist) {
+			bestDist = edgeDist;
+			bestU    = 1.0f - edgeT;
+			bestV    = edgeT;
+		}
+
+		if (outBaryU) {
+			*outBaryU = bestU;
+		}
+		if (outBaryV) {
+			*outBaryV = bestV;
+		}
+		return bestDist;
+	}
+#endif
 
 	f32 sqrDist;
 	if (u + v <= absDet) {

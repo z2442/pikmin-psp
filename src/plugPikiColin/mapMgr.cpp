@@ -2045,7 +2045,19 @@ f32 MapMgr::findEdgePenetration(CollTriInfo& tri, immut Vector3f* vertexList, im
 			Vector3f edgeVec = edgeEnd - edgeStart;
 			f32 edgeSqrLen   = edgeVec.x * edgeVec.x + edgeVec.y * edgeVec.y + edgeVec.z * edgeVec.z;
 			// calc normalised edge parameter - between 0 and 1 = edge point is closest; < 0 or > 1 = vertex is closest
-			f32 t = edgeVec.DP(sphereCenter - edgeStart) / edgeSqrLen;
+			f32 t = -1.0f;
+#if defined(PLATFORM_PSP)
+			union {
+				f32 value;
+				u32 bits;
+			} edgeLength = { edgeSqrLen };
+			u32 edgeLengthMagnitude = edgeLength.bits & 0x7FFFFFFF;
+			if (edgeLengthMagnitude >= 0x3727C5AC && edgeLengthMagnitude < 0x7F800000) {
+				t = edgeVec.DP(sphereCenter - edgeStart) / edgeSqrLen;
+			}
+#else
+			t = edgeVec.DP(sphereCenter - edgeStart) / edgeSqrLen;
+#endif
 			if (t >= 0.0f && t < 1.0f) {
 				// closest point is on an edge - get the position
 				Vector3f edgePos(edgeVec.x * t + edgeStart.x, edgeVec.y * t + edgeStart.y, edgeVec.z * t + edgeStart.z);

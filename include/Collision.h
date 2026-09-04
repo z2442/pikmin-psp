@@ -324,6 +324,18 @@ public:
 
 	bool inTriClampTo(Vector3f& pos)
 	{
+#if defined(PLATFORM_PSP)
+		union {
+			f32 value;
+			u32 bits;
+		} normalY = { mTriangle.mNormal.y };
+		u32 normalYMagnitude = normalY.bits & 0x7FFFFFFF;
+		// Vertical and invalid planes cannot provide a unique ground height.
+		// Reject them before the PSP scalar FPU sees a zero/denormal divisor.
+		if (normalYMagnitude < 0x3727C5AC || normalYMagnitude >= 0x7F800000) {
+			return false;
+		}
+#endif
 		pos.y      = -(pos.x * mTriangle.mNormal.x + pos.z * mTriangle.mNormal.z - mTriangle.mOffset) / mTriangle.mNormal.y;
 		bool inTri = true;
 		for (int i = 0; inTri && i < 3; i++) {
