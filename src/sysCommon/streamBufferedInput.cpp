@@ -69,6 +69,21 @@ void BufferedInputStream::read(void* input, int size)
 	while (size != 0) {
 		fillBuffer();
 		int diff     = mRemainingBytes - mCurrentBufferPos;
+		if (diff <= 0) {
+#if defined(PLATFORM_PSP)
+			// Some disc resources rely on the zero padding following their
+			// logical EOF.  The original DVD layer could satisfy that aligned
+			// read, while a normal PSP file ends exactly at its reported size.
+			// Returning padding also guarantees forward progress instead of
+			// repeatedly issuing a zero-byte sceIoRead forever.
+			OSReport("Pikmin PSP: zero-padding read past EOF in %s (%d bytes)\n", mPath ? mPath : "<unknown>", size);
+			memset(buf, 0, size);
+			mPosition += size;
+			return;
+#else
+			return;
+#endif
+		}
 		int copySize = size;
 		if (copySize > diff) {
 			copySize = diff;

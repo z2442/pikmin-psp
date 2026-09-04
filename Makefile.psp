@@ -1,0 +1,75 @@
+PSPSDK := $(shell psp-config --pspsdk-path)
+PSPDEV := $(shell psp-config --pspdev-path)
+
+PSP_BUILD ?= bootstrap
+
+ifeq ($(PSP_BUILD),game)
+BUILD_DIR := build/psp/GPIE01_01-game
+PSP_ENTRY_SOURCE := src/port/psp/game_main.cpp
+PSP_GAME_SOURCES := \
+	src/sysBootup.cpp \
+	$(wildcard src/sysCommon/*.cpp) \
+	$(wildcard src/sysDolphin/*.cpp) \
+	$(wildcard src/plugPikiColin/*.cpp) \
+	$(wildcard src/plugPikiKando/*.cpp) \
+	$(wildcard src/plugPikiNakata/*.cpp) \
+	$(wildcard src/plugPikiNishimura/*.cpp) \
+	$(wildcard src/plugPikiOgawa/*.cpp) \
+	$(wildcard src/plugPikiYamashita/*.cpp)
+PSP_EBOOT_TITLE := Pikmin PSP Game (GPIE01_01, Experimental)
+else
+BUILD_DIR := build/psp/GPIE01_01
+PSP_ENTRY_SOURCE := src/port/psp/main.cpp
+PSP_GAME_SOURCES :=
+PSP_EBOOT_TITLE := Pikmin PSP Port (GPIE01_01)
+endif
+
+TARGET := $(BUILD_DIR)/pikmin-psp
+PSP_EBOOT := $(BUILD_DIR)/EBOOT.PBP
+PSP_EBOOT_SFO := $(BUILD_DIR)/PARAM.SFO
+
+PSP_PORT_SOURCES := \
+	$(PSP_ENTRY_SOURCE) \
+	src/port/psp/PspPlatform.cpp \
+	src/port/psp/PspRenderer.cpp \
+	src/port/psp/PspGxBackend.cpp \
+	src/port/psp/PspDolphinOs.cpp \
+	src/port/psp/PspDolphinDvd.cpp \
+	src/port/psp/PspDolphinCompat.cpp \
+	src/port/psp/PspDolphinMtx.cpp \
+	src/port/psp/PspAudioStubs.cpp
+PSP_SOURCES := $(PSP_PORT_SOURCES) $(PSP_GAME_SOURCES)
+OBJS := $(patsubst src/%.cpp,$(BUILD_DIR)/obj/%.o,$(PSP_SOURCES))
+
+INCDIR := include
+CFLAGS := -G0 -O2 -g3 -Wall -Wextra -Wno-unused-parameter -ffunction-sections -fdata-sections \
+	-fno-strict-aliasing -DPLATFORM_PSP=1 -DVERSION_GPIE01_01 -DDTK_CONFIG_NONMATCHING=1 \
+	-DPIKI_USE_JAUDIO=0
+CXXFLAGS := -std=gnu++17 -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables -Wno-register
+ifeq ($(PSP_BUILD),game)
+CXXFLAGS += -fpermissive -Wno-narrowing -w
+endif
+# psp-fixup-imports requires every generated import NID to retain its matching
+# stub.  Section GC can orphan imports referenced only by compatibility shims.
+LDFLAGS := -Wl,-u,module_info
+LIBS := -lintrafont -lpspgum -lpspgu -lpsppower -lpsprtc -lm -lstdc++
+
+EXTRA_TARGETS := $(PSP_EBOOT)
+PSP_FW_VERSION := 600
+BUILD_PRX := 1
+
+.PHONY: psp-port psp-game
+psp-port: all
+
+psp-game:
+	$(MAKE) -f Makefile.psp PSP_BUILD=game all
+
+ifeq ($(PSP_BUILD),game)
+$(BUILD_DIR)/obj/sysBootup.o: CXXFLAGS += -Dmain=pikminGameMain
+endif
+
+$(BUILD_DIR)/obj/%.o: src/%.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+include $(PSPSDK)/lib/build.mak

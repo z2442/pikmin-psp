@@ -4,6 +4,7 @@
 #include "Common/String.h"
 #include "CoreNode.h"
 #include "DebugLog.h"
+#include "Dolphin/os.h"
 #include "Stream.h"
 #include "Vector.h"
 
@@ -121,6 +122,15 @@ void Parameters::read(RandomAccessStream& input)
 	STACK_PAD_VAR(1);
 
 	while (true) {
+#if defined(PLATFORM_PSP)
+		// Never synthesize another parameter header after the physical end of
+		// a malformed or endian-misparsed file.  Apart from being invalid, a
+		// zero-padded header has size zero and would otherwise loop forever.
+		if (input.getPending() < (int)sizeof(int)) {
+			OSReport("Pikmin PSP: unterminated parameter list in %s\n", input.mPath ? input.mPath : "<unknown>");
+			break;
+		}
+#endif
 		int entryHeader = input.readInt();
 		if (entryHeader == FILE_TERMINATOR) {
 			// end of file reached

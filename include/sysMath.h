@@ -65,7 +65,7 @@ SYSCORE_API f32 qdist3(f32 x0, f32 y0, f32 z0, f32 x1, f32 y1, f32 z1);
 
 inline f32 speedy_sqrtf(f32 x)
 {
-#if defined(WIN32)
+#if defined(WIN32) || defined(PLATFORM_PSP)
 	return sqrtf(x);
 #else
 	vf32 y;

@@ -1,6 +1,7 @@
 #include "Stream.h"
 
 #include "Common/String.h"
+#include "endianness.h"
 #include <string.h>
 
 // operator new[] is used without this header being included.
@@ -15,6 +16,9 @@ int Stream::readInt()
 {
 	int i;
 	read(&i, sizeof(int));
+#if defined(PLATFORM_PSP)
+	i = (int)BE2H32((u32)i);
+#endif
 	return i;
 }
 
@@ -35,6 +39,9 @@ short Stream::readShort()
 {
 	short s;
 	read(&s, sizeof(short));
+#if defined(PLATFORM_PSP)
+	s = (short)BE2H16((u16)s);
+#endif
 	return s;
 }
 
@@ -45,6 +52,10 @@ f32 Stream::readFloat()
 {
 	f32 f;
 	read(&f, sizeof(f32));
+#if defined(PLATFORM_PSP)
+	u32 bits = BE2H32(*reinterpret_cast<u32*>(&f));
+	f = *reinterpret_cast<f32*>(&bits);
+#endif
 	return f;
 }
 
@@ -90,7 +101,7 @@ void Stream::readString(String& str)
 void Stream::writeInt(int i)
 {
 	int result = i;
-#ifdef WIN32
+#if defined(WIN32) || defined(PLATFORM_PSP)
 	result = (((result & 0xFF000000) >> 24) | ((result & 0xFF0000) >> 8) | ((result & 0xFF00) << 8) | (result << 24));
 #endif
 	write(&result, sizeof(result));
@@ -110,7 +121,7 @@ void Stream::writeByte(u8 c)
 void Stream::writeShort(short _s)
 {
 	short s = _s;
-#ifdef WIN32
+#if defined(WIN32) || defined(PLATFORM_PSP)
 	s = (((s & 0xFF00) >> 8) | (s << 8));
 #endif
 	write(&s, sizeof(short));
@@ -122,9 +133,12 @@ void Stream::writeShort(short _s)
 void Stream::writeFloat(f32 f)
 {
 	f32 result = f;
-#ifdef WIN32
+#if defined(WIN32)
 	int c  = reinterpret_cast<int&>(result);
 	result = ((u8)c << 24) | ((c & 0xFF00) << 8) | ((c & 0xFF0000) >> 8) | ((c & 0xFF000000) >> 24);
+#elif defined(PLATFORM_PSP)
+	u32 bits = H2BE32(*reinterpret_cast<u32*>(&result));
+	result = *reinterpret_cast<f32*>(&bits);
 #endif
 	write(&result, sizeof(f32));
 }

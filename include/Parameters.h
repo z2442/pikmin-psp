@@ -31,7 +31,18 @@ public:
 	 * @brief Converts a string to a fourcc ID and sets it as the ID.
 	 * @param id String ID to convert and store.
 	 */
-	void Set(immut char* id) { mID = *(s32*)id; }
+	void Set(immut char* id)
+	{
+#if defined(PLATFORM_PSP)
+		// Parameter files store their three-character IDs in GameCube byte
+		// order.  A raw word load produced the same numeric value on PPC, but
+		// reverses it on the little-endian PSP and prevents every ID match.
+		const u8* bytes = reinterpret_cast<const u8*>(id);
+		mID             = (long)(((u32)bytes[0] << 24) | ((u32)bytes[1] << 16) | ((u32)bytes[2] << 8) | (u32)bytes[3]);
+#else
+		mID = *(s32*)id;
+#endif
+	}
 
 	/**
 	 * @brief Gets the fourcc ID.

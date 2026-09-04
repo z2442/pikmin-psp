@@ -180,7 +180,14 @@ P2DPane::P2DPane(P2DPane* parent, RandomAccessStream* input, u16 paneType)
 	tag[2] = input->readByte();
 	tag[3] = input->readByte();
 
+#if defined(PLATFORM_PSP)
+	// BLO pane tags are four-character big-endian values.  The original PPC
+	// word load preserved that value, while a raw load on PSP reverses all
+	// four characters and makes every P2DScreen::search() fail.
+	mTagName = ((u32)tag[0] << 24) | ((u32)tag[1] << 16) | ((u32)tag[2] << 8) | (u32)tag[3];
+#else
 	mTagName = reinterpret_cast<u32&>(tag);
+#endif
 
 	mBounds.mMinX = (int)input->readShort();
 	mBounds.mMinY = (int)input->readShort();

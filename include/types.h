@@ -14,6 +14,16 @@ typedef unsigned __int8 u8;
 typedef unsigned __int16 u16;
 typedef unsigned __int32 u32;
 typedef unsigned __int64 u64;
+#elif defined(PLATFORM_PSP)
+#include <stdint.h>
+typedef int8_t s8;
+typedef int16_t s16;
+typedef int32_t s32;
+typedef int64_t s64;
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
 #else
 typedef signed char s8;
 typedef signed short s16;
@@ -380,6 +390,36 @@ inline void padStack(void)
 #define __mwerks_alloca(size)             /* void*  */ __alloca(size)             // unsigned long
 #define __mwerks_va_setup(args)           /* void   */ __va_setup(args)           // void*
 #define __mwerks_builtin_va_info(args)    /* void   */ __builtin_va_info(args)    // va_list*
+#elif defined(PLATFORM_PSP)
+// Portable definitions used by the non-matching PSP build.  These preserve the
+// value-level behavior of the MetroWerks/PPC intrinsics without emitting any
+// GameCube-specific instructions.
+#include <math.h>
+#include <string.h>
+#define __mwerks_eieio()                  __sync_synchronize()
+#define __mwerks_sync()                   __sync_synchronize()
+#define __mwerks_isync()                  __sync_synchronize()
+#define __mwerks_abs(value)               __builtin_abs(value)
+#define __mwerks_labs(value)              __builtin_labs(value)
+#define __mwerks_fabs(value)              __builtin_fabs(value)
+#define __mwerks_fnabs(value)             (-__builtin_fabs(value))
+#define __mwerks_cntlzw(value)            __builtin_clz((u32)(value))
+#define __mwerks_fmadd(p1, p2, p3)        ((p1) * (p2) + (p3))
+#define __mwerks_fmsub(p1, p2, p3)        ((p1) * (p2) - (p3))
+#define __mwerks_fnmadd(p1, p2, p3)       (-((p1) * (p2) + (p3)))
+#define __mwerks_fnmsub(p1, p2, p3)       (-((p1) * (p2) - (p3)))
+#define __mwerks_fsel(a, c, b)            ((a) >= 0.0 ? (c) : (b))
+#define __mwerks_fmadds(p1, p2, p3)       ((f32)((p1) * (p2) + (p3)))
+#define __mwerks_fmsubs(p1, p2, p3)       ((f32)((p1) * (p2) - (p3)))
+#define __mwerks_fnmadds(p1, p2, p3)      ((f32)(-((p1) * (p2) + (p3))))
+#define __mwerks_fnmsubs(p1, p2, p3)      ((f32)(-((p1) * (p2) - (p3))))
+#define __mwerks_fres(value)              (1.0f / (f32)(value))
+#define __mwerks_fabsf(value)             __builtin_fabsf(value)
+#define __mwerks_fnabsf(value)            (-__builtin_fabsf(value))
+#define __mwerks_frsqrte(value)           (1.0 / __builtin_sqrt((f64)(value)))
+#define __mwerks_memcpy(dest, src, size)  memcpy((dest), (src), (size))
+#define __mwerks_strcpy(dest, src)         strcpy((dest), (src))
+#define __mwerks_alloca(size)              __builtin_alloca(size)
 #endif
 
 // Disable MSVC errors.  This is typically done via a compiler flag `/wdXXXX`, but that doesn't appear to work under MSVC 6.0.

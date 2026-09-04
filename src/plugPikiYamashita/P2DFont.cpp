@@ -142,19 +142,35 @@ f32 P2DFont::drawChar(f32 xPos, f32 yPos, int charCode, int drawWidth, int drawH
 	GXBegin(GX_QUADS, GX_VTXFMT0, 4);
 
 	GXPosition3f32(x0, y0, 0.0f);
+#if defined(PLATFORM_PSP)
+	GXColor4u8(mTLColour.r, mTLColour.g, mTLColour.b, mTLColour.a);
+#else
 	GXColor1u32(reinterpret_cast<u32&>(mTLColour));
+#endif
 	GXTexCoord2u16(s0, t0);
 
 	GXPosition3f32(x1, y0, 0.0f);
+#if defined(PLATFORM_PSP)
+	GXColor4u8(mTRColour.r, mTRColour.g, mTRColour.b, mTRColour.a);
+#else
 	GXColor1u32(reinterpret_cast<u32&>(mTRColour));
+#endif
 	GXTexCoord2u16(s1, t0);
 
 	GXPosition3f32(x1, y1, 0.0f);
+#if defined(PLATFORM_PSP)
+	GXColor4u8(mBRColour.r, mBRColour.g, mBRColour.b, mBRColour.a);
+#else
 	GXColor1u32(reinterpret_cast<u32&>(mBRColour));
+#endif
 	GXTexCoord2u16(s1, t1);
 
 	GXPosition3f32(x0, y1, 0.0f);
+#if defined(PLATFORM_PSP)
+	GXColor4u8(mBLColour.r, mBLColour.g, mBLColour.b, mBLColour.a);
+#else
 	GXColor1u32(reinterpret_cast<u32&>(mBLColour));
+#endif
 	GXTexCoord2u16(s0, t1);
 
 	GXEnd();

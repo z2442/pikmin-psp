@@ -358,6 +358,15 @@ u32 DGXGraphics::compileMaterial(Material* mat)
 		return 0;
 	}
 
+#if defined(PLATFORM_PSP)
+	// The PSP backend applies material state directly.  Leaving this pointer
+	// null selects the existing uncached path in setMaterial instead of trying
+	// to replay a GameCube register display list.
+	mat->mDisplayListPtr  = nullptr;
+	mat->mDisplayListSize = 0;
+	return 0;
+#endif
+
 	if (gsys->mIsRendering) {
 		ERROR("Cannot make material DL when using GP\n");
 	}
@@ -565,6 +574,15 @@ void DGXGraphics::waitRetrace()
  */
 void DGXGraphics::waitPostRetrace()
 {
+#if defined(PLATFORM_PSP)
+	// GameCube VI invokes retrace callbacks asynchronously.  The PSP shim uses
+	// an explicit vblank wait, so perform any extra 30 FPS pacing here instead
+	// of blocking on a callback message that cannot arrive by itself.
+	int remaining = mSystemFrameRate - (VIGetRetraceCount() - mRetraceCount) - 1;
+	while (remaining-- > 0) VIWaitForRetrace();
+	return;
+#endif
+
 	BOOL interrupt = OSDisableInterrupts();
 
 	int a = mSystemFrameRate - (VIGetRetraceCount() - mRetraceCount) - 1;
