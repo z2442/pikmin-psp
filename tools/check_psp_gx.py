@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Check GPU mesh batching natively; optionally pass extracted .mod files."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+root = Path(__file__).resolve().parents[1]
+sdk = subprocess.check_output(["psp-config", "--pspsdk-path"], text=True).strip()
+with tempfile.TemporaryDirectory(prefix="pikmin-gx-") as directory:
+    binary = str(Path(directory) / "check")
+    subprocess.run([
+        os.environ.get("CXX", "g++"), "-std=c++17", "-O1", "-g", "-w", "-fpermissive",
+        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+        "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+        "-DPLATFORM_PSP=1", "-DVERSION_GPIE01_01", "-DDTK_CONFIG_NONMATCHING=1",
+        "-I", str(root / "include"), "-I", str(Path(sdk) / "include"),
+        str(root / "tests/psp_gx_mesh.cpp"), "-o", binary,
+    ], check=True)
+    environment = os.environ.copy()
+    environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
+    subprocess.run([binary, *sys.argv[1:]], check=True, env=environment)

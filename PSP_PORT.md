@@ -35,14 +35,30 @@ make -f Makefile.psp psp-game
 
 It compiles and links all 384 original high-level C++ files and writes
 `build/psp/GPIE01_01-game/EBOOT.PBP`. It is an integration target, not yet a
-playable release: indexed GX display-list decoding and tiled texture conversion
-must be completed before the original game can render correctly.
+playable release: indexed GX mesh lists and basic tiled textures are supported,
+while multi-stage TEV combinations and other GX features remain incomplete.
 
 The whole-game target requires `libme-core` and includes the original JAM
 sequencer, bank loader, and scene control. It converts the big-endian bank
 metadata once, then directly decodes the game's AFC/PCM `.aw` samples and
 streamed `.stx` audio on the Media Engine. PCM is sent to the PSP hardware SRC
 at 32 kHz; no GameCube DSP instruction emulation is involved.
+
+The title renderer batches indexed triangle strips by model display list and
+keeps positions in model space. The PSP GE applies rigid model matrices (or
+bone matrices for batches using up to eight different GX matrices) and performs
+hardware clipping. The general decoder remains available for other list types.
+The native GU command checks compare transformed triangles and winding against
+the original decoder, and can also check extracted title assets:
+
+```sh
+python3 tools/check_psp_gx.py \
+  build/psp/GPIE01_01-game/data/dataDir/cinemas/opening/opening.mod \
+  build/psp/GPIE01_01-game/data/dataDir/cinemas/titles/logo.mod
+```
+
+These checks need PSPSDK headers and a native C++ compiler; they do not measure
+hardware frame rate or verify the final image on a PSP.
 
 The native decoder and metadata checks can be run against the extracted bank:
 
@@ -95,9 +111,8 @@ to exit.
 1. PSP platform bootstrap and portable compiler definitions (present).
 2. Dolphin OS replacements: filesystem, timing, basic threads/messages/mutexes,
    and controller are present; save data still needs integration.
-3. GX-to-GU renderer: immediate vertices, matrices, depth/blend/cull (present);
-   texture decoding, indexed geometry, display lists, and the TEV combinations
-   Pikmin uses remain.
+3. GX-to-GU renderer: immediate vertices, matrices, depth/blend/cull, basic
+   texture decoding, and indexed mesh lists (present); full TEV support remains.
 4. Original `PlugPikiApp` loop and experimental ME-backed JAudio playback
    (present in the whole-game build).
 5. Profile memory and rendering on PSP-1000 and PSP-2000/3000 hardware.

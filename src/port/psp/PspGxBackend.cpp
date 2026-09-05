@@ -21,6 +21,11 @@ struct PspGxVertex {
 	f32 z;
 };
 
+struct PspGxSkinnedVertex {
+	f32 weights[8];
+	PspGxVertex vertex;
+};
+
 struct PspGxAttribute {
 	GXAttrType source;
 	GXCompCnt count;
@@ -79,6 +84,7 @@ u32 sDebugTexturedDrawCalls;
 u32 sDebugTextureLoads;
 u32 sDebugTextureFailures;
 u32 sDebugListSplits;
+u32 sDebugBatchedPrimitives;
 
 const int kBufferWidth  = 512;
 const int kScreenWidth  = 480;
@@ -363,7 +369,7 @@ void consumeIndex(const u8*& input, GXAttrType source, u32& index)
 
 void decodeMeshVertex(const u8*& input)
 {
-	u8 matrixIndex = 0;
+	u8 matrixIndex = sState.currentPositionMatrix * 3;
 	for (u32 attribute = GX_VA_PNMTXIDX; attribute <= GX_VA_TEX7MTXIDX; ++attribute) {
 		PspGxAttribute& state = sState.attributes[attribute];
 		if (state.source == GX_DIRECT) {
@@ -465,7 +471,7 @@ ScePspFMatrix4 identityMatrix()
 	return result;
 }
 
-void submitVertices(PspGxVertex* vertices, u32 count, int primitive)
+void submitVertices(const void* vertices, u32 count, int primitive, const u16* indices = nullptr, bool skinned = false)
 {
 	if (!vertices || count == 0) {
 		return;
@@ -475,8 +481,10 @@ void submitVertices(PspGxVertex* vertices, u32 count, int primitive)
 	if (sState.textureEnabled) ++sDebugTexturedDrawCalls;
 	if (sState.textureEnabled) sceGuEnable(GU_TEXTURE_2D); else sceGuDisable(GU_TEXTURE_2D);
 	const int format = GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF
+	                 | (indices ? GU_INDEX_16BIT : 0)
+	                 | (skinned ? GU_WEIGHT_32BITF | GU_WEIGHTS(8) : 0)
 	                 | (sState.transform3D ? GU_TRANSFORM_3D : GU_TRANSFORM_2D);
-	sceGuDrawArray(primitive, format, count, nullptr, vertices);
+	sceGuDrawArray(primitive, format, count, indices, vertices);
 }
 
 void reserveDisplayListMemory(u32 byteCount)
@@ -504,6 +512,154 @@ void loadGuPositionMatrix(u32 index)
 	// Draws are submitted with sceGuDrawArray, not sceGumDrawArray.  Send the
 	// matrix directly to the GE rather than only updating GUM's software stack.
 	sceGuSetMatrix(GU_MODEL, &converted);
+}
+
+struct MeshLayout {
+	u32 stride;
+	s32 offset[GX_VA_MAX_ATTR];
+};
+
+bool meshLayout(MeshLayout& layout)
+{
+	layout.stride = 0;
+	for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) layout.offset[i] = -1;
+	for (u32 i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+		// NBT replaces the normal in the FIFO, despite its separate API enum.
+		u32 attr = i == GX_VA_NRM && sState.attributes[GX_VA_NBT].source != GX_NONE ? (u32)GX_VA_NBT : i;
+		const PspGxAttribute& state = sState.attributes[attr];
+		if (state.source == GX_NONE) continue;
+		layout.offset[attr] = layout.stride;
+		if (i <= GX_VA_TEX7MTXIDX && state.source == GX_DIRECT) ++layout.stride;
+		else if (state.source == GX_INDEX8) ++layout.stride;
+		else if (state.source == GX_INDEX16) layout.stride += 2;
+		else return false;
+	}
+	const PspGxAttribute& pos = sState.attributes[GX_VA_POS];
+	const PspGxAttribute& col = sState.attributes[GX_VA_CLR0];
+	const PspGxAttribute& uv = sState.attributes[GX_VA_TEX0];
+	return layout.offset[GX_VA_POS] >= 0 && pos.array && pos.componentType == GX_F32
+	    && (col.source == GX_NONE || (col.array && col.componentType == GX_RGBA8))
+	    && (uv.source == GX_NONE || (uv.array && uv.componentType == GX_F32));
+}
+
+u32 meshIndex(const u8* vertex, const MeshLayout& layout, GXAttr attr)
+{
+	const u8* input = vertex + layout.offset[attr];
+	return sState.attributes[attr].source == GX_INDEX16 ? ((u32)input[0] << 8) | input[1] : input[0];
+}
+
+u32 triangleIndexCount(u8 primitive, u32 vertices)
+{
+	switch (primitive) {
+	case GX_TRIANGLES: return vertices % 3 == 0 ? vertices : 0;
+	case GX_QUADS: return vertices % 4 == 0 ? vertices / 4 * 6 : 0;
+	case GX_TRIANGLESTRIP:
+	case GX_TRIANGLEFAN: return vertices >= 3 ? (vertices - 2) * 3 : 0;
+	default: return 0;
+	}
+}
+
+u32 meshMatrixIndex(const u8* vertex, const MeshLayout& layout)
+{
+	return layout.offset[GX_VA_PNMTXIDX] < 0 ? sState.currentPositionMatrix
+	    : MIN(meshIndex(vertex, layout, GX_VA_PNMTXIDX) / 3, 9U);
+}
+
+// Retail model lists contain thousands of short strips. Submit a whole list
+// as indexed triangles. Positions stay in model space: the GE transforms and
+// clips them. Rigid meshes use GU_MODEL, while mixed matrices use GE bones.
+bool drawMeshList(const u8* input, const u8* end)
+{
+	MeshLayout layout;
+	if (!meshLayout(layout)) return false;
+	u32 vertexCount = 0, indexCount = 0, primitiveCount = 0, matrixMask = 0;
+	for (const u8* scan = input; scan < end;) {
+		u8 command = *scan++;
+		if (command == GX_CMD_NOP) continue;
+		if (end - scan < 2) return false;
+		u32 count = readBig16(scan);
+		u32 indices = triangleIndexCount(command & GX_OPCODE_MASK, count);
+		if (!indices || (u32)(end - scan) / layout.stride < count) return false;
+		vertexCount += count;
+		indexCount += indices;
+		++primitiveCount;
+		if (vertexCount > 65535 || indexCount > 65535) return false;
+		for (u32 i = 0; i < count; ++i) matrixMask |= 1U << meshMatrixIndex(scan + i * layout.stride, layout);
+		scan += count * layout.stride;
+	}
+	if (!vertexCount) return true;
+	u8 boneSlots[10] = {};
+	u32 matrixCount = 0, rigidMatrix = 0;
+	for (u32 i = 0; i < 10; ++i) if (matrixMask & (1U << i)) {
+		boneSlots[i] = matrixCount++;
+		rigidMatrix = i;
+	}
+	if (matrixCount > 8) return false;
+	bool skinned = matrixCount > 1;
+	u32 vertexSize = skinned ? sizeof(PspGxSkinnedVertex) : sizeof(PspGxVertex);
+	u32 byteCount = vertexCount * vertexSize + indexCount * sizeof(u16);
+	if (byteCount + 8 + kDisplayListCommandReserve > sizeof(sGxDisplayList)) return false;
+	reserveDisplayListMemory(byteCount);
+	u8* vertices = static_cast<u8*>(sceGuGetMemory(byteCount));
+	u16* indices = reinterpret_cast<u16*>(vertices + vertexCount * vertexSize);
+	u32 base = 0, index = 0;
+	const PspGxAttribute& pos = sState.attributes[GX_VA_POS];
+	const PspGxAttribute& col = sState.attributes[GX_VA_CLR0];
+	const PspGxAttribute& uv = sState.attributes[GX_VA_TEX0];
+	while (input < end) {
+		u8 command = *input++;
+		if (command == GX_CMD_NOP) continue;
+		u8 primitive = command & GX_OPCODE_MASK;
+		u32 count = readBig16(input);
+		for (u32 i = 0; i < count; ++i, input += layout.stride) {
+			u8* destination = vertices + (base + i) * vertexSize;
+			if (skinned) {
+				PspGxSkinnedVertex* weighted = reinterpret_cast<PspGxSkinnedVertex*>(destination);
+				memset(weighted->weights, 0, sizeof(weighted->weights));
+				weighted->weights[boneSlots[meshMatrixIndex(input, layout)]] = 1.0f;
+				destination = reinterpret_cast<u8*>(&weighted->vertex);
+			}
+			PspGxVertex& out = *reinterpret_cast<PspGxVertex*>(destination);
+			const f32* xyz = reinterpret_cast<const f32*>(pos.array + meshIndex(input, layout, GX_VA_POS) * pos.stride);
+			out.x = xyz[0]; out.y = xyz[1]; out.z = pos.count == GX_POS_XY ? 0.0f : xyz[2];
+			out.colour = sState.currentColour;
+			if (col.source != GX_NONE) memcpy(&out.colour, col.array + meshIndex(input, layout, GX_VA_CLR0) * col.stride, 4);
+			out.u = out.v = 0.0f;
+			if (uv.source != GX_NONE) {
+				const f32* st = reinterpret_cast<const f32*>(uv.array + meshIndex(input, layout, GX_VA_TEX0) * uv.stride);
+				out.u = st[0]; out.v = uv.count == GX_TEX_S ? 0.0f : st[1];
+			}
+		}
+		if (primitive == GX_TRIANGLES) {
+			for (u32 i = 0; i < count; ++i) indices[index++] = base + i;
+		} else if (primitive == GX_QUADS) {
+			for (u32 i = 0; i < count; i += 4) {
+				indices[index++] = base + i; indices[index++] = base + i + 1; indices[index++] = base + i + 2;
+				indices[index++] = base + i; indices[index++] = base + i + 2; indices[index++] = base + i + 3;
+			}
+		} else {
+			for (u32 i = 2; i < count; ++i) {
+				indices[index++] = base + (primitive == GX_TRIANGLEFAN ? 0 : i - 2 + (i & 1));
+				indices[index++] = base + (primitive == GX_TRIANGLEFAN ? i - 1 : i - 1 - (i & 1));
+				indices[index++] = base + i;
+			}
+		}
+		base += count;
+	}
+	if (skinned) {
+		ScePspFMatrix4 identity = identityMatrix();
+		sceGuSetMatrix(GU_MODEL, &identity);
+		for (u32 i = 0; i < 10; ++i) if (matrixMask & (1U << i)) {
+			ScePspFMatrix4 matrix = positionMatrix(sState.positionMatrices[i]);
+			sceGuBoneMatrix(boneSlots[i], &matrix);
+		}
+	} else {
+		loadGuPositionMatrix(rigidMatrix);
+	}
+	submitVertices(vertices, indexCount, GU_TRIANGLES, indices, skinned);
+	loadGuPositionMatrix(sState.currentPositionMatrix);
+	sDebugBatchedPrimitives += primitiveCount;
+	return true;
 }
 
 } // namespace
@@ -640,6 +796,7 @@ GXFifoObj* GXInit(void*, u32)
 	sceGuDepthRange(65535, 0);
 	sceGuScissor(0, 0, kScreenWidth, kScreenHeight);
 	sceGuEnable(GU_SCISSOR_TEST);
+	sceGuEnable(GU_CLIP_PLANES);
 	sceGuShadeModel(GU_SMOOTH);
 	sceGuFrontFace(GU_CW);
 	// Match the working OOT PSP renderer: sceGuDrawArray consumes GE matrix
@@ -799,9 +956,10 @@ void GXSetCopyClear(GXColor colour, u32 depth)
 void GXCopyDisp(void*, GXBool clear)
 {
 	if (!sState.guInitialised || !sState.listOpen) return;
-	if (sDebugFrameCount < 12) {
-		OSReport("Pikmin PSP GX frame %u: draws=%u vertices=%u textured=%u textures=%u failed=%u\n", sDebugFrameCount,
-		         sDebugDrawCalls, sDebugVertexCount, sDebugTexturedDrawCalls, sDebugTextureLoads, sDebugTextureFailures);
+	if (sDebugFrameCount < 12 || sDebugFrameCount == 120 || sDebugFrameCount == 300 || sDebugFrameCount == 600) {
+		OSReport("Pikmin PSP GX frame %u: draws=%u vertices=%u textured=%u textures=%u failed=%u batched=%u\n", sDebugFrameCount,
+		         sDebugDrawCalls, sDebugVertexCount, sDebugTexturedDrawCalls, sDebugTextureLoads, sDebugTextureFailures,
+		         sDebugBatchedPrimitives);
 	}
 	++sDebugFrameCount;
 	sceGuFinish();
@@ -823,6 +981,7 @@ void GXCopyDisp(void*, GXBool clear)
 	sDebugTexturedDrawCalls = 0;
 	sDebugTextureLoads = 0;
 	sDebugTextureFailures = 0;
+	sDebugBatchedPrimitives = 0;
 }
 void GXCopyTex(void*, GXBool) { }
 
@@ -954,6 +1113,7 @@ void GXCallDisplayList(void* displayList, u32 byteCount)
 	if (!displayList || byteCount == 0) return;
 	const u8* input = static_cast<const u8*>(displayList);
 	const u8* end = input + byteCount;
+	if (drawMeshList(input, end)) return;
 	while (input < end) {
 		u8 command = *input++;
 		if (command == GX_CMD_NOP) continue;
