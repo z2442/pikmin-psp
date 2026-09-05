@@ -20,3 +20,16 @@ with tempfile.TemporaryDirectory(prefix="pikmin-audio-") as directory:
     # LeakSanitizer cannot attach to its child process in some containers.
     environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
     subprocess.run([binary, *sys.argv[1:]], check=True, env=environment)
+    sequence_binary = str(Path(directory) / "sequence")
+    subprocess.run([
+        os.environ.get("CXX", "g++"), "-std=c++17", "-O1", "-g", "-fpermissive", "-w",
+        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+        "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+        "-DPLATFORM_PSP=1", "-DDTK_CONFIG_NONMATCHING=1", "-I", str(root / "include"),
+        str(root / "tests/psp_audio_sequence.cpp"),
+        "-x", "c++", str(root / "src/jaudio/file_seq.c"),
+        str(root / "src/jaudio/seqsetup.c"), str(root / "src/jaudio/playercall.c"),
+        "-o", sequence_binary,
+    ], check=True)
+    # Bound the regression: an asynchronous stop under AudioLock spins forever.
+    subprocess.run([sequence_binary], check=True, env=environment, timeout=10)

@@ -285,6 +285,11 @@ static void Init_Track(seqp_* track, u32 dataAddress, seqp_* parent)
 /**
  * @TODO: Documentation
  */
+#if defined(PLATFORM_PSP)
+static void __StopSeq(seqp_* track);
+static s32 Jaq_RootCallback(void* track);
+#endif
+
 BOOL Jaq_StopSeq(s32 index)
 {
 	seqp_* track;
@@ -311,6 +316,13 @@ BOOL Jaq_StopSeq(s32 index)
 	default:
 	{
 		track->trackState = 3;
+#if defined(PLATFORM_PSP)
+		// The caller holds AudioLock, so the audio worker cannot service the
+		// stop request while Jaf_StopSeq waits. Finish this track under that
+		// same lock, including removing its callback before the root is reused.
+		Jac_RemovePlayerCallback(Jaq_RootCallback, track);
+		__StopSeq(track);
+#endif
 		break;
 	}
 	}

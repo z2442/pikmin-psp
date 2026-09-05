@@ -24,6 +24,9 @@ typedef struct PLAYER_CALL_ {
 void ResetPlayerCallback();
 s32 Jac_RegisterDspPlayerCallback(PlayerCallBack, void*);
 s32 Jac_RegisterPlayerCallback(PlayerCallBack, void*);
+#if defined(PLATFORM_PSP)
+void Jac_RemovePlayerCallback(PlayerCallBack, void*);
+#endif
 
 ////////////////////////////////////////////////////////////
 

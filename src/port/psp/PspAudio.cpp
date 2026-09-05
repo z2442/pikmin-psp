@@ -216,8 +216,10 @@ extern "C" void Jac_PlaySystemSe(s32 a0)
 extern "C" void Jac_SceneExit(u32 a0, u32 a1)
 {
 	if (!PikminPsp::audioReady()) return ;
+	PikminPsp::audioLog("game audio call: SceneExit begin scene=%u stage=%u", (unsigned)a0, (unsigned)a1);
 	PikminPsp::AudioLock lock;
 	PspImpl_Jac_SceneExit(a0, a1);
+	PikminPsp::audioLog("game audio call: SceneExit complete scene=%u", (unsigned)a0);
 }
 
 extern "C" void Jac_SceneSetup(u32 a0, u32 a1)

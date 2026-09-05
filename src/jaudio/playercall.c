@@ -30,6 +30,16 @@ s32 Jac_CheckPlayerCallback(PlayerCallBack callback, void* arg)
 	return -1;
 }
 
+#if defined(PLATFORM_PSP)
+void Jac_RemovePlayerCallback(PlayerCallBack callback, void* arg)
+{
+	s32 index = Jac_CheckPlayerCallback(callback, arg);
+	if (index >= 0) {
+		PLAYER_CALLLIST[index].callback = NULL;
+	}
+}
+#endif
+
 /**
  * @TODO: Documentation
  * @note UNUSED Size: 000040
