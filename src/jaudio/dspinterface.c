@@ -356,7 +356,9 @@ void DSP_CacheChannelAll()
  */
 void DSP_InvalChannelAll()
 {
+#if !defined(PLATFORM_PSP)
 	DCInvalidateRange(CH_BUF, sizeof(CH_BUF));
+#endif
 }
 
 /**

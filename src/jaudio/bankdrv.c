@@ -5,8 +5,15 @@
 #include "jaudio/random.h"
 #include "jaudio/rate.h"
 #include <stddef.h>
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspAudio.h"
+#endif
 
+#if defined(PLATFORM_PSP)
+static s16 FORCE_RELEASE_TABLE[] = { 0, 5, 0, 15, 0, 0 };
+#else
 static u32 FORCE_RELEASE_TABLE[3] = { 5, 15, 0 };
+#endif
 
 /**
  * @TODO: Documentation
@@ -259,9 +266,15 @@ f32 Bank_OscToOfs(Osc_* osc, Oscbuf_* buf)
 			buf->state = 0;
 			break;
 		}
+#if defined(PLATFORM_PSP)
+		val0 = PikminPsp::audioReadEnvelope(table + offset + 0);
+		val1 = PikminPsp::audioReadEnvelope(table + offset + 1);
+		val2 = PikminPsp::audioReadEnvelope(table + offset + 2);
+#else
 		val0 = table[offset + 0];
 		val1 = table[offset + 1];
 		val2 = table[offset + 2];
+#endif
 
 		if (val0 == 0xd) {
 			buf->tableIndex = val2;

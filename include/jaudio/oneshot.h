@@ -28,7 +28,14 @@ typedef union SOUNDID_ SOUNDID_;
  */
 union SOUNDID_ {
 	u32 value; // _00
+#if defined(PLATFORM_PSP)
+	struct {
+		u8 storage[4];
+		u8 operator[](unsigned index) const { return storage[3 - index]; }
+	} bytes;
+#else
 	u8 bytes[4];
+#endif
 };
 
 void Effecter_Overwrite_1ShotD(jc_* jc, Osc_* osc, u32 oscIndex);

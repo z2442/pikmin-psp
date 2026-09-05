@@ -212,6 +212,24 @@ union URegisterParam_ {
 	u16 reg[32];
 };
 
+#if defined(PLATFORM_PSP)
+/*
+ * JAM numbers the two 16-bit halves of each extended register in big-endian
+ * order.  Reading RegisterParam_::extendedRegs directly only has that meaning
+ * on PowerPC; on PSP the host union reverses the two halves.
+ */
+static inline u32 Jam_GetExtendedRegister(const URegisterParam_* registers, u32 index)
+{
+	return (u32(registers->reg[16 + index * 2]) << 16) | registers->reg[17 + index * 2];
+}
+
+static inline void Jam_SetExtendedRegister(URegisterParam_* registers, u32 index, u32 value)
+{
+	registers->reg[16 + index * 2] = value >> 16;
+	registers->reg[17 + index * 2] = value;
+}
+#endif
+
 /**
  * @brief This struct is analogous to `JASTrack` of later JAudio.
  *

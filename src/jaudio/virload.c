@@ -5,6 +5,9 @@
 
 #include <stddef.h>
 #include <string.h>
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspAudio.h"
+#endif
 
 #define JV_DIR_NAME_LENGTH (16)
 static char JV_DIR_NAME[JV_DIR_NAME_LENGTH][64];
@@ -52,6 +55,9 @@ BOOL JV_InitHeader_M(immut char* fileName, u8* barcData, u8* archiveWork)
 	}
 
 	u32 dirSeparatorIndex = strlen(fileName) - 1;
+#if defined(PLATFORM_PSP)
+	PikminPsp::audioConvertSequenceHeader(barcData);
+#endif
 
 	for (dirSeparatorIndex; dirSeparatorIndex > 0; dirSeparatorIndex--) {
 		if (fileName[dirSeparatorIndex] == '/') {

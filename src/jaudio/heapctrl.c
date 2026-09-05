@@ -6,6 +6,9 @@
 #include "Dolphin/OS/OSMessage.h"
 #include "Dolphin/ar.h"
 #include <stddef.h>
+#if defined(PLATFORM_PSP)
+#include <string.h>
+#endif
 
 #define DMABUFFER_SIZE (0x10000)
 static u8 dmabuffer[DMABUFFER_SIZE] ATTRIBUTE_ALIGN(32);
@@ -30,6 +33,9 @@ static void ARAMFinish(u32 msg)
  */
 static void ARAM_TO_ARAM_DMA(u32 src, u32 dst, u32 totalSize)
 {
+#if defined(PLATFORM_PSP)
+	memmove((void*)dst, (void*)src, totalSize);
+#else
 	ARQRequest request;
 	OSMessageQueue msgQueue;
 	OSMessage msg;
@@ -48,6 +54,7 @@ static void ARAM_TO_ARAM_DMA(u32 src, u32 dst, u32 totalSize)
 		src += burstSize;
 		dst += burstSize;
 	}
+#endif
 }
 
 /**
@@ -55,6 +62,9 @@ static void ARAM_TO_ARAM_DMA(u32 src, u32 dst, u32 totalSize)
  */
 static void DRAM_TO_DRAM_DMA(u32 src, u32 dst, u32 totalSize)
 {
+#if defined(PLATFORM_PSP)
+	memmove((void*)dst, (void*)src, totalSize);
+#else
 	ARQRequest request;
 	OSMessageQueue msgQueue;
 	OSMessage msg;
@@ -77,6 +87,7 @@ static void DRAM_TO_DRAM_DMA(u32 src, u32 dst, u32 totalSize)
 		src += burstSize;
 		dst += burstSize;
 	}
+#endif
 }
 
 /**

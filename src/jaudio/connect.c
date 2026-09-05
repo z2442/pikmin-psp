@@ -3,6 +3,9 @@
 #include "jaudio/bx.h"
 #include "jaudio/heapctrl.h"
 #include <stddef.h>
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspAudio.h"
+#endif
 
 static s16 WS_V2P_TABLE[0x100];
 static s16 BNK_V2P_TABLE[0x100];
@@ -102,8 +105,17 @@ BOOL Jac_SceneSet(WaveArchiveBank_* bank, CtrlGroup_* group, u32 id, BOOL set)
 	Ctrl_* cdf;
 	u32 i;
 
+#if defined(PLATFORM_PSP)
+	PikminPsp::audioLog("wave scene: enter bank=%p group=%p scene=%u set=%d", bank, group, (unsigned)id, (int)set);
+#endif
 	arc = bank->waveGroups[id];
 	!arc;
+
+#if defined(PLATFORM_PSP)
+	PikminPsp::audioLog("wave scene: archive=%p file=%s waves=%u status=%u heap=0x%x", arc, arc->filePath,
+	                     (unsigned)arc->waveCount, (unsigned)arc->fileLoadStatus,
+	                     (unsigned)arc->heap.startAddress);
+#endif
 
 	if (arc->heap.startAddress && arc->fileLoadStatus) {
 		for (i = 0; i < arc->waveCount; i++) {
@@ -115,7 +127,12 @@ BOOL Jac_SceneSet(WaveArchiveBank_* bank, CtrlGroup_* group, u32 id, BOOL set)
 			arc->waves[i]->fileLoadStatus = &arc->fileLoadStatus;
 		}
 
-		if (LoadAram_All(arc->filePath, &arc->fileLoadStatus, &arc->heap) == 0) {
+		u32 loadResult = LoadAram_All(arc->filePath, &arc->fileLoadStatus, &arc->heap);
+#if defined(PLATFORM_PSP)
+		PikminPsp::audioLog("wave scene: load result=0x%x status=%u heap=0x%x", (unsigned)loadResult,
+		                     (unsigned)arc->fileLoadStatus, (unsigned)arc->heap.startAddress);
+#endif
+		if (loadResult == 0) {
 			return FALSE;
 		}
 	}
@@ -136,6 +153,9 @@ BOOL Jac_SceneSet(WaveArchiveBank_* bank, CtrlGroup_* group, u32 id, BOOL set)
 	if (set) {
 		group->mCurrentSceneIndex = id;
 	}
+#if defined(PLATFORM_PSP)
+	PikminPsp::audioLog("wave scene: complete scene=%u", (unsigned)id);
+#endif
 	return TRUE;
 
 	STACK_PAD_VAR(6);
@@ -208,7 +228,11 @@ WaveID_* GetSoundHandle(CtrlGroup_* group, u32 flag)
 		return NULL;
 	}
 
-	if (*ptr == 0) {
+	if (*ptr == 0
+#if defined(PLATFORM_PSP)
+	    || *ptr == 0xffffffff
+#endif
+	) {
 		return NULL;
 	}
 

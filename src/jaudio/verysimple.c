@@ -24,6 +24,12 @@
 #include "jaudio/syncstream.h"
 #include "jaudio/waveread.h"
 #include <stddef.h>
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspAudio.h"
+#define PSP_AUDIO_STAGE(name) PikminPsp::audioLog("Jac_Start: %s", name)
+#else
+#define PSP_AUDIO_STAGE(name) ((void)0)
+#endif
 
 static CmdQueue system_se;      // TODO: type uncertain
 static CmdQueue system_se_stop; // TODO: type undertain
@@ -295,12 +301,19 @@ void Jac_PlaySe(u32)
  */
 static void Jac_PlayInit()
 {
+	PSP_AUDIO_STAGE("Jaq_Reset begin");
 	Jaq_Reset();
+	PSP_AUDIO_STAGE("stream init begin");
 	Init_StreamAudio();
+	PSP_AUDIO_STAGE("connect tables begin");
 	Jac_ConnectTableInit();
+	PSP_AUDIO_STAGE("sequence header begin");
 	Jaf_InitSeqArchive2("/Seqs/pikiseq.hed", HEAD_pikiseq, 0);
+	PSP_AUDIO_STAGE("BGM state begin");
 	Jac_InitBgm();
+	PSP_AUDIO_STAGE("bank registration begin");
 	Bank_Setup("Banks/pikibank.bx");
+	PSP_AUDIO_STAGE("bank registration complete");
 }
 
 /**
@@ -404,12 +417,16 @@ BOOL Jac_CheckBootOk()
 void Jac_Start(void* heap, u32 heapSize, u32 aramSize, immut char* rootPath)
 {
 	STACK_PAD_VAR(1);
+	PSP_AUDIO_STAGE("enter");
 
 	if (rootPath) {
 		DVDT_SetRootPath(rootPath);
 	}
+	PSP_AUDIO_STAGE("core initialization begin");
 	StartAudioThread(heap, heapSize, aramSize, 3);
+	PSP_AUDIO_STAGE("aux buses begin");
 	AuxBusInit();
+	PSP_AUDIO_STAGE("file registration begin");
 	Jac_RegisterExtFastOpen("/Seqs/pikiseq.arc");
 	Jac_RegisterExtFastOpen("/Banks/demose_0.aw");
 	Jac_RegisterExtFastOpen("/Banks/demose_1.aw");
@@ -427,18 +444,30 @@ void Jac_Start(void* heap, u32 heapSize, u32 aramSize, immut char* rootPath)
 	Jac_RegisterExtFastOpen("/fanf5.stx");
 	Jac_RegisterExtFastOpen("/badend0.stx");
 	Jac_RegisterExtFastOpen("/badend1.stx");
+	PSP_AUDIO_STAGE("FAT heap begin");
 	Jac_FatMemory_Init(0x10000);
 	Jac_Archiver_Init();
+	PSP_AUDIO_STAGE("play initialization begin");
 	Jac_PlayInit();
-	WaveScene_Set(0, 0);
+	PSP_AUDIO_STAGE("initial wave scene begin");
+	BOOL waveReady = WaveScene_Set(0, 0);
+#if defined(PLATFORM_PSP)
+	PikminPsp::audioLog("Jac_Start: initial wave scene result=%d", (int)waveReady);
+#endif
 	DVDT_CheckPass(0, 0, __BootSoundOK);
+	PSP_AUDIO_STAGE("command queues begin");
 	Jac_Portcmd_Init();
 	Jal_CmdQueue_Init();
 	Jac_SetMixerLevel(1.1f, 2.0f);
 	Jam_RegisterTrackCallback(TrackReceive);
+	PSP_AUDIO_STAGE("event systems begin");
 	Jac_InitEventSystem();
+	PSP_AUDIO_STAGE("event system complete");
 	Jac_InitDemoSystem();
+	PSP_AUDIO_STAGE("demo system complete");
 	Jac_InitStreamSystem();
+	PSP_AUDIO_STAGE("stream system complete");
+	PSP_AUDIO_STAGE("complete");
 }
 
 /**

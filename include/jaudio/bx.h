@@ -70,6 +70,9 @@ struct Ibnk_ {
  */
 struct Vmap_ {
 	u8 mBaseVelocity; // _00
+#if defined(PLATFORM_PSP)
+	u8 _pad01[3];
+#endif
 	s16 mWsysID;      // _04
 	s16 mWaveID;      // _06
 	f32 mVolume;      // _08

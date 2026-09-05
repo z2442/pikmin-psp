@@ -6,6 +6,9 @@
 
 #include <stddef.h>
 #include <string.h>
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspAudio.h"
+#endif
 
 /**
  * @brief Invented struct of an unknown name.
@@ -88,6 +91,9 @@ u32 Jaf_LoadSeq(u32 seqIndex, u8* seqBuffer)
 	u32 seqArchiveHandle    = seq_archandle | seqIndex;
 	BOOL result             = JV_LoadFile(seqArchiveHandle, seqBuffer, 0, size);
 	seq_loadbuffer[seqIndex] = seqBuffer;
+#if defined(PLATFORM_PSP)
+	PikminPsp::audioRegisterSequence(seqBuffer, size);
+#endif
 	return result;
 }
 
@@ -197,7 +203,14 @@ void Jaf_LoadStartFinish(u32 asyncContext)
 static void Jaf_LoadFinish(u32 asyncContext)
 {
 	// Why is a (known) u32 parameter suddenly a pointer?
-	seq_loadbuffer[*(int*)(asyncContext + 4)] = *(u8**)(asyncContext + 12);
+	u32 seqIndex = *(u32*)(asyncContext + 4);
+	u8* seqBuffer = *(u8**)(asyncContext + 12);
+	seq_loadbuffer[seqIndex] = seqBuffer;
+#if defined(PLATFORM_PSP)
+	// JAM bytecode is intentionally kept in disc byte order. Oscillator tables
+	// embedded in that same buffer therefore need big-endian 16-bit reads.
+	PikminPsp::audioRegisterSequence(seqBuffer, Jaf_CheckSeqSize(seqIndex));
+#endif
 	*(u8*)asyncContext                        = 0;
 }
 

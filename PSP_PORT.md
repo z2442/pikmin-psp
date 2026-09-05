@@ -8,7 +8,7 @@ kept separate from the original GameCube matching build.
 `make -f Makefile.psp psp-port` builds a PSP EBOOT that validates the PSP GU
 framebuffer, alpha blending, system-font rendering, controller input, timing,
 exit callbacks, executable-relative paths, and primitive submission through
-the original GX-facing API. Audio is intentionally disabled.
+the original GX-facing API. Audio remains disabled in this small bootstrap.
 
 The shared game code and the existing high-level `DGXGraphics` implementation
 have also been compile-checked with `psp-g++`. The platform layer now contains
@@ -38,6 +38,19 @@ It compiles and links all 384 original high-level C++ files and writes
 playable release: indexed GX display-list decoding and tiled texture conversion
 must be completed before the original game can render correctly.
 
+The whole-game target requires `libme-core` and includes the original JAM
+sequencer, bank loader, and scene control. It converts the big-endian bank
+metadata once, then directly decodes the game's AFC/PCM `.aw` samples and
+streamed `.stx` audio on the Media Engine. PCM is sent to the PSP hardware SRC
+at 32 kHz; no GameCube DSP instruction emulation is involved.
+
+The native decoder and metadata checks can be run against the extracted bank:
+
+```sh
+python3 tools/check_psp_audio.py \
+  build/psp/GPIE01_01-game/data/dataDir/SndData/Banks/pikibank.bx
+```
+
 ## Game data
 
 No copyrighted game data is committed by this project. Extract the filesystem
@@ -54,6 +67,10 @@ PSP/GAME/PIKMIN/
 The current EBOOT reports whether this directory is present. The supplied RVZ
 must first be extracted by a GameCube-disc tool that supports RVZ; an RVZ file
 cannot be used directly by the PSP runtime.
+
+The game EBOOT writes `audio.log` beside itself with ME startup, sequence-load,
+voice, PCM, and PSP output milestones. This file is only updated when a new
+milestone is reached, so it does not add continuous Memory Stick traffic.
 
 ## Control mapping
 
@@ -81,7 +98,8 @@ to exit.
 3. GX-to-GU renderer: immediate vertices, matrices, depth/blend/cull (present);
    texture decoding, indexed geometry, display lists, and the TEV combinations
    Pikmin uses remain.
-4. Start the original `PlugPikiApp` loop with audio calls stubbed.
+4. Original `PlugPikiApp` loop and experimental ME-backed JAudio playback
+   (present in the whole-game build).
 5. Profile memory and rendering on PSP-1000 and PSP-2000/3000 hardware.
 
 The renderer should translate the existing GX-facing game code rather than

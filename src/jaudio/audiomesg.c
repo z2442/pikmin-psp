@@ -17,7 +17,16 @@ void Jac_InitMessageQueue(Jac_MessageQueue* queue, OSMessage* msgArray, s32 coun
  */
 BOOL Jac_SendMessageBlock(Jac_MessageQueue* queue, OSMessage mesg)
 {
+#if defined(PLATFORM_PSP)
+	// Game commands and the consumer share the audio lock. A full queue
+	// must not spin while holding that lock and prevent it from draining.
+	if (!Jac_SendMessage(queue, mesg)) {
+		Jac_ReceiveMessage_Fast(queue, NULL);
+		return Jac_SendMessage(queue, mesg);
+	}
+#else
 	while (Jac_SendMessage(queue, mesg) != TRUE) { }
+#endif
 	return TRUE;
 }
 

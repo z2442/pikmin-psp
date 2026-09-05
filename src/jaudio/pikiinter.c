@@ -8,8 +8,12 @@
 #include "jaudio/piki_bgm.h"
 #include "jaudio/piki_player.h"
 #include "jaudio/pikidemo.h"
+#include "jaudio/playercall.h"
 #include "jaudio/verysimple.h"
 #include <stddef.h>
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspAudio.h"
+#endif
 
 typedef struct SEvent_UnkC SEvent_UnkC;
 typedef struct Portargs_ Portargs_;
@@ -194,9 +198,36 @@ void Jac_InitEventSystem(void)
 	Jac_SetProcessStatus(10);
 	CURRENT_TIME = 0;
 
+#if defined(PLATFORM_PSP)
+	/*
+	 * The GameCube audio worker is already advancing the two resident JAM
+	 * sequences here.  PSP output starts after Jac_Start returns, so the
+	 * original unbounded wait deadlocks before that thread can exist.  Advance
+	 * only the registered DSP callbacks during bootstrap; this creates the
+	 * system-event track without racing the rest of JAudio initialization.
+	 */
+	u32 bootstrapFrames = 0;
+	do {
+		handle = Jam_GetTrackHandle(0x20000);
+		if (!handle) {
+			DspPlayerCallback();
+			++bootstrapFrames;
+		}
+	} while (!handle && bootstrapFrames < 512);
+
+	if (!handle) {
+		PikminPsp::audioLog("event system: track 0x20000 unavailable after %u bootstrap frames",
+		                     (unsigned)bootstrapFrames);
+		Jac_SetProcessStatus(11);
+		return;
+	}
+	PikminPsp::audioLog("event system: track 0x20000 ready after %u bootstrap frames",
+	                     (unsigned)bootstrapFrames);
+#else
 	do {
 		handle = Jam_GetTrackHandle(0x20000);
 	} while (handle == NULL);
+#endif
 
 	for (i = 0; i < 16; i++) {
 		EVENT[i].eventType = 0;

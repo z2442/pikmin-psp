@@ -1,4 +1,7 @@
 #include "port/psp/PspPlatform.h"
+#if defined(PIKMIN_PSP_AUDIO)
+#include "port/psp/PspAudio.h"
+#endif
 
 #include <pspctrl.h>
 #include <pspiofilemgr.h>
@@ -18,6 +21,9 @@ char sExecutableRoot[384] = ".";
 int exitCallback(int, int, void*)
 {
 	sQuitRequested = true;
+#if defined(PIKMIN_PSP_AUDIO)
+	PikminPsp::audioShutdown();
+#endif
 	sceKernelExitGame();
 	return 0;
 }
@@ -80,6 +86,9 @@ bool initialise(int argc, char** argv)
 
 void shutdown()
 {
+#if defined(PIKMIN_PSP_AUDIO)
+	audioShutdown();
+#endif
 	sceKernelExitGame();
 }
 

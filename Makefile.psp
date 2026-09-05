@@ -16,11 +16,22 @@ PSP_GAME_SOURCES := \
 	$(wildcard src/plugPikiNishimura/*.cpp) \
 	$(wildcard src/plugPikiOgawa/*.cpp) \
 	$(wildcard src/plugPikiYamashita/*.cpp)
+PSP_JAUDIO_NAMES := aramcall audiomesg bankdrv bankloader bankread centcalc cmdqueue cmdstack \
+	connect driverinterface dspdriver dspinterface dummyprobe fat file_seq filter3d \
+	fxinterface heapctrl interface ja_calc jammain_2 jamosc midplay noteon oneshot piki_bgm \
+	piki_player piki_scene pikidemo pikiinter pikiseq playercall random rate sample \
+	seqsetup tables verysimple virload waveread
+PSP_JAUDIO_SOURCES := $(addprefix src/jaudio/,$(addsuffix .c,$(PSP_JAUDIO_NAMES)))
+PSP_AUDIO_SOURCES := src/port/psp/PspAudio.cpp src/port/psp/PspAudioRuntime.cpp \
+	src/port/psp/PspAudioAssets.cpp src/port/psp/PspAudioMixer.cpp src/port/psp/PspAudioStream.cpp
+PSP_RENDERER_SOURCES :=
 PSP_EBOOT_TITLE := Pikmin PSP Game (GPIE01_01, Experimental)
 else
 BUILD_DIR := build/psp/GPIE01_01
 PSP_ENTRY_SOURCE := src/port/psp/main.cpp
 PSP_GAME_SOURCES :=
+PSP_AUDIO_SOURCES := src/port/psp/PspAudioStubs.cpp
+PSP_RENDERER_SOURCES := src/port/psp/PspRenderer.cpp
 PSP_EBOOT_TITLE := Pikmin PSP Port (GPIE01_01)
 endif
 
@@ -31,15 +42,16 @@ PSP_EBOOT_SFO := $(BUILD_DIR)/PARAM.SFO
 PSP_PORT_SOURCES := \
 	$(PSP_ENTRY_SOURCE) \
 	src/port/psp/PspPlatform.cpp \
-	src/port/psp/PspRenderer.cpp \
+	$(PSP_RENDERER_SOURCES) \
 	src/port/psp/PspGxBackend.cpp \
 	src/port/psp/PspDolphinOs.cpp \
 	src/port/psp/PspDolphinDvd.cpp \
 	src/port/psp/PspDolphinCompat.cpp \
 	src/port/psp/PspDolphinMtx.cpp \
-	src/port/psp/PspAudioStubs.cpp
+	$(PSP_AUDIO_SOURCES)
 PSP_SOURCES := $(PSP_PORT_SOURCES) $(PSP_GAME_SOURCES)
 OBJS := $(patsubst src/%.cpp,$(BUILD_DIR)/obj/%.o,$(PSP_SOURCES))
+OBJS += $(patsubst src/%.c,$(BUILD_DIR)/obj/%.o,$(PSP_JAUDIO_SOURCES))
 
 INCDIR := include
 CFLAGS := -G0 -O2 -g3 -Wall -Wextra -Wno-unused-parameter -ffunction-sections -fdata-sections \
@@ -53,10 +65,17 @@ endif
 # stub.  Section GC can orphan imports referenced only by compatibility shims.
 LDFLAGS := -Wl,-u,module_info
 LIBS := -lintrafont -lpspgum -lpspgu -lpsppower -lpsprtc -lm -lstdc++
+ifeq ($(PSP_BUILD),game)
+CFLAGS += -DPIKMIN_PSP_AUDIO=1
+LIBS += -lme-core -lpspaudio
+endif
 
 EXTRA_TARGETS := $(PSP_EBOOT)
 PSP_FW_VERSION := 600
 BUILD_PRX := 1
+# Request the expanded user partition explicitly. This controls the packaged
+# EBOOT; a PRX loaded by PSPLINK inherits the partition selected by PSPLINK.
+PSP_LARGE_MEMORY := 1
 
 .PHONY: psp-port psp-game
 psp-port: all
@@ -70,6 +89,12 @@ endif
 
 $(BUILD_DIR)/obj/%.o: src/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/obj/jaudio/%.o: src/jaudio/%.c include/port/psp/PspJAudioRename.h
+	@mkdir -p $(@D)
+	$(CXX) $(filter-out -w,$(CXXFLAGS)) -Werror=return-type -MMD -MP -include port/psp/PspJAudioRename.h -x c++ -c $< -o $@
+
+-include $(OBJS:.o=.d)
 
 include $(PSPSDK)/lib/build.mak

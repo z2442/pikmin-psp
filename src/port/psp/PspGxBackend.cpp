@@ -318,6 +318,15 @@ int guCompare(GXCompare compare)
 	return functions[(u32)compare < ARRAY_SIZE(functions) ? compare : GX_ALWAYS];
 }
 
+int guDepthCompare(GXCompare compare)
+{
+	// The PSP renderer uses the conventional reversed GU depth range
+	// (near = 0xffff, far = 0).  GX uses the opposite ordering, so preserve
+	// GX's comparison semantics by reversing all ordered depth comparisons.
+	static const int functions[] = { GU_NEVER, GU_GREATER, GU_EQUAL, GU_GEQUAL, GU_LESS, GU_NOTEQUAL, GU_LEQUAL, GU_ALWAYS };
+	return functions[(u32)compare < ARRAY_SIZE(functions) ? compare : GX_ALWAYS];
+}
+
 u16 readBig16(const u8*& input)
 {
 	u16 value = ((u16)input[0] << 8) | input[1];
@@ -712,7 +721,7 @@ void GXSetCullMode(GXCullMode mode)
 void GXSetZMode(GXBool compareEnable, GXCompare function, GXBool updateEnable)
 {
 	if (compareEnable) sceGuEnable(GU_DEPTH_TEST); else sceGuDisable(GU_DEPTH_TEST);
-	sceGuDepthFunc(guCompare(function));
+	sceGuDepthFunc(guDepthCompare(function));
 	sceGuDepthMask(updateEnable ? GU_FALSE : GU_TRUE);
 }
 
@@ -781,7 +790,11 @@ void GXSetCopyFilter(GXBool, const u8[12][2], GXBool, const u8[7]) { }
 void GXSetCopyClear(GXColor colour, u32 depth)
 {
 	sState.clearColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a);
-	sState.clearDepth = depth > 0xffff ? depth >> 8 : depth;
+	u32 gxDepth = depth > 0xffff ? depth >> 8 : depth;
+	if (gxDepth > 0xffff) gxDepth = 0xffff;
+	// GX clears to its far value (normally 0xffff/0xffffff).  Convert that
+	// value to the reversed PSP depth range used above.
+	sState.clearDepth = 0xffff - gxDepth;
 }
 void GXCopyDisp(void*, GXBool clear)
 {

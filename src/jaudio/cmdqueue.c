@@ -122,7 +122,9 @@ static s32 Jal_FrameWork(void* callbackArg)
 
 	// I think they accidentally wrote UB or something, idk man.  This is effectively what the function does,
 	// but explicitly doing so makes the compiler shuffle the value in and out of a more permanent register.
-#if defined(BUGFIX)
+#if defined(PLATFORM_PSP)
+	return 0;
+#elif defined(BUGFIX)
 	return result;
 #endif
 }

@@ -584,6 +584,10 @@ void Jam_WriteRegParam(seqp_* track, u8 controlByte)
 	}
 	}
 
+#if defined(PLATFORM_PSP)
+	// Special bank/program/priority writes also publish the comparison register.
+	r28 = r30_newRegValue;
+#endif
 	switch (r29_regIdx) {
 	case 0:
 	case 1:
@@ -630,7 +634,11 @@ void Jam_WriteRegParam(seqp_* track, u8 controlByte)
 	case 0x2A:
 	case 0x2B:
 	{
+#if defined(PLATFORM_PSP)
+		Jam_SetExtendedRegister(&track->regParam, r29_regIdx - 0x28, unaff_r27);
+#else
 		track->regParam.param.extendedRegs[r29_regIdx - 0x28] = unaff_r27;
+#endif
 		return;
 	}
 	default:
@@ -751,7 +759,11 @@ u32 Jam_ReadReg32(seqp_* track, u8 index)
 	case 42:
 	case 43:
 	{
+#if defined(PLATFORM_PSP)
+		return Jam_GetExtendedRegister(&track->regParam, index - 40);
+#else
 		return track->regParam.param.extendedRegs[index - 40];
+#endif
 	}
 	case 35:
 	{

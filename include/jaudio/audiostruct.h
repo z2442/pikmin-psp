@@ -116,9 +116,15 @@ struct jcs_ {
 typedef union MixConfig {
 	u16 whole;
 	struct {
+#if defined(PLATFORM_PSP)
+		u8 lower1 : 4;
+		u8 lower0 : 4;
+		u8 upper;
+#else
 		u8 upper;
 		u8 lower0 : 4;
 		u8 lower1 : 4;
+#endif
 	} parts;
 } MixConfig;
 

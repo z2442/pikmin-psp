@@ -446,9 +446,13 @@ void Jac_InitStreamSystem(void)
  */
 void Jac_StopDemoSound(u32 id)
 {
+#if defined(PLATFORM_PSP)
+	StreamSyncStopAudio(0);
+#else
 	if (StreamSyncCheckBusy(0, id) == 1) {
 		stop_flag = 1;
 	}
+#endif
 }
 
 /**
@@ -489,8 +493,12 @@ void Jac_StartDemoSound(u32 id)
 	if (StreamSyncCheckReadyID(0, id) == 0) {
 		Jac_PrepareDemoSound(id);
 	}
+#if defined(PLATFORM_PSP)
+	StreamSyncPlayAudio(1.0f, 0, stream_level, stream_level);
+#else
 	do {
 	} while (StreamSyncPlayAudio(1.0f, 0, stream_level, stream_level) != 1);
+#endif
 }
 
 /**

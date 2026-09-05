@@ -4,6 +4,9 @@
 #include "jaudio/bankread.h"
 #include "jaudio/dvdthread.h"
 #include "jaudio/waveread.h"
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspAudio.h"
+#endif
 
 typedef struct BXHeader BXHeader;
 typedef struct AddrSize AddrSize;
@@ -44,9 +47,19 @@ void Bank_Setup(immut char* filename)
 
 	Bank_Init();
 
+#if defined(PLATFORM_PSP)
+	mem = (u8*)PikminPsp::audioBankData();
+#else
 	mem = (u8*)OSAlloc2(DVDT_CheckFile(filename));
 	DVDT_LoadFile(filename, mem);
+#endif
 	header = (BXHeader*)mem;
+
+#if defined(PLATFORM_PSP)
+	PikminPsp::audioLog("bank setup: data=%p wsysTable=0x%x wsysCount=%u ibnkTable=0x%x ibnkCount=%u", mem,
+	                     (unsigned)header->wsysPointerOffset, (unsigned)header->wsysPointerCount,
+	                     (unsigned)header->ibnkPointerOffset, (unsigned)header->ibnkPointerCount);
+#endif
 
 	Wavegroup_Init();
 
@@ -55,7 +68,14 @@ void Bank_Setup(immut char* filename)
 
 	for (i = 0; i < pointerCount; ++i) {
 		if (pairs[i].size != 0) {
+#if defined(PLATFORM_PSP)
+			PikminPsp::audioLog("bank setup: WSYS %u begin offset=0x%x size=%u", (unsigned)i,
+			                     (unsigned)pairs[i].addr, (unsigned)pairs[i].size);
+			BOOL registered = Wavegroup_Regist((void*)(mem + pairs[i].addr), i);
+			PikminPsp::audioLog("bank setup: WSYS %u result=%d", (unsigned)i, (int)registered);
+#else
 			Wavegroup_Regist((void*)(mem + pairs[i].addr), i);
+#endif
 		}
 	}
 
@@ -64,7 +84,14 @@ void Bank_Setup(immut char* filename)
 
 	for (i = 0; i < pointerCount; ++i) {
 		if (pairs[i].size != 0) {
+#if defined(PLATFORM_PSP)
+			PikminPsp::audioLog("bank setup: IBNK %u begin offset=0x%x size=%u", (unsigned)i,
+			                     (unsigned)pairs[i].addr, (unsigned)pairs[i].size);
+			BOOL registered = Bank_Regist((void*)(mem + pairs[i].addr), i);
+			PikminPsp::audioLog("bank setup: IBNK %u result=%d", (unsigned)i, (int)registered);
+#else
 			Bank_Regist((void*)(mem + pairs[i].addr), i);
+#endif
 		}
 	}
 }

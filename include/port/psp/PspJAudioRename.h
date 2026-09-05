@@ -1,0 +1,46 @@
+#pragma once
+#include "types.h"
+// The original compiler traps here. Preserve that behavior instead of letting
+// non-void placeholders fall through into undefined C++ control flow.
+#undef TRAP_UNIMPLEMENTED
+#define TRAP_UNIMPLEMENTED __builtin_trap()
+// Only the JAudio translation units see these names; game calls take the audio lock.
+#define Jac_AddDVDBuffer PspImpl_Jac_AddDVDBuffer
+#define Jac_BackDVDBuffer PspImpl_Jac_BackDVDBuffer
+#define Jac_CheckFreeEvents PspImpl_Jac_CheckFreeEvents
+#define Jac_CreateEvent PspImpl_Jac_CreateEvent
+#define Jac_DemoFrame PspImpl_Jac_DemoFrame
+#define Jac_DestroyEvent PspImpl_Jac_DestroyEvent
+#define Jac_EnterBossMode PspImpl_Jac_EnterBossMode
+#define Jac_ExitBossMode PspImpl_Jac_ExitBossMode
+#define Jac_FinishDemo PspImpl_Jac_FinishDemo
+#define Jac_FinishPartsFindDemo PspImpl_Jac_FinishPartsFindDemo
+#define Jac_FinishTextDemo PspImpl_Jac_FinishTextDemo
+#define Jac_Freeze PspImpl_Jac_Freeze
+#define Jac_Freeze_Precall PspImpl_Jac_Freeze_Precall
+#define Jac_Gsync PspImpl_Jac_Gsync
+#define Jac_InitAllEvent PspImpl_Jac_InitAllEvent
+#define Jac_Orima_Formation PspImpl_Jac_Orima_Formation
+#define Jac_Orima_Walk PspImpl_Jac_Orima_Walk
+#define Jac_OutputMode PspImpl_Jac_OutputMode
+#define Jac_Piki_Number PspImpl_Jac_Piki_Number
+#define Jac_PlayEventAction PspImpl_Jac_PlayEventAction
+#define Jac_PlayOrimaSe PspImpl_Jac_PlayOrimaSe
+#define Jac_PlaySystemSe PspImpl_Jac_PlaySystemSe
+#define Jac_SceneExit PspImpl_Jac_SceneExit
+#define Jac_SceneSetup PspImpl_Jac_SceneSetup
+#define Jac_SetBGMVolume PspImpl_Jac_SetBGMVolume
+#define Jac_SetDemoOnyons PspImpl_Jac_SetDemoOnyons
+#define Jac_SetDemoPartsCount PspImpl_Jac_SetDemoPartsCount
+#define Jac_SetDemoPartsID PspImpl_Jac_SetDemoPartsID
+#define Jac_SetSEVolume PspImpl_Jac_SetSEVolume
+#define Jac_Start PspImpl_Jac_Start
+#define Jac_StartDemo PspImpl_Jac_StartDemo
+#define Jac_StartPartsFindDemo PspImpl_Jac_StartPartsFindDemo
+#define Jac_StartTextDemo PspImpl_Jac_StartTextDemo
+#define Jac_StopEventAction PspImpl_Jac_StopEventAction
+#define Jac_StopOrimaSe PspImpl_Jac_StopOrimaSe
+#define Jac_StopSe PspImpl_Jac_StopSe
+#define Jac_StopSystemSe PspImpl_Jac_StopSystemSe
+#define Jac_UpdateCamera PspImpl_Jac_UpdateCamera
+#define Jac_UpdateEventPosition PspImpl_Jac_UpdateEventPosition
