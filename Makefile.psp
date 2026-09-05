@@ -24,6 +24,8 @@ PSP_JAUDIO_NAMES := aramcall audiomesg bankdrv bankloader bankread centcalc cmdq
 PSP_JAUDIO_SOURCES := $(addprefix src/jaudio/,$(addsuffix .c,$(PSP_JAUDIO_NAMES)))
 PSP_AUDIO_SOURCES := src/port/psp/PspAudio.cpp src/port/psp/PspAudioRuntime.cpp \
 	src/port/psp/PspAudioAssets.cpp src/port/psp/PspAudioMixer.cpp src/port/psp/PspAudioStream.cpp
+PSP_AUDIO_SOURCES += src/port/psp/PspMovie.cpp src/port/psp/PspMovieDecode.cpp
+PSP_JAUDIO_SOURCES += src/hvqm4dec/hvqm4dec.c
 PSP_RENDERER_SOURCES :=
 PSP_EBOOT_TITLE := Pikmin PSP Game (GPIE01_01, Experimental)
 else
@@ -94,6 +96,10 @@ $(BUILD_DIR)/obj/%.o: src/%.cpp
 $(BUILD_DIR)/obj/jaudio/%.o: src/jaudio/%.c include/port/psp/PspJAudioRename.h
 	@mkdir -p $(@D)
 	$(CXX) $(filter-out -w,$(CXXFLAGS)) -Werror=return-type -MMD -MP -include port/psp/PspJAudioRename.h -x c++ -c $< -o $@
+
+$(BUILD_DIR)/obj/hvqm4dec/%.o: src/hvqm4dec/%.c
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -MMD -MP -x c++ -c $< -o $@
 
 -include $(OBJS:.o=.d)
 

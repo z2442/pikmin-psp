@@ -12,6 +12,9 @@
 #include "jaudio/verysimple.h"
 #include "jaudio/waveread.h"
 #include <stddef.h>
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspAudio.h"
+#endif
 
 void __Prepare_BGM(u32);
 void Jac_BgmAnimEndStop();
@@ -34,6 +37,20 @@ u8 demo_parts_num;
 u8 event_pause_counter;
 u32 demo_end_delay;
 static CmdQueue demo_q;
+
+#if defined(PLATFORM_PSP)
+static void WaitForDemoLoad()
+{
+	// PSP reads finish synchronously, but their callbacks are deferred until
+	// the caller has installed its state. Service them here under AudioLock;
+	// the worker cannot acquire that lock while Jac_StartDemo is waiting.
+	PikminPsp::audioDrainCompletions();
+	if (now_loading < 3) {
+		PikminPsp::audioLog("demo audio load unavailable; continuing cutscene id=%d status=%u",
+		                    current_demo_no, (unsigned)now_loading);
+	}
+}
+#endif
 
 // table for which parts play the sparkle sound on collect
 #if defined(VERSION_GPIJ01_01) || defined(VERSION_G98P01_PIKIDEMO) || defined(VERSION_DPIJ01_PIKIDEMO)
@@ -581,7 +598,11 @@ void Jac_StartDemo(u32 cinID)
 	}
 	default:
 	{
+#if defined(PLATFORM_PSP)
+		WaitForDemoLoad();
+#else
 		while (now_loading < 3) { }
+#endif
 		break;
 	}
 	}
@@ -592,8 +613,12 @@ void Jac_StartDemo(u32 cinID)
 		now_loading = 1;
 		__Prepare_BGM(DEMOID_ShipUpgradePractice);
 		if (now_loading) {
+#if defined(PLATFORM_PSP)
+			WaitForDemoLoad();
+#else
 			while (now_loading < 3)
 				;
+#endif
 		}
 	}
 
@@ -601,8 +626,12 @@ void Jac_StartDemo(u32 cinID)
 		now_loading = 1;
 		__Prepare_BGM(DEMOID_ShipUpgradeLast);
 		if (now_loading) {
+#if defined(PLATFORM_PSP)
+			WaitForDemoLoad();
+#else
 			while (now_loading < 3)
 				;
+#endif
 		}
 	}
 

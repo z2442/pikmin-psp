@@ -1,5 +1,8 @@
 #include "hvqm4.h"
 #include <stddef.h>
+#if defined(PLATFORM_PSP)
+#include <string.h>
+#endif
 
 /*
  * Initial code attempts + comments + function arguments/naming guides taken from
@@ -26,8 +29,21 @@ static u32 readTree_scale;
 #define CHROMA_IDX 1
 
 #define read8(buf, offset)  (*(u8*)((u8*)(buf) + (offset)))
+#if defined(PLATFORM_PSP)
+static inline u16 read16(const void* buf, u32 offset)
+{
+	const u8* p = (const u8*)buf + offset;
+	return (u16)p[0] << 8 | p[1];
+}
+static inline u32 read32(const void* buf, u32 offset)
+{
+	const u8* p = (const u8*)buf + offset;
+	return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3];
+}
+#else
 #define read16(buf, offset) (*(u16*)((u8*)(buf) + (offset)))
 #define read32(buf, offset) (*(u32*)((u8*)(buf) + (offset)))
+#endif
 
 static inline u8 saturate(int x)
 {
@@ -135,7 +151,12 @@ static inline int getBit(BitBuffer* str)
 	int bit;
 
 	if ((bit = str->shift) < 0) {
+#if defined(PLATFORM_PSP)
+		value = str->word = read32(str->ptr, 0);
+		str->ptr += 4;
+#else
 		value = str->word = *((u32*)str->ptr)++;
+#endif
 		bit               = 31;
 	} else {
 		value = str->word;
@@ -160,7 +181,12 @@ static inline s16 getByte(BitBuffer* str)
 	} else {
 		value = str->word;
 		value <<= 7 - bit;
+#if defined(PLATFORM_PSP)
+		str->word = read32(str->ptr, 0);
+		str->ptr += 4;
+#else
 		str->word = *((u32*)str->ptr)++;
+#endif
 		value |= str->word >> (bit + 25);
 		bit += 24;
 	}
@@ -194,7 +220,7 @@ static s16 _readTree(Tree* const dst, BitBuffer* const str)
 			val -= 0x100;
 		}
 
-		val <<= readTree_scale;
+		val *= 1 << readTree_scale;
 		dst->leaf[0][no] = val;
 		return no;
 	}
@@ -592,6 +618,11 @@ static void OrgBlock(VideoState* ws, u8* block, int blockWidth, int p)
 	FORCE_DONT_INLINE;
 
 	buf                          = &ws->aotcd[p];
+#if defined(PLATFORM_PSP)
+	// Raw pixel blocks are bytes, and their input need not be word aligned.
+	for (int row = 0; row < 4; ++row) memcpy(block + row * blockWidth, buf->ptr + row * 4, 4);
+	buf->ptr += 16;
+#else
 	ptr                          = (u32*)buf->ptr;
 	temp1                        = ptr[1];
 	temp2                        = ptr[2];
@@ -601,6 +632,7 @@ static void OrgBlock(VideoState* ws, u8* block, int blockWidth, int p)
 	*(u32*)(block += blockWidth) = temp2;
 	*(u32*)(block += blockWidth) = temp3;
 	buf->ptr                     = (u8*)ptr + 16;
+#endif
 }
 
 /**
@@ -1001,10 +1033,10 @@ static inline s32 GetMCAotBasis(VideoState* ws, u8 basisOut[16], s32* pscl, u8* 
 	}
 }
 
-static inline s32 GetAotSum(VideoState* ws, long sum[16], u8 nbasis, u8* nestTop, int nestWidth, int p)
+static inline s32 GetAotSum(VideoState* ws, s32 sum[16], u8 nbasis, u8* nestTop, int nestWidth, int p)
 {
-	long prev_scl;
-	long scl;
+	s32 prev_scl;
+	s32 scl;
 	u8 bas[16];
 
 	sum[0] = sum[1] = sum[2] = sum[3] = sum[4] = sum[5] = sum[6] = sum[7] = sum[8] = sum[9] = sum[10] = sum[11] = sum[12] = sum[13]
@@ -1072,9 +1104,9 @@ static inline s32 GetMCAotSum(VideoState* ws, s32 sum[16], u8 nbasis, u8* nestTo
  */
 static void IntraAotBlock(VideoState* ws, u8* blk, int blkWidth, u8 dcv, u8 nbasis, int p)
 {
-	long sum[16];
+	s32 sum[16];
 	int avr;
-	long mns;
+	s32 mns;
 
 	if (nbasis == 6) {
 		OrgBlock(ws, blk, blkWidth, p);
@@ -1786,7 +1818,7 @@ static void PrediAotBlock(VideoState* ws, u8* blk, u8* mblk, int blkWidth, u8 nb
 	}
 
 	mns = ws->aotscale_q;
-	avr = (decodeSOvfSym(&ws->dcval[p], ws->dc_min, ws->dc_max) >> ws->dc_scale_q << mns) - avr;
+	avr = (decodeSOvfSym(&ws->dcval[p], ws->dc_min, ws->dc_max) >> ws->dc_scale_q) * (1 << mns) - avr;
 	scl = (decodeSOvfSym(&ws->dcval[p], ws->dc_min, ws->dc_max) >> ws->dc_scale_q) * mcdivTable[max - min];
 
 	// This loop is probably not manually unrolled, but it helps fake-match the stack size
@@ -1900,7 +1932,7 @@ static void getMVector(int* vec, BitBufferWithTree* code, int fcode)
 
 	range = 1 << (fcode + 5);
 	// quantized value
-	v = decodeHuff(code) << fcode;
+	v = decodeHuff(code) * (1 << fcode);
 	// residual bits
 	for (i = fcode - 1; i >= 0; i--) {
 		v += getBit(&code->str) << i;
@@ -2204,7 +2236,7 @@ void HVQM4DecodeIpic(SeqObj* obj, void* code, void* outbuf)
 	readTree(&ws->scale[Y_IDX], 0, 2);
 
 	ws->dc_max = +0x7F << read8(code, 0);
-	ws->dc_min = -0x80 << read8(code, 0);
+	ws->dc_min = -(0x80 << read8(code, 0));
 
 	// 4x4 block types
 	Ipic_BasisNumDec(ws);
@@ -2272,7 +2304,7 @@ void HVQM4DecodeBpic(SeqObj* obj, void* code, void* outbuf, void* ref2, void* re
 	readTree(&ws->mstat, 0, 0);
 
 	ws->dc_max = +0x7F << read8(code, 0);
-	ws->dc_min = -0x80 << read8(code, 0);
+	ws->dc_min = -(0x80 << read8(code, 0));
 
 	BpicPlaneDec(obj, outbuf, ref2, ref1);
 }

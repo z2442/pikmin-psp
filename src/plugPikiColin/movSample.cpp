@@ -9,6 +9,9 @@
 #include "jaudio/piki_scene.h"
 #include "sysNew.h"
 #include "system.h"
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspMovie.h"
+#endif
 
 u16 ImgH;
 u16 ImgW;
@@ -160,7 +163,9 @@ struct MovSampleSetupSection : public Node {
 			"../MovieData/cntA_S.h4m", "../MovieData/cntB_S.h4m", "../MovieData/cntC_S.h4m",
 			"../MovieData/cntD_S.h4m", "../MovieData/sr_S.h4m",   "../MovieData/srhp_S.h4m",
 		};
-#if PIKI_USE_JAUDIO
+#if defined(PLATFORM_PSP)
+		Jac_StreamMovieInit(movieNames[gameflow.mCurrIntroMovieID], nullptr, 0);
+#elif PIKI_USE_JAUDIO
 		int movieBufferSize = 0xe00000;
 		u8* movieBuffer     = new (0x20) u8[movieBufferSize];
 		Jac_StreamMovieInit(movieNames[gameflow.mCurrIntroMovieID], movieBuffer, movieBufferSize);
@@ -193,6 +198,7 @@ struct MovSampleSetupSection : public Node {
 			pictureStatus = Jac_StreamMovieGetPicture(&pictureData, &pictureWidth, &pictureHeight);
 		}
 
+#if !defined(PLATFORM_PSP)
 		if (pictureData && pictureStatus) {
 #if defined(VERSION_GPIJ01) || defined(VERSION_DPIJ01_PIKIDEMO)
 			convHVQM4TexY8UV8(pictureWidth, pictureHeight, pictureData, mYuvFrameBuffers[mFrameBufferIndex]);
@@ -201,6 +207,7 @@ struct MovSampleSetupSection : public Node {
 #endif
 			mFrameBufferIndex ^= 1;
 		}
+#endif
 
 		bool shouldExit = false;
 		if (flowCont.mEndingType == ENDING_None && mController->keyClick(KBBTN_START | KBBTN_A | KBBTN_B)) {
@@ -209,7 +216,9 @@ struct MovSampleSetupSection : public Node {
 
 		if (shouldExit || pictureStatus == -1) {
 			Jac_StreamMovieStop();
+#if !defined(PLATFORM_PSP)
 			OSCancelThread(&playbackThread);
+#endif
 
 			if (flowCont.mEndingType != ENDING_None) {
 				Jac_SceneExit(SCENE_Exit, 0);
@@ -232,6 +241,9 @@ struct MovSampleSetupSection : public Node {
 		STACK_PAD_VAR(64);
 		gfx.setOrthogonal(mtx.mMtx, AREA_FULL_SCREEN(gfx));
 
+#if defined(PLATFORM_PSP)
+		PikminPsp::movieDraw();
+#else
 		GXSetNumTexGens(2);
 		GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_TEX0, 60, 0, 125);
 		GXSetTexCoordGen2(GX_TEXCOORD1, GX_TG_MTX3X4, GX_TG_TEX0, 60, 0, 125);
@@ -303,6 +315,7 @@ struct MovSampleSetupSection : public Node {
 
 		gfx.setColour(Colour(255, 255, 64, 255), true);
 		gfx.setAuxColour(Colour(255, 0, 64, 255));
+#endif
 
 		gameflow.drawLoadLogo(gfx, false, gameflow.mLevelBannerTex, gameflow.mLevelBannerFadeValue);
 	}

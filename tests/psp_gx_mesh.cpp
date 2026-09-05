@@ -16,6 +16,10 @@ u32 drawCalls;
 ScePspFMatrix4 modelMatrix;
 ScePspFMatrix4 bones[8];
 std::vector<PspGxVertex> triangles;
+struct MovieVertex { u16 u, v; s16 x, y, z; };
+std::vector<MovieVertex> sprites;
+const void* moviePixels;
+int movieFormat, movieStride, movieWrapU, movieWrapV;
 
 void transform(PspGxVertex& vertex, const ScePspFMatrix4& matrix)
 {
@@ -30,6 +34,7 @@ void resetDraws()
 {
 	used = drawCalls = 0;
 	triangles.clear();
+	sprites.clear();
 	modelMatrix = positionMatrix(sState.positionMatrices[sState.currentPositionMatrix]);
 }
 
@@ -119,6 +124,27 @@ void syntheticLists()
 	compareList(list, sizeof(list));
 }
 
+void movieFrame()
+{
+	resetState(); resetDraws();
+	static u16 pixels[512 * 512];
+	PikminPsp::drawMovieFrame(pixels, 360, 270, 512);
+	assert(drawCalls == 0); // No commands outside an active frame.
+	sState.listOpen = true;
+	PikminPsp::drawMovieFrame(pixels, 360, 270, 512);
+	assert(drawCalls == 6 && sprites.size() == 12);
+	assert(moviePixels == pixels && movieFormat == GU_PSM_5650 && movieStride == 512);
+	assert(movieWrapU == GU_CLAMP && movieWrapV == GU_CLAMP);
+	for (u32 i = 0; i < sprites.size(); i += 2) {
+		const auto& a = sprites[i]; const auto& b = sprites[i + 1];
+		assert(a.u == i / 2 * 64 && b.u == MIN(a.u + 64, 360));
+		assert(a.v == 0 && b.v == 270);
+		assert(a.x == a.u + 60 && b.x == b.u + 60);
+		assert(a.y == 1 && b.y == 271 && a.z == 0 && b.z == 0);
+	}
+	sState.listOpen = false;
+}
+
 struct Reader {
 	std::vector<u8> data;
 	u32 pos = 0;
@@ -197,12 +223,34 @@ int sceGuSync(int, int) { return 0; }
 int sceGuStart(int, void*) { used = 0; return 0; }
 void sceGuEnable(int) {}
 void sceGuDisable(int) {}
+void sceGuDepthMask(int) {}
+void sceGuPixelMask(unsigned int) {}
+void sceGuScissor(int, int, int, int) {}
+void sceGuTexMode(int mode, int, int, int) { movieFormat = mode; }
+void sceGuTexImage(int level, int width, int height, int stride, const void* pixels)
+{
+	assert(level == 0 && width == 512 && height == 512);
+	movieStride = stride; moviePixels = pixels;
+}
+void sceGuTexFunc(int, int) {}
+void sceGuTexFilter(int, int) {}
+void sceGuTexWrap(int u, int v) { movieWrapU = u; movieWrapV = v; }
+void sceGuTexScale(float, float) {}
+void sceGuTexOffset(float, float) {}
+void sceGuTexFlush() {}
 void OSReport(const char*, ...) {}
 void sceGuSetMatrix(int type, const ScePspFMatrix4* matrix) { if (type == GU_MODEL) modelMatrix = *matrix; }
 void sceGuBoneMatrix(unsigned int index, const ScePspFMatrix4* matrix) { assert(index < 8); bones[index] = *matrix; }
 void sceGuDrawArray(int primitive, int format, int count, const void* indexData, const void* vertexData)
 {
 	++drawCalls;
+	if (primitive == GU_SPRITES) {
+		assert(format == (GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D));
+		assert(count == 2 && !indexData);
+		const auto* pair = static_cast<const MovieVertex*>(vertexData);
+		sprites.insert(sprites.end(), pair, pair + count);
+		return;
+	}
 	std::vector<PspGxVertex> vertices;
 	for (int i = 0; i < count; ++i) {
 		u32 index = indexData ? static_cast<const u16*>(indexData)[i] : i;
@@ -233,6 +281,7 @@ void sceGuDrawArray(int primitive, int format, int count, const void* indexData,
 int main(int argc, char** argv)
 {
 	syntheticLists();
+	movieFrame();
 	for (int i = 1; i < argc; ++i) modelTest(argv[i]);
-	puts("PSP GPU mesh checks passed");
+	puts("PSP GPU mesh and movie frame checks passed");
 }

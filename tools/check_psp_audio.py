@@ -33,3 +33,13 @@ with tempfile.TemporaryDirectory(prefix="pikmin-audio-") as directory:
     ], check=True)
     # Bound the regression: an asynchronous stop under AudioLock spins forever.
     subprocess.run([sequence_binary], check=True, env=environment, timeout=10)
+    demo_binary = str(Path(directory) / "demo")
+    subprocess.run([
+        os.environ.get("CXX", "g++"), "-std=c++17", "-O1", "-g", "-fpermissive", "-w",
+        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+        "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+        "-DPLATFORM_PSP=1", "-DVERSION_GPIE01_01", "-DDTK_CONFIG_NONMATCHING=1",
+        "-I", str(root / "include"), str(root / "tests/psp_audio_demo.cpp"),
+        "-o", demo_binary,
+    ], check=True)
+    subprocess.run([demo_binary], check=True, env=environment, timeout=10)

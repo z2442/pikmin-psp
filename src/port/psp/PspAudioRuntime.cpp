@@ -1,5 +1,6 @@
 #include "port/psp/PspAudio.h"
 #include "port/psp/PspPlatform.h"
+#include "port/psp/PspMovie.h"
 #include "jaudio/aictrl.h"
 #include "jaudio/aramcall.h"
 #include "jaudio/audiothread.h"
@@ -94,6 +95,7 @@ int audioThread(SceSize, void*)
 				PikminPsp::audioStreamUpdate();
 				if (trace) PikminPsp::audioLog("audio frame %u: mix begin", (unsigned)frame);
 				PikminPsp::audioMix(sOutput[buffer] + sub * 160, 80);
+				PikminPsp::movieMix(sOutput[buffer] + sub * 160, 80);
 				if (trace) PikminPsp::audioLog("audio frame %u: mix complete", (unsigned)frame);
 			}
 			if (trace) PikminPsp::audioLog("audio frame %u: lock complete", (unsigned)frame);

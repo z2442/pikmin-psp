@@ -44,6 +44,18 @@ metadata once, then directly decodes the game's AFC/PCM `.aw` samples and
 streamed `.stx` audio on the Media Engine. PCM is sent to the PSP hardware SRC
 at 32 kHz; no GameCube DSP instruction emulation is involved.
 
+The opening planet/ship sequence uses the game's model-based cinematic player.
+Demo audio loading now services pending completion callbacks while holding the
+audio lock, preventing the opening's second segment from waiting indefinitely.
+
+The whole-game target also plays the six original `MovieData/*.h4m` tutorial
+and credits movies. It uses the repository's HVQM4 decoder with big-endian
+bitstream reads, two YUV reference buffers, and a 360×270 RGB565 image centered
+on the PSP screen. Compressed AFC movie audio is buffered and mixed into the
+32 kHz output on the CPU. Movie data needs no transcoding. Start, Cross, or
+Circle skips tutorial movies; endings keep the original unskippable behavior.
+Playback speed and audio/video timing still need validation on PSP hardware.
+
 The title renderer batches indexed triangle strips by model display list and
 keeps positions in model space. The PSP GE applies rigid model matrices (or
 bone matrices for batches using up to eight different GX matrices) and performs
@@ -67,6 +79,15 @@ python3 tools/check_psp_audio.py \
   build/psp/GPIE01_01-game/data/dataDir/SndData/Banks/pikibank.bx
 ```
 
+Movie checks decode video and audio with address/undefined-behavior sanitizers,
+then exercise timing, skip, restart, EOF, and invalid-file handling. They check
+90 frames per movie by default; use `PIKMIN_MOVIE_TEST_FRAMES=0` for full files:
+
+```sh
+PIKMIN_MOVIE_TEST_FRAMES=0 python3 tools/check_psp_movies.py \
+  build/psp/GPIE01_01-game/data/dataDir/MovieData/*.h4m
+```
+
 ## Game data
 
 No copyrighted game data is committed by this project. Extract the filesystem
@@ -83,9 +104,10 @@ PSP/GAME/PIKMIN/
 The current EBOOT reports whether this directory is present. The supplied RVZ
 must first be extracted by a GameCube-disc tool that supports RVZ; an RVZ file
 cannot be used directly by the PSP runtime.
+Include `data/dataDir/MovieData` with its original `.h4m` files for movie playback.
 
 The game EBOOT writes `audio.log` beside itself with ME startup, sequence-load,
-voice, PCM, and PSP output milestones. This file is only updated when a new
+voice, PCM, movie start/end/errors, and PSP output milestones. This file is only updated when a new
 milestone is reached, so it does not add continuous Memory Stick traffic.
 
 ## Control mapping

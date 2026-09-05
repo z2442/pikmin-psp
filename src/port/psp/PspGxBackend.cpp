@@ -664,6 +664,33 @@ bool drawMeshList(const u8* input, const u8* end)
 
 } // namespace
 
+namespace PikminPsp {
+void drawMovieFrame(const u16* pixels, u32 width, u32 height, u32 stride)
+{
+	if (!sState.listOpen || !pixels) return;
+	reserveDisplayListMemory(512);
+	sceGuDisable(GU_DEPTH_TEST); sceGuDepthMask(GU_TRUE);
+	sceGuDisable(GU_BLEND); sceGuDisable(GU_ALPHA_TEST); sceGuDisable(GU_CULL_FACE);
+	sceGuDisable(GU_FOG); sceGuDisable(GU_LIGHTING);
+	sceGuPixelMask(0); sceGuScissor(0, 0, kScreenWidth, kScreenHeight);
+	sceGuEnable(GU_TEXTURE_2D);
+	sceGuTexMode(GU_PSM_5650, 0, 0, GU_FALSE);
+	sceGuTexImage(0, 512, 512, stride, pixels);
+	sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+	sceGuTexFilter(GU_LINEAR, GU_LINEAR); sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+	sceGuTexScale(1.0f, 1.0f); sceGuTexOffset(0.0f, 0.0f); sceGuTexFlush();
+	struct Vertex { u16 u, v; s16 x, y, z; };
+	int left = (kScreenWidth - width) / 2, top = (kScreenHeight - height) / 2;
+	for (u32 x = 0; x < width; x += 64) {
+		u32 end = MIN(x + 64, width);
+		Vertex* pair = (Vertex*)sceGuGetMemory(sizeof(Vertex) * 2);
+		pair[0] = {u16(x), 0, s16(left + x), s16(top), 0};
+		pair[1] = {u16(end), u16(height), s16(left + end), s16(top + height), 0};
+		sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, nullptr, pair);
+	}
+}
+}
+
 extern "C" {
 
 void GXBegin(GXPrimitive type, GXVtxFmt, u16 numVertices)

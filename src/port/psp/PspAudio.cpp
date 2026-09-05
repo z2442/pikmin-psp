@@ -112,8 +112,10 @@ extern "C" void Jac_ExitBossMode()
 extern "C" void Jac_FinishDemo()
 {
 	if (!PikminPsp::audioReady()) return ;
+	PikminPsp::audioLog("game audio call: FinishDemo begin");
 	PikminPsp::AudioLock lock;
 	PspImpl_Jac_FinishDemo();
+	PikminPsp::audioLog("game audio call: FinishDemo complete");
 }
 
 extern "C" void Jac_FinishPartsFindDemo()
@@ -285,8 +287,10 @@ extern "C" void Jac_Start(void* a0, u32 a1, u32 a2, immut char* a3)
 extern "C" void Jac_StartDemo(u32 a0)
 {
 	if (!PikminPsp::audioReady()) return ;
+	PikminPsp::audioLog("game audio call: StartDemo begin id=%u", (unsigned)a0);
 	PikminPsp::AudioLock lock;
 	PspImpl_Jac_StartDemo(a0);
+	PikminPsp::audioLog("game audio call: StartDemo complete id=%u", (unsigned)a0);
 }
 
 extern "C" void Jac_StartPartsFindDemo(u32 a0, BOOL a1)
@@ -344,11 +348,3 @@ extern "C" BOOL Jac_UpdateEventPosition(int a0, SVector_* a1)
 	PikminPsp::AudioLock lock;
 	return PspImpl_Jac_UpdateEventPosition(a0, a1);
 }
-
-extern "C" int Jac_StreamMovieGetPicture(void*, int* width, int* height)
-{
-	if (width) *width = 0;
-	if (height) *height = 0;
-	return 0;
-}
-extern "C" void Jac_StreamMovieStop() {}

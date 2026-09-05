@@ -1,5 +1,6 @@
 #include "port/psp/PspPlatform.h"
 #include "port/psp/PspAudio.h"
+#include "port/psp/PspMovie.h"
 
 #include <pspkernel.h>
 
@@ -16,6 +17,7 @@ int main(int argc, char** argv)
 	PikminPsp::audioLogReset();
 	PikminPsp::audioBootMe();
 	int result = pikminGameMain(argc, argv);
+	PikminPsp::movieShutdown();
 	PikminPsp::audioShutdown();
 	PikminPsp::shutdown();
 	return result;
