@@ -295,6 +295,12 @@ void Texture::createBuffer(int width, int height, int texFmt, void* buf)
 	int dataSize = TexImg::calcDataSize(mTexFormat, mWidth, mHeight);
 
 	mPixelData = (buf) ? buf : new (0x20) u8[(dataSize / 2) * 2];
+#if defined(PLATFORM_PSP)
+	// Shadow capture starts after a short delay; the initial map casts no shadow.
+	if (!buf) {
+		memset(mPixelData, 0, dataSize);
+	}
+#endif
 
 	mWidthFactor  = 1.0f / mWidth;
 	mHeightFactor = 1.0f / mHeight;

@@ -311,11 +311,64 @@ void particleColours()
 	assert(!sState.particleColourEnabled);
 }
 
+// Until TEV lighting is implemented end-to-end, preserve the title's
+// material tint and FIFO alpha rather than applying partial CPU lighting.
+void titleColourCompatibility()
+{
+	resetState(); resetDraws();
+	GXSetChanCtrl(GX_COLOR0, GX_TRUE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT0, GX_DF_CLAMP, GX_AF_SPOT);
+	GXSetChanCtrl(GX_ALPHA0, GX_FALSE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT0, GX_DF_CLAMP, GX_AF_NONE);
+	GXSetChanMatColor(GX_COLOR0A0, (GXColor){255,255,229,255});
+	GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+	for (int i = 0; i < 3; ++i) GXPosition3f32(i, 0, 0);
+	GXEnd();
+	for (const auto& vertex : triangles) assert(vertex.colour == GU_RGBA(255,255,229,255));
+	// A transparent overlay must retain the submitted vertex alpha.
+	resetDraws();
+	GXSetChanCtrl(GX_COLOR0A0, GX_FALSE, GX_SRC_VTX, GX_SRC_VTX, 0, GX_DF_NONE, GX_AF_NONE);
+	GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+	for (int i = 0; i < 4; ++i) {
+		GXPosition3f32(i & 1, i >> 1, 0);
+		GXColor4u8(0,0,0,0);
+	}
+	GXEnd();
+	for (const auto& vertex : triangles) assert(vertex.colour == 0);
+}
+
+void shadowCopies()
+{
+	resetState();
+	Mtx identity = {{1,0,0,0},{0,1,0,0},{0,0,1,0}};
+	GXLoadTexMtxImm(identity, GX_TEXMTX0, GX_MTX3x4);
+	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX2X4, GX_TG_POS, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+	PspGxVertex vertex = {};
+	generateTexCoord(vertex, 0.25f,0.75f,2);
+	assert(vertex.u == 0.25f && vertex.v == 0.75f);
+	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_POS, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+	generateTexCoord(vertex, 0.25f,0.75f,2);
+	assert(vertex.u == 0.125f && vertex.v == 0.375f);
+	// Validate scaled framebuffer reads, GX tile boundaries and big-endian RGB565.
+	std::vector<u32> framebuffer(kBufferWidth*kScreenHeight, GU_RGBA(255,255,255,255));
+	std::vector<u8> buffer(16*8*2, 0);
+	GXSetTexCopySrc(0,0,640,480); GXSetTexCopyDst(16,8,GX_TF_I8,GX_TRUE);
+	copyFramebuffer(buffer.data(), framebuffer.data());
+	for (u32 y=0; y<8; ++y) for (u32 x=0; x<16; ++x)
+		assert(decodeTexturePixel(buffer.data(),16,GX_TF_I8,x,y) == 0xffffffff);
+	for (auto& pixel : framebuffer) pixel = GU_RGBA(255,0,0,255);
+	GXSetTexCopyDst(16,8,GX_TF_RGB565,GX_TRUE);
+	copyFramebuffer(buffer.data(), framebuffer.data());
+	assert(buffer[0] == 0xf8 && buffer[1] == 0);
+	for (u32 y=0; y<8; ++y) for (u32 x=0; x<16; ++x)
+		assert(decodeTexturePixel(buffer.data(),16,GX_TF_RGB565,x,y) == GU_RGBA(255,0,0,255));
+}
+
 int main(int argc, char** argv)
 {
+	titleColourCompatibility();
+	shadowCopies();
 	syntheticLists();
 	movieFrame();
 	particleColours();
 	for (int i = 1; i < argc; ++i) modelTest(argv[i]);
-	puts("PSP GPU mesh, particle colour, and movie frame checks passed");
+	puts("PSP title colour, shadow copy, GPU mesh, particle colour, and movie frame checks passed");
 }

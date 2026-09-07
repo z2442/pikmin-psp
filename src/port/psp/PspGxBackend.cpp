@@ -8,6 +8,7 @@
 #include <pspkernel.h>
 
 #include <malloc.h>
+#include <math.h>
 #include <string.h>
 
 namespace {
@@ -55,6 +56,13 @@ struct PspGxState {
 	u32 currentPositionMatrix;
 	PspGxAttribute attributes[GX_VA_MAX_ATTR];
 	Mtx positionMatrices[10];
+	Mtx textureMatrices[10];
+	GXTexGenSrc texSource;
+	GXTexGenType texType;
+	u32 texMatrix;
+	u16 copyLeft, copyTop, copyWidth, copyHeight, copyDestWidth, copyDestHeight;
+	GXTexFmt copyFormat;
+	u32 drawBufferOffset;
 };
 
 struct PspGxTexture {
@@ -360,6 +368,24 @@ void transformPosition(u8 matrixIndex, f32& x, f32& y, f32& z)
 	z = outputZ;
 }
 
+void generateTexCoord(PspGxVertex& vertex, f32 x, f32 y, f32 z, GXTexGenSrc source = GX_TG_POS,
+                      u32 matrix = GX_IDENTITY)
+{
+	if (sState.texSource != source) return;
+	if (matrix == GX_IDENTITY) matrix = sState.texMatrix;
+	if (matrix < GX_TEXMTX0 || matrix >= GX_IDENTITY) return;
+	// DGX builds the reflection matrix from the model/view rotation and a
+	// half-texture offset. Normals here are native-endian model-space values;
+	// applying the position matrix as well would transform them twice.
+	const Mtx& m = sState.textureMatrices[(matrix - GX_TEXMTX0) / 3];
+	vertex.u = m[0][0]*x + m[0][1]*y + m[0][2]*z + m[0][3];
+	vertex.v = m[1][0]*x + m[1][1]*y + m[1][2]*z + m[1][3];
+	if (sState.texType == GX_TG_MTX3X4) {
+		f32 q = m[2][0]*x + m[2][1]*y + m[2][2]*z + m[2][3];
+		if (fabsf(q) > 1e-8f) { vertex.u /= q; vertex.v /= q; }
+	}
+}
+
 void consumeIndex(const u8*& input, GXAttrType source, u32& index)
 {
 	if (source == GX_INDEX8) {
@@ -372,11 +398,13 @@ void consumeIndex(const u8*& input, GXAttrType source, u32& index)
 void decodeMeshVertex(const u8*& input)
 {
 	u8 matrixIndex = sState.currentPositionMatrix * 3;
+	u32 textureMatrix = sState.texMatrix;
 	for (u32 attribute = GX_VA_PNMTXIDX; attribute <= GX_VA_TEX7MTXIDX; ++attribute) {
 		PspGxAttribute& state = sState.attributes[attribute];
 		if (state.source == GX_DIRECT) {
 			u8 value = *input++;
 			if (attribute == GX_VA_PNMTXIDX) matrixIndex = value;
+			if (attribute == GX_VA_TEX0MTXIDX) textureMatrix = value;
 		} else if (state.source != GX_NONE) {
 			u32 ignored = 0;
 			consumeIndex(input, state.source, ignored);
@@ -391,6 +419,7 @@ void decodeMeshVertex(const u8*& input)
 	f32 x = sourcePosition[0];
 	f32 y = sourcePosition[1];
 	f32 z = position.count == GX_POS_XY ? 0.0f : sourcePosition[2];
+	f32 modelX = x, modelY = y, modelZ = z;
 	transformPosition(matrixIndex, x, y, z);
 	PspGXPosition3f32(x, y, z);
 
@@ -399,6 +428,12 @@ void decodeMeshVertex(const u8*& input)
 	u32 ignored = 0;
 	consumeIndex(input, normal.source, ignored);
 	consumeIndex(input, nbt.source, ignored);
+	const PspGxAttribute& normalData = nbt.source != GX_NONE ? nbt : normal;
+	if (normalData.source != GX_NONE && normalData.array && normalData.componentType == GX_F32) {
+		const f32* n = reinterpret_cast<const f32*>(normalData.array + ignored * normalData.stride);
+		PspGxVertex* vertex = currentVertex();
+		if (vertex) generateTexCoord(*vertex, n[0], n[1], n[2], GX_TG_NRM, textureMatrix);
+	}
 
 	for (u32 attribute = GX_VA_CLR0; attribute <= GX_VA_CLR1; ++attribute) {
 		PspGxAttribute& colour = sState.attributes[attribute];
@@ -421,6 +456,8 @@ void decodeMeshVertex(const u8*& input)
 			PspGXTexCoord2f32(uv[0], texture.count == GX_TEX_S ? 0.0f : uv[1]);
 		}
 	}
+	PspGxVertex* out = currentVertex();
+	if (out) generateTexCoord(*out, modelX, modelY, modelZ, GX_TG_POS, textureMatrix);
 }
 
 int guBlendFactor(GXBlendFactor factor)
@@ -631,6 +668,17 @@ bool drawMeshList(const u8* input, const u8* end)
 				const f32* st = reinterpret_cast<const f32*>(uv.array + meshIndex(input, layout, GX_VA_TEX0) * uv.stride);
 				out.u = st[0]; out.v = uv.count == GX_TEX_S ? 0.0f : st[1];
 			}
+			u32 textureMatrix = layout.offset[GX_VA_TEX0MTXIDX] >= 0
+			    ? meshIndex(input, layout, GX_VA_TEX0MTXIDX) : sState.texMatrix;
+			generateTexCoord(out, out.x, out.y, out.z, GX_TG_POS, textureMatrix);
+			if (sState.texSource == GX_TG_NRM) {
+				GXAttr normalAttr = layout.offset[GX_VA_NBT] >= 0 ? GX_VA_NBT : GX_VA_NRM;
+				const PspGxAttribute& normal = sState.attributes[normalAttr];
+				if (layout.offset[normalAttr] >= 0 && normal.array && normal.componentType == GX_F32) {
+					const f32* n = reinterpret_cast<const f32*>(normal.array + meshIndex(input, layout, normalAttr) * normal.stride);
+					generateTexCoord(out, n[0], n[1], n[2], GX_TG_NRM, textureMatrix);
+				}
+			}
 		}
 		if (primitive == GX_TRIANGLES) {
 			for (u32 i = 0; i < count; ++i) indices[index++] = base + i;
@@ -725,7 +773,11 @@ void PspGXPosition2s16(s16 x, s16 y) { PspGXPosition3f32((f32)x, (f32)y, 0.0f); 
 void PspGXPosition2u16(u16 x, u16 y) { PspGXPosition3f32((f32)x, (f32)y, 0.0f); }
 void PspGXPosition3s16(s16 x, s16 y, s16 z) { PspGXPosition3f32((f32)x, (f32)y, (f32)z); }
 void PspGXPosition3u16(u16 x, u16 y, u16 z) { PspGXPosition3f32((f32)x, (f32)y, (f32)z); }
-void PspGXNormal3f32(f32, f32, f32) { }
+void PspGXNormal3f32(f32 x, f32 y, f32 z)
+{
+	PspGxVertex* vertex = currentVertex();
+	if (vertex) generateTexCoord(*vertex, x, y, z, GX_TG_NRM);
+}
 
 void PspGXColor1u32(u32 colour)
 {
@@ -744,7 +796,7 @@ void PspGXColor4u8(u8 r, u8 g, u8 b, u8 a)
 void PspGXTexCoord2f32(f32 u, f32 v)
 {
 	PspGxVertex* vertex = currentVertex();
-	if (vertex) {
+	if (vertex && sState.texSource != GX_TG_NRM) {
 		vertex->u = u;
 		vertex->v = v;
 	}
@@ -782,6 +834,10 @@ void PspGXWriteF32(f32) { }
 void PspGXEnd(void)
 {
 	if (!sState.inPrimitive) return;
+	if (!sState.verticesPretransformed) for (u32 i = 0; i < sState.vertexCount; ++i) {
+		PspGxVertex& vertex = sState.vertices[i];
+		generateTexCoord(vertex, vertex.x, vertex.y, vertex.z);
+	}
 	if (sState.verticesPretransformed) {
 		ScePspFMatrix4 identity = identityMatrix();
 		sceGuSetMatrix(GU_MODEL, &identity);
@@ -869,7 +925,13 @@ void GXLoadPosMtxImm(const Mtx matrix, u32 id)
 }
 
 void GXLoadNrmMtxImm(const Mtx, u32) { }
-void GXLoadTexMtxImm(const Mtx, u32, GXTexMtxType) { }
+void GXLoadTexMtxImm(const Mtx matrix, u32 id, GXTexMtxType type) {
+	if (id >= GX_TEXMTX0 && id < GX_IDENTITY) {
+	Mtx& out = sState.textureMatrices[(id - GX_TEXMTX0) / 3];
+	memcpy(out, matrix, type == GX_MTX2x4 ? sizeof(f32)*8 : sizeof(Mtx));
+	if (type == GX_MTX2x4) { out[2][0] = out[2][1] = out[2][2] = 0; out[2][3] = 1; }
+	}
+}
 void GXSetCurrentMtx(u32 id)
 {
 	sState.currentPositionMatrix = MIN(id / 3, 9U);
@@ -970,8 +1032,12 @@ OSThread* GXSetCurrentGXThread(void) { return OSGetCurrentThread(); }
 void GXSetDispCopySrc(u16, u16, u16, u16) { }
 void GXSetDispCopyDst(u16, u16) { }
 u32 GXSetDispCopyYScale(f32) { return kScreenHeight; }
-void GXSetTexCopySrc(u16, u16, u16, u16) { }
-void GXSetTexCopyDst(u16, u16, GXTexFmt, GXBool) { }
+void GXSetTexCopySrc(u16 left, u16 top, u16 width, u16 height) {
+	sState.copyLeft = left; sState.copyTop = top; sState.copyWidth = width; sState.copyHeight = height;
+}
+void GXSetTexCopyDst(u16 width, u16 height, GXTexFmt format, GXBool) {
+	sState.copyDestWidth = width; sState.copyDestHeight = height; sState.copyFormat = format;
+}
 void GXSetCopyFilter(GXBool, const u8[12][2], GXBool, const u8[7]) { }
 void GXSetCopyClear(GXColor colour, u32 depth)
 {
@@ -993,7 +1059,7 @@ void GXCopyDisp(void*, GXBool clear)
 	++sDebugFrameCount;
 	sceGuFinish();
 	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
-	sceGuSwapBuffers();
+	sState.drawBufferOffset = reinterpret_cast<uintptr_t>(sceGuSwapBuffers());
 	if (!sState.displayEnabled) {
 		sceGuDisplay(GU_TRUE);
 		sState.displayEnabled = true;
@@ -1012,7 +1078,55 @@ void GXCopyDisp(void*, GXBool clear)
 	sDebugTextureFailures = 0;
 	sDebugBatchedPrimitives = 0;
 }
-void GXCopyTex(void*, GXBool) { }
+// Shadow maps are GX tiled I8 buffers. Keep the CPU copy in that format so
+// eviction and re-upload use the same endian-safe decoder as ordinary assets.
+void copyFramebuffer(u8* output, const u32* framebuffer)
+{
+	const u32 width = sState.copyDestWidth, height = sState.copyDestHeight;
+	for (u32 y = 0; y < height; ++y) for (u32 x = 0; x < width; ++x) {
+		u32 sx = MIN((sState.copyLeft + (2*x+1)*sState.copyWidth/(2*width))*kScreenWidth/640, kScreenWidth-1U);
+		u32 sy = MIN((sState.copyTop + (2*y+1)*sState.copyHeight/(2*height))*kScreenHeight/480, kScreenHeight-1U);
+		u32 colour = framebuffer[sy*kBufferWidth + sx];
+		u32 r = colour & 255, g = (colour >> 8) & 255, b = (colour >> 16) & 255;
+		if (sState.copyFormat == GX_TF_I8) {
+			u32 offset = ((y/4)*((width+7)/8)+x/8)*32 + (y%4)*8 + x%8;
+			output[offset] = (77*r + 150*g + 29*b) >> 8;
+		} else if (sState.copyFormat == GX_TF_RGB565) {
+			u32 offset = ((y/4)*((width+3)/4)+x/4)*32 + ((y%4)*4+x%4)*2;
+			u16 packed = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+			output[offset] = packed >> 8; output[offset+1] = packed;
+		}
+	}
+}
+void GXCopyTex(void* destination, GXBool clear) {
+	if (!destination || !sState.listOpen || !sState.copyDestWidth || !sState.copyDestHeight) return;
+	if (sState.copyFormat != GX_TF_I8 && sState.copyFormat != GX_TF_RGB565) return;
+	sceGuFinish(); sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+	const u32* framebuffer = reinterpret_cast<const u32*>((reinterpret_cast<uintptr_t>(sceGeEdramGetAddr()) | 0x40000000U) + sState.drawBufferOffset);
+	copyFramebuffer(static_cast<u8*>(destination), framebuffer);
+	// Refresh in place: DGX caches the active Texture pointer and may omit
+	// GXLoadTexObj when this same render target is sampled again.
+	for (u32 i = 0; i < ARRAY_SIZE(sTextureCache); ++i) {
+		PspGxTexture& texture = sTextureCache[i];
+		if (texture.source != destination || !texture.pixels) continue;
+		for (u32 y = 0; y < texture.activeHeight; ++y) {
+			for (u32 x = 0; x < texture.activeWidth; ++x) {
+				u32 colour = decodeTexturePixel(static_cast<const u8*>(destination), texture.sourceWidth, texture.format,
+				                                x * texture.sourceWidth / texture.activeWidth,
+				                                y * texture.sourceHeight / texture.activeHeight);
+				texture.pixels[y * texture.storageWidth + x] = rgbaTo4444(colour & 255, (colour >> 8) & 255,
+				                                                       (colour >> 16) & 255, colour >> 24);
+			}
+		}
+		sceKernelDcacheWritebackRange(texture.pixels, texture.byteCount);
+	}
+	sceGuStart(GU_DIRECT, sGxDisplayList);
+	sceGuTexFlush();
+	if (clear) {
+		sceGuClearColor(sState.clearColour); sceGuClearDepth(sState.clearDepth);
+		sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+	}
+}
 
 void GXSetColorUpdate(GXBool enabled) { sceGuPixelMask(enabled ? 0 : 0xffffffff); }
 void GXSetAlphaUpdate(GXBool) { }
@@ -1041,7 +1155,9 @@ void GXSetFog(GXFogType type, f32 start, f32 end, f32, f32, GXColor colour)
 }
 void GXSetFogRangeAdj(GXBool, u16, GXFogAdjTable*) { }
 
-void GXSetTexCoordGen2(GXTexCoordID, GXTexGenType, GXTexGenSrc, u32, GXBool, u32) { }
+void GXSetTexCoordGen2(GXTexCoordID id, GXTexGenType type, GXTexGenSrc source, u32 matrix, GXBool, u32) {
+	if (id == GX_TEXCOORD0) { sState.texSource = source; sState.texType = type; sState.texMatrix = matrix; }
+}
 void GXSetNumTevStages(u8) { }
 void GXSetTevOp(GXTevStageID stage, GXTevMode)
 {

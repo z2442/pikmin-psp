@@ -106,6 +106,18 @@ python3 tools/check_psp_gx.py \
 These checks need PSPSDK headers and a native C++ compiler; they do not measure
 hardware frame rate or verify the final image on a PSP.
 
+Gameplay rendering on PSP bypasses the original two-texture feedback blur.
+That pass sampled an unfilled framebuffer texture and could cover the wake-up
+scene in black. The backend now captures tiled I8 shadow maps and RGB565 scene
+copies, refreshes their cached uploads, and generates position-based shadow
+coordinates. The experimental CPU
+lighting/color-channel changes were rolled back after they regressed title
+rendering following screen-mode selection. The prior material/vertex-color
+approximation remains active. Native checks cover shadow coordinates,
+framebuffer-copy tiling/endian conversion, and opening/title geometry.
+Full GX lighting, multi-stage TEV, and feedback blur remain incomplete;
+gameplay appearance and capture performance still need PSP hardware testing.
+
 The native decoder and metadata checks can be run against the extracted bank:
 
 ```sh

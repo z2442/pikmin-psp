@@ -1651,7 +1651,13 @@ void MapMgr::postrefresh(Graphics& gfx)
 
 #if PIKI_USE_DGX
 	// make and draw infamous blur effect - on by default
-	if (gsys->mToggleBlur) {
+	// PSP has one texture stage; the GX two-texture feedback blur would
+	// overwrite the scene with an unsupported framebuffer effect.
+	if (gsys->mToggleBlur
+#if defined(PLATFORM_PSP)
+	    && false
+#endif
+	) {
 		// set up screen environment for drawing
 		Matrix4f orthoMtx;
 		gfx.setOrthogonal(orthoMtx.mMtx, AREA_FULL_SCREEN(gfx));
@@ -1730,6 +1736,10 @@ void MapMgr::postrefresh(Graphics& gfx)
 		GXSetTevSwapModeTable(GX_TEV_SWAP0, GX_CH_RED, GX_CH_RED, GX_CH_RED, GX_CH_ALPHA);
 #endif
 		gfx.setColour(Colour(160, 160, 160, (int)(mCurrDesaturationLevel * 255.0f)), true);
+#if defined(PLATFORM_PSP)
+		// The PSP bypasses feedback blur; desaturation still needs a valid scene copy.
+		mBlurResultTexture->grabBuffer(mBlurResultTexture->mWidth, mBlurResultTexture->mHeight, false, true);
+#endif
 		gfx.useTexture(mBlurResultTexture, GX_TEXMAP0);
 		gfx.drawRectangle(AREA_FULL_SCREEN(gfx), RectArea(0, 0, mBlurResultTexture->mWidth, mBlurResultTexture->mHeight), nullptr);
 
