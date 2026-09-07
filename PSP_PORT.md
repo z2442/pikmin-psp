@@ -118,6 +118,20 @@ framebuffer-copy tiling/endian conversion, and opening/title geometry.
 Full GX lighting, multi-stage TEV, and feedback blur remain incomplete;
 gameplay appearance and capture performance still need PSP hardware testing.
 
+The opening ship's reflection maps now generate texture coordinates from
+model-space normals using the game's texture matrices, including their
+half-texture offset. Indexed normals, NBT entries, and immediate normals are
+supported without changing the title's material-color path. The native GX
+checks also accept `cinemas/demo01/ufo.mod` and compare reflection coordinates
+between the batched and fallback decoders. Full multi-stage metallic/specular
+material effects still remain approximate.
+
+The Onion body now uses its animated signed TEV color register for the
+`C0 * raster` material operation. This preserves its red/yellow/blue tint
+without enabling the experimental CPU lighting path. Native GX checks cover
+all three tints, opacity, signed clamping, indexed geometry, and restoring
+ordinary title materials. Secondary specular lighting remains approximate.
+
 The native decoder and metadata checks can be run against the extracted bank:
 
 ```sh

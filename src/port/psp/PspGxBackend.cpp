@@ -47,6 +47,11 @@ struct PspGxState {
 	bool verticesPretransformed;
 	u32 currentColour;
 	u32 particleColour;
+	GXColorS10 tevColour0;
+	bool multiplyTevColour0;
+	GXTevOp tevColourOp;
+	GXTevBias tevColourBias;
+	GXTevScale tevColourScale;
 	bool particleColourEnabled;
 	u32 clearColour;
 	u32 clearDepth;
@@ -368,11 +373,28 @@ void transformPosition(u8 matrixIndex, f32& x, f32& y, f32& z)
 	z = outputZ;
 }
 
+// The Onion's animated body uses C0 * raster colour, followed by an
+// additive specular channel. Keep the tint even while specular is approximate.
+u32 materialTint(u32 colour)
+{
+	if (!sState.multiplyTevColour0 || sState.tevColourOp != GX_TEV_ADD || sState.tevColourBias != GX_TB_ZERO) return colour;
+	const s16 tint[3] = {sState.tevColour0.r, sState.tevColour0.g, sState.tevColour0.b};
+	u32 result = colour & 0xff000000;
+	for (u32 component = 0; component < 3; ++component) {
+		s32 value = (s32)((colour >> (component * 8)) & 255) * tint[component];
+		if (sState.tevColourScale == GX_CS_DIVIDE_2) value /= 2;
+		else value *= 1 << (u32)sState.tevColourScale;
+		value /= 255;
+		result |= (u32)MAX(0, MIN(255, value)) << (component * 8);
+	}
+	return result;
+}
+
 void generateTexCoord(PspGxVertex& vertex, f32 x, f32 y, f32 z, GXTexGenSrc source = GX_TG_POS,
-                      u32 matrix = GX_IDENTITY)
+                      u32 matrix = ~0U)
 {
 	if (sState.texSource != source) return;
-	if (matrix == GX_IDENTITY) matrix = sState.texMatrix;
+	if (matrix == ~0U) matrix = sState.texMatrix;
 	if (matrix < GX_TEXMTX0 || matrix >= GX_IDENTITY) return;
 	// DGX builds the reflection matrix from the model/view rotation and a
 	// half-texture offset. Normals here are native-endian model-space values;
@@ -663,6 +685,7 @@ bool drawMeshList(const u8* input, const u8* end)
 			out.x = xyz[0]; out.y = xyz[1]; out.z = pos.count == GX_POS_XY ? 0.0f : xyz[2];
 			out.colour = sState.currentColour;
 			if (col.source != GX_NONE) memcpy(&out.colour, col.array + meshIndex(input, layout, GX_VA_CLR0) * col.stride, 4);
+			out.colour = materialTint(out.colour);
 			out.u = out.v = 0.0f;
 			if (uv.source != GX_NONE) {
 				const f32* st = reinterpret_cast<const f32*>(uv.array + meshIndex(input, layout, GX_VA_TEX0) * uv.stride);
@@ -834,6 +857,7 @@ void PspGXWriteF32(f32) { }
 void PspGXEnd(void)
 {
 	if (!sState.inPrimitive) return;
+	for (u32 i = 0; i < sState.vertexCount; ++i) sState.vertices[i].colour = materialTint(sState.vertices[i].colour);
 	if (!sState.verticesPretransformed) for (u32 i = 0; i < sState.vertexCount; ++i) {
 		PspGxVertex& vertex = sState.vertices[i];
 		generateTexCoord(vertex, vertex.x, vertex.y, vertex.z);
@@ -1161,9 +1185,16 @@ void GXSetTexCoordGen2(GXTexCoordID id, GXTexGenType type, GXTexGenSrc source, u
 void GXSetNumTevStages(u8) { }
 void GXSetTevOp(GXTevStageID stage, GXTevMode)
 {
-	if (stage == GX_TEVSTAGE0) sState.particleColourEnabled = false;
+	if (stage == GX_TEVSTAGE0) {
+		sState.particleColourEnabled = false;
+		sState.multiplyTevColour0 = false;
+	}
 }
-void GXSetTevColorIn(GXTevStageID, GXTevColorArg, GXTevColorArg, GXTevColorArg, GXTevColorArg) { }
+void GXSetTevColorIn(GXTevStageID stage, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d)
+{
+	if (stage == GX_TEVSTAGE0) sState.multiplyTevColour0 = a == GX_CC_ZERO && d == GX_CC_ZERO
+	    && ((b == GX_CC_C0 && c == GX_CC_RASC) || (b == GX_CC_RASC && c == GX_CC_C0));
+}
 void GXSetTevAlphaIn(GXTevStageID stage, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d)
 {
 	// Particle presets source opacity from REG0, not the raster colour or
@@ -1173,14 +1204,23 @@ void GXSetTevAlphaIn(GXTevStageID stage, GXTevAlphaArg a, GXTevAlphaArg b, GXTev
 	if (stage == GX_TEVSTAGE0)
 		sState.particleColourEnabled = a == GX_CA_ZERO && b == GX_CA_TEXA && c == GX_CA_A0 && d == GX_CA_ZERO;
 }
-void GXSetTevColorOp(GXTevStageID, GXTevOp, GXTevBias, GXTevScale, GXBool, GXTevRegID) { }
+void GXSetTevColorOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool, GXTevRegID)
+{
+	if (stage == GX_TEVSTAGE0) { sState.tevColourOp = op; sState.tevColourBias = bias; sState.tevColourScale = scale; }
+}
 void GXSetTevAlphaOp(GXTevStageID, GXTevOp, GXTevBias, GXTevScale, GXBool, GXTevRegID) { }
 void GXSetTevColor(GXTevRegID reg, GXColor colour)
 {
 	sState.currentColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a);
-	if (reg == GX_TEVREG0) sState.particleColour = sState.currentColour;
+	if (reg == GX_TEVREG0) {
+		sState.particleColour = sState.currentColour;
+		sState.tevColour0 = (GXColorS10){colour.r, colour.g, colour.b, colour.a};
+	}
 }
-void GXSetTevColorS10(GXTevRegID, GXColorS10) { }
+void GXSetTevColorS10(GXTevRegID reg, GXColorS10 colour)
+{
+	if (reg == GX_TEVREG0) sState.tevColour0 = colour;
+}
 void GXSetTevKColor(GXTevKColorID, GXColor colour) { sState.currentColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a); }
 void GXSetTevKColorSel(GXTevStageID, GXTevKColorSel) { }
 void GXSetTevKAlphaSel(GXTevStageID, GXTevKAlphaSel) { }

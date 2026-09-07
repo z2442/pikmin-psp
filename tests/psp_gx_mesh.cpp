@@ -161,6 +161,7 @@ void modelTest(const char* path)
 	Reader r;
 	r.data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 	std::vector<std::array<f32, 3>> positions;
+	std::vector<std::array<f32, 3>> normals;
 	std::vector<std::array<f32, 2>> uv[8];
 	std::vector<u32> colours;
 	u32 oldDraws = 0, newDraws = 0;
@@ -173,6 +174,11 @@ void modelTest(const char* path)
 			for (auto& p : positions) for (auto& v : p) v = r.readFloat();
 			GXSetArray(GX_VA_POS, positions.data(), 12);
 			GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+		} else if (chunk == 0x11) {
+			normals.resize(r.read32()); r.align();
+			for (auto& n : normals) for (auto& v : n) v = r.readFloat();
+			GXSetArray(GX_VA_NRM, normals.data(), 12);
+			GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
 		} else if (chunk == 0x13) {
 			colours.resize(r.read32()); r.align();
 			memcpy(colours.data(), r.data.data() + r.pos, colours.size() * 4);
@@ -204,6 +210,13 @@ void modelTest(const char* path)
 					for (u32 l = 0; l < lists; ++l) {
 						r.read32(); r.read32(); u32 size = r.read32(); r.align();
 						oldDraws += compareList(r.data.data() + r.pos, size);
+						if (!normals.empty()) {
+							Mtx reflection = {{0.5f,0,0,0.5f},{0,0.5f,0,0.5f},{0,0,0,1}};
+							GXLoadTexMtxImm(reflection, GX_TEXMTX0, GX_MTX2x4);
+							GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_NRM, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+							compareList(r.data.data() + r.pos, size);
+							GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_TEX0, GX_IDENTITY, GX_FALSE, GX_PTIDENTITY);
+						}
 						++newDraws; r.pos += size;
 					}
 				}
@@ -335,6 +348,83 @@ void titleColourCompatibility()
 	for (const auto& vertex : triangles) assert(vertex.colour == 0);
 }
 
+void reflectionCoordinates()
+{
+	resetState(); resetDraws();
+	// Same scale and half-texture translation used by DGX's hull reflection.
+	Mtx reflection = {{0.5f,0,0,0.5f},{0,0.5f,0,0.5f},{0,0,0,1}};
+	GXLoadTexMtxImm(reflection, GX_TEXMTX0, GX_MTX2x4);
+	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_NRM, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+	f32 positions[][3] = {{10,20,30},{20,30,40},{30,40,50}};
+	f32 normals[][3] = {{-1,0,0},{0,1,0},{1,0,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxDesc(GX_VA_NRM, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	GXSetArray(GX_VA_NRM, normals, sizeof(normals[0]));
+	u8 list[] = {GX_TRIANGLES,0,3, 0,0, 1,1, 2,2};
+	compareList(list, sizeof(list));
+	assert(triangles[0].u == 0 && triangles[0].v == 0.5f);
+	assert(triangles[1].u == 0.5f && triangles[1].v == 1);
+	assert(triangles[2].u == 1 && triangles[2].v == 0.5f);
+	// The normal is the first vector of an NBT entry; tangent/binormal aren't UVs.
+	f32 nbt[][9] = {{-1,0,0, 1,0,0, 0,1,0},{0,1,0, 1,0,0, 0,1,0},{1,0,0, 1,0,0, 0,1,0}};
+	GXSetVtxDesc(GX_VA_NRM, GX_NONE); GXSetVtxDesc(GX_VA_NBT, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NBT, GX_NRM_NBT, GX_F32, 0);
+	GXSetArray(GX_VA_NBT, nbt, sizeof(nbt[0]));
+	compareList(list, sizeof(list));
+	assert(triangles[2].u == 1 && triangles[2].v == 0.5f);
+	resetDraws();
+	GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+	for (u32 i = 0; i < 3; ++i) {
+		GXPosition3f32(positions[i][0], positions[i][1], positions[i][2]);
+		GXNormal3f32(normals[i][0], normals[i][1], normals[i][2]);
+		GXTexCoord2f32(0,0); // Generated coordinates take precedence over FIFO UVs.
+	}
+	GXEnd();
+	assert(triangles[1].u == 0.5f && triangles[1].v == 1);
+	// Returning to ordinary title/UI UVs must stop normal-based generation.
+	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_TEX0, GX_IDENTITY, GX_FALSE, GX_PTIDENTITY);
+	resetDraws(); GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+	for (u32 i = 0; i < 3; ++i) { GXPosition3f32(i,0,0); GXNormal3f32(1,0,0); GXTexCoord2f32(0.2f,0.3f); }
+	GXEnd();
+	assert(triangles[0].u == 0.2f && triangles[0].v == 0.3f);
+}
+
+void onionMaterialTint()
+{
+	resetState(); resetDraws();
+	GXSetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_C0, GX_CC_RASC, GX_CC_ZERO);
+	GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_FALSE, GX_TEVPREV);
+	// Secondary/specular stages and later register writes must not erase C0.
+	GXSetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_CPREV, GX_CC_ONE, GX_CC_RASC);
+	GXSetChanMatColor(GX_COLOR0A0, (GXColor){255,255,255,255});
+	for (GXColorS10 tint : {(GXColorS10){255,40,20,255}, (GXColorS10){255,220,0,255}, (GXColorS10){20,60,255,255}}) {
+		GXSetTevColorS10(GX_TEVREG0, tint);
+		GXSetTevColorS10(GX_TEVREG1, (GXColorS10){0,0,0,0});
+		GXSetTevColorS10(GX_TEVREG2, (GXColorS10){0,0,0,0});
+		resetDraws(); GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+		for (int i=0; i<3; ++i) { GXPosition3f32(i,0,0); GXColor4u8(255,255,255,128); }
+		GXEnd();
+		for (const auto& vertex : triangles) assert(vertex.colour == GU_RGBA(tint.r,tint.g,tint.b,128));
+	}
+	// Indexed geometry must apply the tint once, even with reused triangle indices.
+	f32 positions[][3] = {{0,0,0},{1,0,0},{1,1,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	u8 list[] = {GX_QUADS,0,4, 0,1,2,3};
+	GXSetTevColorS10(GX_TEVREG0, (GXColorS10){128,64,32,255});
+	compareList(list,sizeof(list));
+	for (const auto& vertex : triangles) assert(vertex.colour == GU_RGBA(128,64,32,255));
+	GXSetTevColorS10(GX_TEVREG0, (GXColorS10){-100,512,255,255});
+	assert(materialTint(0xffffffff) == GU_RGBA(0,255,255,255));
+	// Restore the title's ordinary modulate state with no tint leaking into it.
+	GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+	assert(materialTint(0xffffffff) == 0xffffffff);
+}
+
 void shadowCopies()
 {
 	resetState();
@@ -364,11 +454,13 @@ void shadowCopies()
 
 int main(int argc, char** argv)
 {
+	onionMaterialTint();
+	reflectionCoordinates();
 	titleColourCompatibility();
 	shadowCopies();
 	syntheticLists();
 	movieFrame();
 	particleColours();
 	for (int i = 1; i < argc; ++i) modelTest(argv[i]);
-	puts("PSP title colour, shadow copy, GPU mesh, particle colour, and movie frame checks passed");
+	puts("PSP Onion tint, reflection coordinates, title colour, shadow copy, GPU mesh, particle colour, and movie frame checks passed");
 }
