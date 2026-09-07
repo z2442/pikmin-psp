@@ -97,10 +97,17 @@ public:
 	{
 		mIntID = id;
 
+#if defined(PLATFORM_PSP)
+		// Route names are four-character IDs, independent of host byte order.
+		for (int i = 0; i < 4; i++) {
+			mStringID[i] = char(id >> (24 - i * 8));
+		}
+#else
 		char* str = reinterpret_cast<char*>(&mIntID);
 		for (int i = 0; i < 4; i++) {
 			mStringID[i] = str[i];
 		}
+#endif
 
 		mStringID[4] = '\0';
 	}
@@ -110,10 +117,15 @@ public:
 	 */
 	inline void updateID()
 	{
+#if defined(PLATFORM_PSP)
+		mIntID = (u32(u8(mStringID[0])) << 24) | (u32(u8(mStringID[1])) << 16)
+		       | (u32(u8(mStringID[2])) << 8) | u32(u8(mStringID[3]));
+#else
 		char* str = reinterpret_cast<char*>(&mIntID);
 		for (int i = 0; i < 4; i++) {
 			str[i] = mStringID[i];
 		}
+#endif
 	}
 
 	// unused/inlined:

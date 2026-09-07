@@ -278,10 +278,44 @@ void sceGuDrawArray(int primitive, int format, int count, const void* indexData,
 }
 }
 
+void particleColours()
+{
+	resetState();
+	resetDraws();
+	GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+	GXSetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_TEXA, GX_CA_A0, GX_CA_ZERO);
+	GXSetTevColor(GX_TEVREG0, (GXColor){255, 96, 32, 128});
+	GXSetTevColor(GX_TEVREG1, (GXColor){0, 0, 0, 0});
+	// Billboard, child (with irrelevant raster colour), and crossed quads.
+	for (int kind = 0; kind < 3; ++kind) {
+		GXBegin(GX_QUADS, GX_VTXFMT0, kind == 2 ? 8 : 4);
+		for (int i = 0; i < (kind == 2 ? 8 : 4); ++i) {
+			GXPosition3f32(i & 1 ? 25 : -25, i & 2 ? -25 : 25, i >= 4 ? 25 : 0);
+			if (kind == 1) GXColor4u8(0, 0, 0, 0);
+			GXTexCoord2f32(i & 1, (i >> 1) & 1);
+		}
+		GXEnd();
+	}
+	assert(drawCalls == 3 && triangles.size() == 24);
+	for (const auto& vertex : triangles) assert(vertex.colour == GU_RGBA(255, 96, 32, 128));
+	// Restoring ordinary blending must restore raster colours too.
+	GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+	GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+	for (int i = 0; i < 3; ++i) {
+		GXPosition3f32(i, 0, 0);
+		GXColor4u8(10, 20, 30, 255);
+	}
+	GXEnd();
+	assert(triangles.back().colour == GU_RGBA(10, 20, 30, 255));
+	GXSetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_RASA, GX_CA_TEXA, GX_CA_ZERO);
+	assert(!sState.particleColourEnabled);
+}
+
 int main(int argc, char** argv)
 {
 	syntheticLists();
 	movieFrame();
+	particleColours();
 	for (int i = 1; i < argc; ++i) modelTest(argv[i]);
-	puts("PSP GPU mesh and movie frame checks passed");
+	puts("PSP GPU mesh, particle colour, and movie frame checks passed");
 }

@@ -45,6 +45,8 @@ struct PspGxState {
 	bool textureEnabled;
 	bool verticesPretransformed;
 	u32 currentColour;
+	u32 particleColour;
+	bool particleColourEnabled;
 	u32 clearColour;
 	u32 clearDepth;
 	bool guInitialised;
@@ -712,7 +714,7 @@ void PspGXPosition3f32(f32 x, f32 y, f32 z)
 	if (!sState.inPrimitive || sState.vertexCount >= sState.expectedVertices) return;
 	PspGxVertex& vertex = sState.vertices[sState.vertexCount++];
 	vertex.u = vertex.v = 0.0f;
-	vertex.colour = sState.currentColour;
+	vertex.colour = sState.particleColourEnabled ? sState.particleColour : sState.currentColour;
 	vertex.x = x;
 	vertex.y = y;
 	vertex.z = z;
@@ -730,13 +732,13 @@ void PspGXColor1u32(u32 colour)
 	PspGxVertex* vertex = currentVertex();
 	// Most game callers pass a u32 view of an in-memory GXColor.  On the
 	// little-endian PSP that value is already in the ABGR layout GU expects.
-	if (vertex) vertex->colour = colour;
+	if (vertex && !sState.particleColourEnabled) vertex->colour = colour;
 }
 
 void PspGXColor4u8(u8 r, u8 g, u8 b, u8 a)
 {
 	PspGxVertex* vertex = currentVertex();
-	if (vertex) vertex->colour = GU_RGBA(r, g, b, a);
+	if (vertex && !sState.particleColourEnabled) vertex->colour = GU_RGBA(r, g, b, a);
 }
 
 void PspGXTexCoord2f32(f32 u, f32 v)
@@ -1041,12 +1043,27 @@ void GXSetFogRangeAdj(GXBool, u16, GXFogAdjTable*) { }
 
 void GXSetTexCoordGen2(GXTexCoordID, GXTexGenType, GXTexGenSrc, u32, GXBool, u32) { }
 void GXSetNumTevStages(u8) { }
-void GXSetTevOp(GXTevStageID, GXTevMode) { }
+void GXSetTevOp(GXTevStageID stage, GXTevMode)
+{
+	if (stage == GX_TEVSTAGE0) sState.particleColourEnabled = false;
+}
 void GXSetTevColorIn(GXTevStageID, GXTevColorArg, GXTevColorArg, GXTevColorArg, GXTevColorArg) { }
-void GXSetTevAlphaIn(GXTevStageID, GXTevAlphaArg, GXTevAlphaArg, GXTevAlphaArg, GXTevAlphaArg) { }
+void GXSetTevAlphaIn(GXTevStageID stage, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d)
+{
+	// Particle presets source opacity from REG0, not the raster colour or
+	// the environment register written by setPrimEnv immediately afterwards.
+	// GU modulates the texture with this primary colour (an approximation of
+	// the RGB TEV presets), preserving the particle's animated alpha.
+	if (stage == GX_TEVSTAGE0)
+		sState.particleColourEnabled = a == GX_CA_ZERO && b == GX_CA_TEXA && c == GX_CA_A0 && d == GX_CA_ZERO;
+}
 void GXSetTevColorOp(GXTevStageID, GXTevOp, GXTevBias, GXTevScale, GXBool, GXTevRegID) { }
 void GXSetTevAlphaOp(GXTevStageID, GXTevOp, GXTevBias, GXTevScale, GXBool, GXTevRegID) { }
-void GXSetTevColor(GXTevRegID, GXColor colour) { sState.currentColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a); }
+void GXSetTevColor(GXTevRegID reg, GXColor colour)
+{
+	sState.currentColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a);
+	if (reg == GX_TEVREG0) sState.particleColour = sState.currentColour;
+}
 void GXSetTevColorS10(GXTevRegID, GXColorS10) { }
 void GXSetTevKColor(GXTevKColorID, GXColor colour) { sState.currentColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a); }
 void GXSetTevKColorSel(GXTevStageID, GXTevKColorSel) { }

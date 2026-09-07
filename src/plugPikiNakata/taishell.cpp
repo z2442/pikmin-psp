@@ -369,12 +369,24 @@ bool TaiShellNaviPikiInsideAction::act(Teki& teki)
  */
 bool TaiShellEatAction::act(Teki& teki)
 {
+#if defined(PLATFORM_PSP)
+	TekiRecognitionCondition andCondRecognition(&teki);
+	TekiStickerCondition andCondSticker(&teki);
+	TekiNotCondition andCondNot(&andCondSticker);
+	TekiAndCondition andCond(&andCondRecognition, &andCondNot);
+#else
 	TekiAndCondition andCond(stack_new(TekiRecognitionCondition)(&teki),
 	                         stack_new(TekiNotCondition)(stack_new(TekiStickerCondition)(&teki)));
+#endif
 
 	NVector3f spawnPos;
 	teki.outputSpawnPosition(spawnPos);
+#if defined(PLATFORM_PSP)
+	TekiPositionDistanceCondition posDistAndAndPositionDistance(spawnPos, teki.getAttackableRange());
+	TekiAndCondition posDistAndAnd(&andCond, &posDistAndAndPositionDistance);
+#else
 	TekiAndCondition posDistAndAnd(&andCond, stack_new(TekiPositionDistanceCondition)(spawnPos, teki.getAttackableRange()));
+#endif
 	return teki.interactNaviPiki(InteractSwallow(&teki, nullptr, 0), posDistAndAnd);
 
 	// i am not proud of what this project has required of me spiritually

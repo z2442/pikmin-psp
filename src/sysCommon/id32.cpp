@@ -69,11 +69,16 @@ bool ID32::match(u32 id, char wild) immut
  */
 void ID32::updateID()
 {
+#if defined(PLATFORM_PSP)
+	mId = (u32(u8(mStringID[0])) << 24) | (u32(u8(mStringID[1])) << 16)
+	    | (u32(u8(mStringID[2])) << 8) | u32(u8(mStringID[3]));
+#else
 	char* id = reinterpret_cast<char*>(&mId);
 
 	for (int i = 0; i < 4; i++) {
 		id[i] = this->mStringID[i];
 	}
+#endif
 }
 
 /**
@@ -81,6 +86,9 @@ void ID32::updateID()
  */
 void ID32::updateString()
 {
+#if defined(PLATFORM_PSP)
+	sprint(mStringID);
+#else
 	char* id = reinterpret_cast<char*>(&mId);
 
 	for (int i = 0; i < 4; i++) {
@@ -88,6 +96,7 @@ void ID32::updateString()
 	}
 
 	mStringID[4] = 0;
+#endif
 }
 
 /**
@@ -123,12 +132,19 @@ bool ID32::operator!=(u32 other) immut
  */
 void ID32::write(RandomAccessStream& stream) immut
 {
+#if defined(PLATFORM_PSP)
+	// IDs use least-significant byte first on disc, unlike stream integers.
+	for (int shift = 0; shift < 32; shift += 8) {
+		stream.writeByte(u8(mId >> shift));
+	}
+#else
 	immut char* id = reinterpret_cast<immut char*>(&mId);
 
 	stream.writeByte(id[3]);
 	stream.writeByte(id[2]);
 	stream.writeByte(id[1]);
 	stream.writeByte(id[0]);
+#endif
 }
 
 /**
@@ -137,11 +153,18 @@ void ID32::write(RandomAccessStream& stream) immut
  */
 void ID32::read(RandomAccessStream& stream)
 {
+#if defined(PLATFORM_PSP)
+	mId = 0;
+	for (int shift = 0; shift < 32; shift += 8) {
+		mId |= u32(stream.readByte()) << shift;
+	}
+#else
 	char* id = reinterpret_cast<char*>(&mId);
 	id[3]    = stream.readByte();
 	id[2]    = stream.readByte();
 	id[1]    = stream.readByte();
 	id[0]    = stream.readByte();
+#endif
 
 	updateString();
 }

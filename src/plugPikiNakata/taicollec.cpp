@@ -1042,8 +1042,14 @@ bool TaiCollecPelletLostAction::act(Teki& teki)
 		return true;
 	}
 
+#if defined(PLATFORM_PSP)
+	TekiVisibleCondition condVisible(&teki);
+	TekiCollecTargetPelletCondition condCollecTargetPellet(&teki, teki.getParameterI(COLLECPI_CarryPower));
+	TekiAndCondition cond(&condVisible, &condCollecTargetPellet);
+#else
 	TekiAndCondition NRef cond = TekiAndCondition(
 	    stack_new(TekiVisibleCondition)(&teki), stack_new(TekiCollecTargetPelletCondition)(&teki, teki.getParameterI(COLLECPI_CarryPower)));
+#endif
 	if (!cond.satisfy(target)) {
 		teki.clearCreaturePointer(0);
 		return true;

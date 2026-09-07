@@ -94,10 +94,28 @@ bool TaiAnimationSwallowingAction::act(Teki& teki)
 		Vector3f center;
 		teki.outputHitCenter(center);
 
+#if defined(PLATFORM_PSP)
+		TekiRecognitionCondition andCond1Recognition(&teki);
+		TekiStickerCondition andCond1Sticker(&teki);
+		TekiNotCondition andCond1Not(&andCond1Sticker);
+		TekiAndCondition andCond1(&andCond1Recognition, &andCond1Not);
+#else
 		TekiAndCondition andCond1(stack_new(TekiRecognitionCondition)(&teki),
 		                          stack_new(TekiNotCondition)(stack_new(TekiStickerCondition)(&teki)));
+#endif
+#if defined(PLATFORM_PSP)
+		TekiPikiStateCondition andCond2PikiState(PIKISTATE_Flick);
+		TekiNotCondition andCond2Not(&andCond2PikiState);
+		TekiAndCondition andCond2(&andCond1, &andCond2Not);
+#else
 		TekiAndCondition andCond2(&andCond1, stack_new(TekiNotCondition)(stack_new(TekiPikiStateCondition)(PIKISTATE_Flick)));
+#endif
+#if defined(PLATFORM_PSP)
+		TekiPositionSphereDistanceCondition andCond3PositionSphereDistance(center, teki.getAttackHitRange());
+		TekiAndCondition andCond3(&andCond2, &andCond3PositionSphereDistance);
+#else
 		TekiAndCondition andCond3(&andCond2, stack_new(TekiPositionSphereDistanceCondition)(center, teki.getAttackHitRange()));
+#endif
 
 		int swallowPikiNum = 0;
 		int numSlots       = 0;

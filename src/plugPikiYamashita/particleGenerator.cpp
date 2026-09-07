@@ -1163,6 +1163,13 @@ void zen::particleGenerator::drawPtclOriented(Graphics& gfx)
 	gfx.setBlendMode(mBlendFactor, mZMode, mAnimData.mBlendMode);
 	GXSetCullMode(GX_CULL_NONE);
 	GXClearVtxDesc();
+#if defined(PLATFORM_PSP)
+	GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	GXSetCurrentMtx(0);
+#else
 	GXSetVtxDesc(GX_VA_PNMTXIDX, GX_DIRECT);
 	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
 	GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
@@ -1172,6 +1179,7 @@ void zen::particleGenerator::drawPtclOriented(Graphics& gfx)
 
 	GXSetArray(GX_VA_POS, lpsPos, 6);
 	GXSetArray(GX_VA_TEX0, lpsCoord, 2);
+#endif
 
 	GXSetNumChans(0);
 	GXSetNumTexGens(1);
@@ -1280,6 +1288,18 @@ void zen::particleGenerator::drawPtclOriented(Graphics& gfx)
 
 		GXLoadPosMtxImm(mtx1.mMtx, 0);
 
+#if defined(PLATFORM_PSP)
+		// The original TexCoord2u8 calls pack matrix/position/UV indices
+		// directly into the GX FIFO. Submit real vertices to the PSP shim.
+		u16 count = mOrientedDrawConfig.mIsDoubleSided ? 8 : 4;
+		GXBegin(GX_QUADS, GX_VTXFMT0, count);
+		for (u16 i = 0; i < count; ++i) {
+			const u8* pos = lpsPos + i * 6;
+			GXPosition3s16((s16)((u16(pos[0]) << 8) | pos[1]), (s16)((u16(pos[2]) << 8) | pos[3]),
+			               (s16)((u16(pos[4]) << 8) | pos[5]));
+			GXTexCoord2f32(lpsCoord[(i % 4) * 2], lpsCoord[(i % 4) * 2 + 1]);
+		}
+#else
 		if (mOrientedDrawConfig.mIsDoubleSided) {
 			GXBegin(GX_QUADS, GX_VTXFMT0, 8);
 			GXTexCoord2u8(0, 0);
@@ -1303,6 +1323,8 @@ void zen::particleGenerator::drawPtclOriented(Graphics& gfx)
 			GXTexCoord2u8(2, 0);
 			GXTexCoord2u8(3, 3);
 		}
+#endif
+		GXEnd();
 	}
 #else
 	drawPtclBillboard(gfx);

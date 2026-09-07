@@ -964,10 +964,19 @@ bool TaiOtimotiPressingAction::actByEvent(immut TekiEvent& event)
 		Teki* teki = event.mTeki;
 
 		InteractPress NRef press = InteractPress(teki, teki->getParameterF(TPF_AttackPower));
+#if defined(PLATFORM_PSP)
+		TekiRecognitionCondition condRecognition(teki);
+		TekiDistanceCondition condDistance(teki, teki->getAttackRange());
+		TekiStickerCondition condSticker(teki);
+		TekiNotCondition condNot(&condSticker);
+		TekiAndCondition condAnd(&condDistance, &condNot);
+		TekiAndCondition cond(&condRecognition, &condAnd);
+#else
 		TekiAndCondition NRef cond
 		    = TekiAndCondition(stack_new(TekiRecognitionCondition)(teki),
 		                       stack_new(TekiAndCondition)(stack_new(TekiDistanceCondition)(teki, teki->getAttackRange()),
 		                                                   stack_new(TekiNotCondition)(stack_new(TekiStickerCondition)(teki))));
+#endif
 		teki->interactNaviPiki(press, cond);
 		teki->flickUpper();
 		teki->mDamageCount = 0.0f;

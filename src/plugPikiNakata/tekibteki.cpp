@@ -1426,7 +1426,12 @@ bool BTeki::attackRangeNaviPiki(immut Interaction& interaction, immut Condition&
 	outputHitCenter(hitCenter);
 
 	// Fun Fact: Decompiling this unused function fixed a fakematch related to `TekiAndCondition` in this file.
+#if defined(PLATFORM_PSP)
+	TekiPositionSphereDistanceCondition andCondPositionSphereDistance(hitCenter, getAttackHitRange());
+	TekiAndCondition andCond(&condition, &andCondPositionSphereDistance);
+#else
 	TekiAndCondition andCond(&condition, stack_new(TekiPositionSphereDistanceCondition)(hitCenter, getAttackHitRange()));
+#endif
 	return interactNaviPiki(interaction, andCond);
 }
 
@@ -1566,9 +1571,18 @@ void BTeki::flickLower()
  */
 void BTeki::flickLower(InteractFlick& flick)
 {
+#if defined(PLATFORM_PSP)
+	TekiRecognitionCondition andCondRecognition(static_cast<Teki*>(this));
+	TekiStickingCondition andCondSticking;
+	TekiNotCondition andCondNot(&andCondSticking);
+	TekiAndCondition andCondAnd(&andCondRecognition, &andCondNot);
+	TekiDistanceCondition andCondDistance(static_cast<Teki*>(this), getLowerRange());
+	TekiAndCondition andCond(&andCondAnd, &andCondDistance);
+#else
 	TekiAndCondition andCond(stack_new(TekiAndCondition)(stack_new(TekiRecognitionCondition)(static_cast<Teki*>(this)),
 	                                                     stack_new(TekiNotCondition)(stack_new(TekiStickingCondition)())),
 	                         stack_new(TekiDistanceCondition)(static_cast<Teki*>(this), getLowerRange()));
+#endif
 	interactNavi(flick, andCond);
 	flick.mDamage = 0.0f;
 

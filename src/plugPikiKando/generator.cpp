@@ -40,12 +40,16 @@ GeneratorList* generatorList;
  */
 static void writeID(RandomAccessStream& output, u32 id)
 {
+#if defined(PLATFORM_PSP)
+	ID32(id).write(output);
+#else
 	u8* outID = reinterpret_cast<u8*>(&id);
 
 	output.writeByte(outID[3]);
 	output.writeByte(outID[2]);
 	output.writeByte(outID[1]);
 	output.writeByte(outID[0]);
+#endif
 }
 
 /**
@@ -54,6 +58,11 @@ static void writeID(RandomAccessStream& output, u32 id)
  */
 static u32 readID(RandomAccessStream& input)
 {
+#if defined(PLATFORM_PSP)
+	ID32 id;
+	id.read(input);
+	return id.mId;
+#else
 	u32 outID;
 	u8* id = reinterpret_cast<u8*>(&outID);
 	id[3]  = input.readByte();
@@ -61,6 +70,7 @@ static u32 readID(RandomAccessStream& input)
 	id[1]  = input.readByte();
 	id[0]  = input.readByte();
 	return outID;
+#endif
 }
 
 /**

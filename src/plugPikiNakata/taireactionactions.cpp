@@ -216,7 +216,13 @@ bool TaiTargetNearestCollisionAction::actByEvent(immut TekiEvent& event)
 		return false;
 	}
 	Creature* target = event.mOther;
+#if defined(PLATFORM_PSP)
+	TekiRecognitionCondition condRecognition(event.mTeki);
+	TekiNaviPikiCondition condNaviPiki;
+	TekiAndCondition cond(&condRecognition, &condNaviPiki);
+#else
 	TekiAndCondition cond(stack_new(TekiRecognitionCondition)(event.mTeki), stack_new(TekiNaviPikiCondition)());
+#endif
 	if (!cond.satisfy(target)) {
 		return false;
 	}

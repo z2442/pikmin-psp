@@ -533,8 +533,14 @@ bool TaiKinokoDischargingSporesAction::act(Teki& teki)
 		} else if (teki.getAnimationKeyOption(BTeki::ANIMATION_KEY_OPTION_ACTION_2)) {
 			PRINT_NAKATA("TaiKinokoDischargingSporesAction:act:%08x:ACTION_2:\n", &teki);
 			InteractSpore NRef spore = InteractSpore(&teki);
+#if defined(PLATFORM_PSP)
+			TekiRecognitionCondition andCondRecognition(&teki);
+			TekiDistanceCondition andCondDistance(&teki, teki.getAttackRange());
+			TekiAndCondition andCond(&andCondRecognition, &andCondDistance);
+#else
 			TekiAndCondition andCond(stack_new(TekiRecognitionCondition)(&teki),
 			                         stack_new(TekiDistanceCondition)(&teki, teki.getAttackRange()));
+#endif
 			teki.interactNaviPiki(spore, andCond);
 			rumbleMgr->start(RUMBLE_Unk6, 0, teki.getPosition());
 		}

@@ -23,6 +23,8 @@ public:
  */
 class TekiAndCondition : public TekiCondition {
 public:
+	// Composite conditions borrow their operands. Keep each operand alive for
+	// every satisfy() call; stack_new temporaries expire after the declaration.
 	TekiAndCondition(immut Condition* condA, immut Condition* condB)
 	{
 		mConditionA = condA;

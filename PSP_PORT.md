@@ -48,6 +48,40 @@ The opening planet/ship sequence uses the game's model-based cinematic player.
 Demo audio loading now services pending completion callbacks while holding the
 audio lock, preventing the opening's second segment from waiting indefinitely.
 
+Generator IDs retain the original least-significant-byte-first disc format on
+PSP. This lets the first area's `v0.1` header consume its starting direction
+before reading the generator count, fixing an endian error during loading after
+the ship crash. The native regression checks exercise ID strings, serialization,
+generator helpers, and the first-area header. They also check route-name
+conversion and the Onion's nearest-waypoint lookup: the route system has a
+separate ID representation that must preserve names such as `test` on PSP.
+Reversing that name makes the lookup return null during Onion initialization.
+
+```sh
+python3 tools/check_psp_generator_ids.py \
+  build/psp/GPIE01_01-game/data/dataDir/stages/practice/default.gen
+```
+
+The asset argument is optional; a synthetic header is always checked.
+
+PSP AI condition trees use named local operands so their pointers remain valid
+through subsequent searches and interactions. The old temporary-address pattern
+expired at the declaration's semicolon and could crash enemy startup. A native
+sanitizer regression exercises the Palm startup construction and condition
+short-circuiting:
+
+```sh
+python3 tools/check_psp_conditions.py
+```
+
+Environment texture generation handles zero-scale model matrices without
+dividing by zero. Collapsed models use the texture centre; ordinary and mirrored
+scales retain their original mapping. Check the arithmetic with:
+
+```sh
+python3 tools/check_psp_texgen.py
+```
+
 The whole-game target also plays the six original `MovieData/*.h4m` tutorial
 and credits movies. It uses the repository's HVQM4 decoder with big-endian
 bitstream reads, two YUV reference buffers, and a 360×270 RGB565 image centered

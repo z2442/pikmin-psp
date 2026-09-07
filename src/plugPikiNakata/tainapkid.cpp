@@ -1313,10 +1313,22 @@ bool TaiNapkidCatchingAction::act(Teki& teki)
 	NVector3f offset;
 	offset.add2(teki.getPosition(), direction);
 
+#if defined(PLATFORM_PSP)
+	TekiRecognitionCondition notStickerAndIsRecognizedCondRecognition(&teki);
+	TekiStickerCondition notStickerAndIsRecognizedCondSticker(&teki);
+	TekiNotCondition notStickerAndIsRecognizedCondNot(&notStickerAndIsRecognizedCondSticker);
+	TekiAndCondition notStickerAndIsRecognizedCond(&notStickerAndIsRecognizedCondRecognition, &notStickerAndIsRecognizedCondNot);
+#else
 	TekiAndCondition notStickerAndIsRecognizedCond(stack_new(TekiRecognitionCondition)(&teki),
 	                                               stack_new(TekiNotCondition)(stack_new(TekiStickerCondition)(&teki)));
+#endif
+#if defined(PLATFORM_PSP)
+	TekiPositionSphereDistanceCondition posSphereDistAndOtherCondsPositionSphereDistance(offset, teki.getParameterF(TPF_AttackHitRange));
+	TekiAndCondition posSphereDistAndOtherConds(&notStickerAndIsRecognizedCond, &posSphereDistAndOtherCondsPositionSphereDistance);
+#else
 	TekiAndCondition posSphereDistAndOtherConds(
 	    &notStickerAndIsRecognizedCond, stack_new(TekiPositionSphereDistanceCondition)(offset, teki.getParameterF(TPF_AttackHitRange)));
+#endif
 
 	Iterator iter(pikiMgr);
 	CI_LOOP(iter)

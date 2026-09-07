@@ -938,7 +938,12 @@ void Creature::collisionCheck(f32 _unused)
 		return;
 	}
 
+#if defined(PLATFORM_PSP)
+	CndIsAtari collisionCondition;
+	Iterator iter(&mSearchBuffer, &collisionCondition);
+#else
 	Iterator iter(&mSearchBuffer, stack_new(CndIsAtari)());
+#endif
 	CI_LOOP(iter)
 	{
 		Creature* collider = *iter;

@@ -720,7 +720,13 @@ bool TaiSwallowTurningAction::act(Teki& teki)
 		return true;
 	}
 
+#if defined(PLATFORM_PSP)
+	TekiRecognitionCondition condRecognition(&teki);
+	TekiLowerCondition condLower(&teki);
+	TekiAndCondition cond(&condRecognition, &condLower);
+#else
 	TekiAndCondition NRef cond = TekiAndCondition(stack_new(TekiRecognitionCondition)(&teki), stack_new(TekiLowerCondition)(&teki));
+#endif
 	int pikiCount              = teki.countPikis(cond);
 	f32 linFuncValues[2];
 	NClampLinearFunction linFunc(linFuncValues);
@@ -779,11 +785,22 @@ void TaiSwallowFlickingAction::flick(Teki& teki)
 	teki.flickUpper();
 	InteractFlick NRef flick
 	    = InteractFlick(&teki, teki.getParameterF(TPF_LowerFlickPower), teki.getParameterF(TPF_LowerAttackPower), FLICK_BACKWARDS_ANGLE);
+#if defined(PLATFORM_PSP)
+	TekiRecognitionCondition condRecognition(&teki);
+	TekiStickingCondition condSticking;
+	TekiNotCondition condNot(&condSticking);
+	TekiAndCondition condAnd(&condRecognition, &condNot);
+	TekiDistanceCondition condDistance(&teki, teki.getLowerRange());
+	TekiAngleCondition condAngle(&teki, teki.getParameterF(SWALLOWPF_FlickLowerAngle));
+	TekiAndCondition condAnd2(&condDistance, &condAngle);
+	TekiAndCondition cond(&condAnd, &condAnd2);
+#else
 	TekiAndCondition NRef cond = TekiAndCondition(
 	    stack_new(TekiAndCondition)(stack_new(TekiRecognitionCondition)(&teki),
 	                                stack_new(TekiNotCondition)(stack_new(TekiStickingCondition)())),
 	    stack_new(TekiAndCondition)(stack_new(TekiDistanceCondition)(&teki, teki.getLowerRange()),
 	                                stack_new(TekiAngleCondition)(&teki, teki.getParameterF(SWALLOWPF_FlickLowerAngle))));
+#endif
 	teki.interactNaviPiki(flick, cond);
 
 	TekiAndCondition(nullptr, nullptr);
@@ -799,11 +816,22 @@ bool TaiSwallowSwallowingFlickAction::act(Teki& teki)
 	if (teki.getAnimationKeyOption(BTeki::ANIMATION_KEY_OPTION_ACTION_0)) {
 		InteractFlick NRef flick   = InteractFlick(&teki, teki.getParameterF(TPF_LowerFlickPower), teki.getParameterF(TPF_LowerAttackPower),
 		                                           teki.getDirection() + NMathF::pi);
+#if defined(PLATFORM_PSP)
+		TekiRecognitionCondition condRecognition(&teki);
+		TekiStickingCondition condSticking;
+		TekiNotCondition condNot(&condSticking);
+		TekiAndCondition condAnd(&condRecognition, &condNot);
+		TekiDistanceCondition condDistance(&teki, teki.getLowerRange());
+		TekiAngleCondition condAngle(&teki, teki.getParameterF(SWALLOWPF_FlickLowerAngle));
+		TekiAndCondition condAnd2(&condDistance, &condAngle);
+		TekiAndCondition cond(&condAnd, &condAnd2);
+#else
 		TekiAndCondition NRef cond = TekiAndCondition(
 		    stack_new(TekiAndCondition)(stack_new(TekiRecognitionCondition)(&teki),
 		                                stack_new(TekiNotCondition)(stack_new(TekiStickingCondition)())),
 		    stack_new(TekiAndCondition)(stack_new(TekiDistanceCondition)(&teki, teki.getLowerRange()),
 		                                stack_new(TekiAngleCondition)(&teki, teki.getParameterF(SWALLOWPF_FlickLowerAngle))));
+#endif
 		teki.interactNaviPiki(flick, cond);
 	}
 	return false;
