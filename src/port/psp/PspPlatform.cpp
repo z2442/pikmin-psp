@@ -8,6 +8,9 @@
 #include <pspkernel.h>
 #include <psppower.h>
 #include <psprtc.h>
+#if defined(PIKMIN_PSP_GPROF)
+#include <pspprof.h>
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -18,9 +21,22 @@ volatile bool sQuitRequested;
 u32 sPreviousButtons;
 char sExecutableRoot[384] = ".";
 
+#if defined(PIKMIN_PSP_GPROF)
+char sGprofOutputPath[512];
+
+__attribute__((no_instrument_function, no_profile_instrument_function))
+void stopProfiler()
+{
+	gprof_stop(sGprofOutputPath, 1);
+}
+#endif
+
 int exitCallback(int, int, void*)
 {
 	sQuitRequested = true;
+#if defined(PIKMIN_PSP_GPROF)
+	stopProfiler();
+#endif
 #if defined(PIKMIN_PSP_AUDIO)
 	PikminPsp::audioShutdown();
 #endif
@@ -76,6 +92,10 @@ bool initialise(int argc, char** argv)
 	sQuitRequested  = false;
 	sPreviousButtons = 0;
 	findExecutableRoot(argc, argv);
+#if defined(PIKMIN_PSP_GPROF)
+	resolvePath(sGprofOutputPath, sizeof(sGprofOutputPath), "gmon.out");
+	gprof_start();
+#endif
 
 	scePowerSetClockFrequency(333, 333, 166);
 	sceCtrlSetSamplingCycle(0);
@@ -86,6 +106,9 @@ bool initialise(int argc, char** argv)
 
 void shutdown()
 {
+#if defined(PIKMIN_PSP_GPROF)
+	stopProfiler();
+#endif
 #if defined(PIKMIN_PSP_AUDIO)
 	audioShutdown();
 #endif

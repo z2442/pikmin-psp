@@ -44,6 +44,30 @@ metadata once, then directly decodes the game's AFC/PCM `.aw` samples and
 streamed `.stx` audio on the Media Engine. PCM is sent to the PSP hardware SRC
 at 32 kHz; no GameCube DSP instruction emulation is involved.
 
+For a separate gprof build, use:
+
+```sh
+make -f Makefile.psp psp-game-gprof -j8
+# Equivalent: make -f Makefile.psp psp-game PSP_ENABLE_GPROF=1 -j8
+```
+
+This writes `build/psp/GPIE01_01-game-gprof/EBOOT.PBP` and keeps its objects
+and unstripped `pikmin-psp.elf` separate from the normal build. The bootstrap
+equivalent is `psp-port-gprof`, with output in `build/psp/GPIE01_01-gprof`.
+The profiling EBOOT packages a standard ELF payload so the SDK profiler gets
+the required startup and text bounds; the normal EBOOT continues to use PRX.
+Install the profiling EBOOT alongside the usual `data/dataDir`. Profiling
+starts during platform initialization; exiting through HOME or normal shutdown
+writes `gmon.out` beside the EBOOT. Forced termination cannot save a profile.
+The ME audio mixer and stream code are built without instrumentation because
+the profiler runs on the main CPU.
+
+Copy `gmon.out` back and use the ELF from that exact build:
+
+```sh
+psp-gprof -b -p -q build/psp/GPIE01_01-game-gprof/pikmin-psp.elf gmon.out > gprof.txt
+```
+
 The opening planet/ship sequence uses the game's model-based cinematic player.
 Demo audio loading now services pending completion callbacks while holding the
 audio lock, preventing the opening's second segment from waiting indefinitely.

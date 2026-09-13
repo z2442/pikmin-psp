@@ -2,6 +2,8 @@ PSPSDK := $(shell psp-config --pspsdk-path)
 PSPDEV := $(shell psp-config --pspdev-path)
 
 PSP_BUILD ?= bootstrap
+PSP_ENABLE_GPROF ?= 0
+PSP_GPROF_ENABLED := $(filter 1 ON on TRUE true YES yes,$(PSP_ENABLE_GPROF))
 
 ifeq ($(PSP_BUILD),game)
 BUILD_DIR := build/psp/GPIE01_01-game
@@ -37,6 +39,11 @@ PSP_RENDERER_SOURCES := src/port/psp/PspRenderer.cpp
 PSP_EBOOT_TITLE := Pikmin PSP Port (GPIE01_01)
 endif
 
+ifneq ($(PSP_GPROF_ENABLED),)
+BUILD_DIR := $(BUILD_DIR)-gprof
+PSP_EBOOT_TITLE := $(PSP_EBOOT_TITLE) [gprof]
+endif
+
 TARGET := $(BUILD_DIR)/pikmin-psp
 PSP_EBOOT := $(BUILD_DIR)/EBOOT.PBP
 PSP_EBOOT_SFO := $(BUILD_DIR)/PARAM.SFO
@@ -67,6 +74,10 @@ endif
 # stub.  Section GC can orphan imports referenced only by compatibility shims.
 LDFLAGS := -Wl,-u,module_info
 LIBS := -lintrafont -lpspgum -lpspgu -lpsppower -lpsprtc -lm -lstdc++
+ifneq ($(PSP_GPROF_ENABLED),)
+CFLAGS += -DPIKMIN_PSP_GPROF=1 -pg -fno-omit-frame-pointer -fno-optimize-sibling-calls
+LDFLAGS += -pg -g
+endif
 ifeq ($(PSP_BUILD),game)
 CFLAGS += -DPIKMIN_PSP_AUDIO=1
 LIBS += -lme-core -lpspaudio
@@ -75,15 +86,26 @@ endif
 EXTRA_TARGETS := $(PSP_EBOOT)
 PSP_FW_VERSION := 600
 BUILD_PRX := 1
+ifneq ($(PSP_GPROF_ENABLED),)
+# Use the standard startup and executable text bounds required by libpspprof.
+# PSPSDK packages a stripped ELF and retains the symbol ELF for psp-gprof.
+BUILD_PRX := 0
+endif
 # Request the expanded user partition explicitly. This controls the packaged
 # EBOOT; a PRX loaded by PSPLINK inherits the partition selected by PSPLINK.
 PSP_LARGE_MEMORY := 1
 
-.PHONY: psp-port psp-game
+.PHONY: psp-port psp-game psp-port-gprof psp-game-gprof
 psp-port: all
 
 psp-game:
 	$(MAKE) -f Makefile.psp PSP_BUILD=game all
+
+psp-port-gprof:
+	$(MAKE) -f Makefile.psp PSP_BUILD=bootstrap PSP_ENABLE_GPROF=1 all
+
+psp-game-gprof:
+	$(MAKE) -f Makefile.psp PSP_BUILD=game PSP_ENABLE_GPROF=1 all
 
 ifeq ($(PSP_BUILD),game)
 $(BUILD_DIR)/obj/sysBootup.o: CXXFLAGS += -Dmain=pikminGameMain
@@ -104,3 +126,13 @@ $(BUILD_DIR)/obj/hvqm4dec/%.o: src/hvqm4dec/%.c
 -include $(OBJS:.o=.d)
 
 include $(PSPSDK)/lib/build.mak
+
+ifneq ($(PSP_GPROF_ENABLED),)
+# ME callbacks and the stream mixer they call cannot use the CPU profiler.
+$(BUILD_DIR)/obj/port/psp/PspAudioMixer.o $(BUILD_DIR)/obj/port/psp/PspAudioStream.o: CXXFLAGS := $(filter-out -pg,$(CXXFLAGS))
+endif
+
+$(PSP_EBOOT_SFO): | $(BUILD_DIR)
+
+$(BUILD_DIR):
+	@mkdir -p $@
