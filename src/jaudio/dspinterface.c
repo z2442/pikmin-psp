@@ -312,8 +312,10 @@ void DSP_InitFilter(u8 idx)
  */
 void DSP_FlushBuffer()
 {
+#if !defined(PLATFORM_PSP)
 	DCFlushRange(CH_BUF, sizeof(CH_BUF));
 	DCFlushRange(FX_BUF, sizeof(FX_BUF));
+#endif
 }
 
 /**
@@ -321,7 +323,11 @@ void DSP_FlushBuffer()
  */
 void DSP_FlushChannel(u8 idx)
 {
+#if !defined(PLATFORM_PSP)
 	DCFlushRangeNoSync(&CH_BUF[idx], sizeof(DSPchannel_));
+#endif
+	// PSP's main CPU owns CH_BUF. The ME consumes PspAudioMixer's separately
+	// synchronized job snapshot, so flushing this table only evicts hot data.
 }
 
 /**

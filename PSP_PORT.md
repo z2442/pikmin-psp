@@ -44,6 +44,18 @@ metadata once, then directly decodes the game's AFC/PCM `.aw` samples and
 streamed `.stx` audio on the Media Engine. PCM is sent to the PSP hardware SRC
 at 32 kHz; no GameCube DSP instruction emulation is involved.
 
+Audio transport sends an 80-byte mixer channel snapshot in place of each
+384-byte GameCube DSP block. JAudio's CPU-owned channel table no longer receives
+redundant DSP cache flushes. The 16 KiB stream input is published only on refill
+or reset; the 256-byte playback state still synchronizes for every 80-sample job.
+This preserves the sequencer cadence, mixer fields and completion updates while
+reducing interprocessor cache traffic. `audio.log` reports the transport sizes.
+Native transfer-range, refill/reset, and channel-field checks run with:
+
+```sh
+python3 tools/check_psp_audio_transport.py
+```
+
 For a separate gprof build, use:
 
 ```sh
@@ -66,6 +78,59 @@ Copy `gmon.out` back and use the ELF from that exact build:
 
 ```sh
 psp-gprof -b -p -q build/psp/GPIE01_01-game-gprof/pikmin-psp.elf gmon.out > gprof.txt
+```
+
+The first profile-driven renderer optimization skips the vertex tint pass for
+ordinary materials and caches three 256-byte channel tables for tinted materials.
+The tables preserve the existing signed TEV arithmetic and opacity; they are
+rebuilt when the RGB tint or scale changes. Native GX checks compare all signed
+tint values and scales against the previous arithmetic, alongside the existing
+geometry checks. To measure the gain, repeat the same scene and duration on PSP
+with the updated build. Keep each capture with its matching ELF before rebuilding;
+profiling overhead and time spent waiting can distort the flat-profile rankings.
+
+Rigid mesh conversion now has a bounded 4 MiB cache. It retains native vertices
+and triangle indices, checks the display list and source array versions before
+reuse, and applies the current model matrix at draw time. Model draw scopes
+compare shared array snapshots once when binding the model, rather than once
+per material. These snapshots have a separate 2 MiB budget. Calls outside these
+scopes retain per-entry byte comparisons. Changes
+to positions, UVs, vertex colors, tint, normals, or reflection state invalidate
+the affected entry. Skinned meshes retain their existing path. Allocation failure
+falls back to conversion. Cached buffers are submitted directly to the GPU and
+remain protected from eviction until a GPU sync completes. Aligned snapshots
+avoid the PSP library's byte-at-a-time comparison path.
+
+The native GX checks exercise reuse, source mutations, animated matrices,
+reflection changes, and eviction protection. Replaying the opening and logo
+models together reproduces the title's 71,010 decoded vertices per frame; after
+warmup the eight-way cache avoids all 71,010 conversions in that replay. The reported native benchmark
+ratio is not a PSP FPS measurement. In `performance.log`, `mesh_cache_hits` and
+`cached_vertices` report reuse, while `cache_validate_ms` measures lookup and
+snapshot checks within `mesh_ms`. `array_validate_ms` measures the shared array
+comparisons inside `render_ms`, outside `mesh_ms`.
+
+The normal build also writes `performance.log` beside the EBOOT every 120
+presented frames. It reports average FPS, frame time, final GPU wait, display-list
+split wait, framebuffer-copy time (including its GPU wait), and draw/vertex/copy
+counts. Each launch starts a new log at the first report. Use this log from the
+slow scene to distinguish GPU/copy stalls from the remaining game, audio, CPU
+rendering and pacing time without gprof instrumentation. A second line now
+reports main/audio thread CPU time, render, mesh conversion, texture loading,
+retrace waits, audio work, and audio-lock waits. Wall-time scopes overlap (for
+example mesh work is part of rendering, and audio can run during either), so
+these columns must not be added together. The submitted-index count includes
+vertex reuse; `decoded_vertices` counts actual mesh vertex conversions.
+`skinned_vertices`, `fallback_lists`, and `texture_misses` help identify expensive
+paths. Counter units and wraparound can be checked with
+`python3 tools/check_psp_performance.py`.
+
+PSP frame pacing reads the hardware refresh counter, including refreshes that
+pass during rendering. This avoids adding the full pacing delay to frames that
+have already missed their target. Check the VI shim with:
+
+```sh
+python3 tools/check_psp_retrace.py
 ```
 
 The opening planet/ship sequence uses the game's model-based cinematic player.

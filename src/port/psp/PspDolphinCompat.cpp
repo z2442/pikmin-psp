@@ -3,6 +3,7 @@
 #include "Dolphin/hio.h"
 #include "Dolphin/pad.h"
 #include "Dolphin/vi.h"
+#include "port/psp/PspPerformance.h"
 
 #include <pspdisplay.h>
 
@@ -16,7 +17,6 @@ const u32 kAramSize = 0x00800000;
 u8* sAram;
 VIRetraceCallback sPreRetrace;
 VIRetraceCallback sPostRetrace;
-u32 sRetraceCount;
 
 u8* aramAddress(u32 address, u32 length)
 {
@@ -129,7 +129,9 @@ void VIFlush(void) { }
 void VISetNextFrameBuffer(void*) { }
 void VISetBlack(BOOL) { }
 u32 VIGetDTVStatus(void) { return 1; }
-u32 VIGetRetraceCount(void) { return sRetraceCount; }
+// Count refreshes during rendering too. A synthetic counter incremented only
+// by VIWaitForRetrace makes slow frames pay the full pacing delay again.
+u32 VIGetRetraceCount(void) { return sceDisplayGetVcount(); }
 VIRetraceCallback VISetPreRetraceCallback(VIRetraceCallback callback)
 {
 	VIRetraceCallback previous = sPreRetrace;
@@ -144,10 +146,11 @@ VIRetraceCallback VISetPostRetraceCallback(VIRetraceCallback callback)
 }
 void VIWaitForRetrace(void)
 {
+	PikminPsp::PerformanceScope timing(PikminPsp::PerformancePacing);
 	sceDisplayWaitVblankStart();
-	++sRetraceCount;
-	if (sPreRetrace) sPreRetrace(sRetraceCount);
-	if (sPostRetrace) sPostRetrace(sRetraceCount);
+	u32 retraceCount = VIGetRetraceCount();
+	if (sPreRetrace) sPreRetrace(retraceCount);
+	if (sPostRetrace) sPostRetrace(retraceCount);
 }
 
 } // extern "C"

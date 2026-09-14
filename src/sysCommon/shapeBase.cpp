@@ -1,4 +1,7 @@
 #include "Shape.h"
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspGxMeshCache.h"
+#endif
 
 #include "Animator.h"
 #include "CinematicPlayer.h"
@@ -2067,6 +2070,9 @@ void BaseShape::drawroutes(Graphics& gfx, Camera& cam)
  */
 void BaseShape::drawculled(Graphics& gfx, Camera& cam, ShapeDynMaterials* dynMats)
 {
+#if defined(PLATFORM_PSP)
+	PikminPsp::MeshValidationScope validation;
+#endif
 	immut Matrix4f* mtx = gfx.mActiveMatrix;
 	gfx.initMesh((Shape*)this);
 	int culledJointCount = 0;

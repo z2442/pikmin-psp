@@ -5,6 +5,11 @@
 #include "Mesh.h"
 #include "Shape.h"
 #include "sysNew.h"
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspPerformance.h"
+#include "port/psp/PspGxMeshCache.h"
+static u32 sPspRenderStart;
+#endif
 
 /**
  * @todo: Documentation
@@ -515,6 +520,9 @@ void DGXGraphics::initRender(int a1, int a2)
  */
 void DGXGraphics::beginRender()
 {
+#if defined(PLATFORM_PSP)
+	sPspRenderStart = sceKernelGetSystemTimeLow();
+#endif
 	if (gsys->mIsRendering) {
 		ERROR("still busy with GP!\n");
 	}
@@ -540,6 +548,9 @@ void DGXGraphics::doneRender()
 	GXFlush();
 	GXDrawDone();
 	gsys->mIsRendering = 0;
+#if defined(PLATFORM_PSP)
+	PikminPsp::performanceAdd(PikminPsp::PerformanceRender, (u32)(sceKernelGetSystemTimeLow() - sPspRenderStart));
+#endif
 }
 
 /**
@@ -1211,6 +1222,14 @@ static GXVtxAttrFmtList meshVAT[] = {
  */
 void DGXGraphics::initMesh(Shape* model)
 {
+#if defined(PLATFORM_PSP)
+	if (model->mVertexCount > 0) PikminPsp::validateMeshArray(GX_VA_POS, model->mVertexList, model->mVertexCount * sizeof(Vector3f));
+	if (model->mNormalCount > 0) PikminPsp::validateMeshArray(GX_VA_NRM, model->mNormalList, model->mNormalCount * sizeof(Vector3f));
+	if (model->mNBTCount > 0) PikminPsp::validateMeshArray(GX_VA_NBT, model->mNBTList, model->mNBTCount * sizeof(NBT));
+	if (model->mVtxColorCount > 0) PikminPsp::validateMeshArray(GX_VA_CLR0, model->mVtxColorList, model->mVtxColorCount * sizeof(Colour));
+	for (int i = 0; i < model->mTotalActiveTexCoords; ++i)
+		if (model->mTexCoordCounts[i] > 0) PikminPsp::validateMeshArray((GXAttr)(GX_VA_TEX0 + i), model->mTexCoordList[i], model->mTexCoordCounts[i] * sizeof(Vector2f));
+#endif
 	oldTevGroup = 0;
 	GXSetVtxAttrFmtv(GX_VTXFMT0, meshVAT);
 	GXSetVtxDescv(meshVCD);
@@ -1406,6 +1425,9 @@ void DGXGraphics::drawSingleMatpoly(Shape* model, Joint::MatPoly* matPoly)
  */
 void DGXGraphics::drawMeshes(Camera&, Shape* shape)
 {
+#if defined(PLATFORM_PSP)
+	PikminPsp::MeshValidationScope validation;
+#endif
 	initMesh(shape);
 	for (int i = shape->mTotalMatpolyCount - 1; i >= 0; i--) {
 		drawSingleMatpoly(shape, shape->mMatpolyList[i]);

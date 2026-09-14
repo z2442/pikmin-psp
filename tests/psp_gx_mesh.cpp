@@ -8,11 +8,17 @@
 #include <cstdio>
 #include <fstream>
 #include <vector>
+#include <chrono>
+
+namespace PikminPsp {
+void performanceAdd(PerformanceMetric, u32) {}
+}
 
 namespace {
 alignas(16) u8 memory[8 * 1024 * 1024];
 u32 used;
 u32 drawCalls;
+bool recordGeometry = true;
 ScePspFMatrix4 modelMatrix;
 ScePspFMatrix4 bones[8];
 std::vector<PspGxVertex> triangles;
@@ -87,6 +93,12 @@ u32 compareList(const u8* input, u32 size)
 	for (u32 i = 0; i < triangles.size(); ++i) equalVertex(triangles[i], expected[i]);
 	ScePspFMatrix4 expectedModel = positionMatrix(sState.positionMatrices[sState.currentPositionMatrix]);
 	assert(memcmp(&modelMatrix, &expectedModel, sizeof(expectedModel)) == 0);
+	// A second submission exercises the persistent cache against the same
+	// reference geometry, rather than merely checking that a cache hit occurred.
+	resetDraws();
+	assert(drawMeshList(input, input + size));
+	assert(drawCalls == 1 && triangles.size() == expected.size());
+	for (u32 i = 0; i < triangles.size(); ++i) equalVertex(triangles[i], expected[i]);
 	return oldDraws;
 }
 
@@ -124,6 +136,129 @@ void syntheticLists()
 	compareList(list, sizeof(list));
 }
 
+void meshCacheInvalidation()
+{
+	clearMeshCache();
+	resetState();
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	f32 uv[][2] = {{0,0},{1,0},{0,1}};
+	f32 normals[][3] = {{0,0,1},{0,1,0},{1,0,0}};
+	u32 colours[] = {0xff102030,0x80405060,0x40708090};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxDesc(GX_VA_NRM, GX_INDEX8);
+	GXSetVtxDesc(GX_VA_CLR0, GX_INDEX8);
+	GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	GXSetArray(GX_VA_NRM, normals, sizeof(normals[0]));
+	GXSetArray(GX_VA_CLR0, colours, sizeof(colours[0]));
+	GXSetArray(GX_VA_TEX0, uv, sizeof(uv[0]));
+	u8 list[] = {GX_TRIANGLES,0,3, 0,0,0,0, 1,1,1,1, 2,2,2,2};
+	compareList(list, sizeof(list));
+	u64 decoded = sTimings.decodedVertices;
+	sState.positionMatrices[0][0][3] += 20;
+	compareList(list, sizeof(list));
+	assert(sTimings.decodedVertices == decoded); // GE matrix animation needs no conversion.
+	positions[1][0] = 7; compareList(list, sizeof(list));
+	uv[1][1] = 0.75f; compareList(list, sizeof(list));
+	colours[2] = 0xaabbccdd; compareList(list, sizeof(list));
+	list[3] = 2; compareList(list, sizeof(list));
+	sState.currentPositionMatrix = 9; compareList(list, sizeof(list));
+	GXSetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_C0, GX_CC_RASC, GX_CC_ZERO);
+	GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_FALSE, GX_TEVPREV);
+	GXSetTevColorS10(GX_TEVREG0, (GXColorS10){255,100,50,255}); compareList(list, sizeof(list));
+	GXSetTevColorS10(GX_TEVREG0, (GXColorS10){50,100,255,255}); compareList(list, sizeof(list));
+	Mtx reflection = {{0.5f,0,0,0.5f},{0,0.5f,0,0.5f},{0,0,0,1}};
+	GXLoadTexMtxImm(reflection, GX_TEXMTX0, GX_MTX2x4);
+	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_NRM, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+	compareList(list, sizeof(list));
+	normals[0][0] = 0.5f; compareList(list, sizeof(list));
+	reflection[0][3] = 0.25f;
+	GXLoadTexMtxImm(reflection, GX_TEXMTX0, GX_MTX2x4); compareList(list, sizeof(list));
+	// Pointer reuse with changed bytes and changed array bindings must miss.
+	f32 replacement[][3] = {{2,3,4},{5,6,7},{8,9,10}};
+	GXSetArray(GX_VA_POS, replacement, sizeof(replacement[0])); compareList(list, sizeof(list));
+	meshCacheGpuIdle();
+	compareList(list, sizeof(list));
+	MeshCacheKey key;
+	meshCacheKey(key);
+	MeshCacheEntry* pinned = findCachedMesh(list, sizeof(list), key);
+	assert(pinned && pinned->gpuEpoch == sMeshCacheEpoch);
+	const u8* oldStorage = pinned->storage;
+	std::vector<u8> oldBytes(oldStorage, oldStorage + pinned->allocationBytes);
+	// Multiple changes before any GPU sync fill the associative set. The
+	// fallback may draw uncached, but must not overwrite the pinned allocation.
+	for (u32 i = 0; i < 8; ++i) {
+		replacement[1][0] += 1;
+		compareList(list, sizeof(list));
+		assert(pinned->storage == oldStorage);
+		assert(!memcmp(oldStorage, oldBytes.data(), oldBytes.size()));
+	}
+	meshCacheGpuIdle();
+	compareList(list, sizeof(list));
+	meshCacheKey(key);
+	assert(findCachedMesh(list, sizeof(list), key));
+	assert(sMeshCacheBytes > 0 && sMeshCacheBytes <= kMeshCacheLimit);
+	clearMeshCache();
+	assert(sMeshCacheBytes == 0);
+}
+
+void sharedMeshArrays()
+{
+	clearMeshCache(); resetState();
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	u8 list[] = {GX_TRIANGLES,0,3,0,1,2};
+	u64 firstGeneration;
+	{
+		PikminPsp::MeshValidationScope scope;
+		PikminPsp::validateMeshArray(GX_VA_POS, positions, sizeof(positions));
+		compareList(list, sizeof(list));
+		MeshCacheKey key; meshCacheKey(key);
+		auto* entry = findCachedMesh(list, sizeof(list), key);
+		assert(entry && entry->inputs[0].generation);
+		firstGeneration = entry->inputs[0].generation;
+		u64 decoded = sTimings.decodedVertices;
+		sState.positionMatrices[0][0][3] += 4;
+		compareList(list, sizeof(list));
+		assert(sTimings.decodedVertices == decoded);
+		// Nested scopes restore the outer bindings.
+		{ PikminPsp::MeshValidationScope nested; assert(sMeshValidationScope == &nested); }
+		assert(sMeshValidationScope == &scope);
+	}
+	assert(!sMeshValidationScope);
+	positions[1][0] = 8;
+	meshCacheGpuIdle();
+	{
+		PikminPsp::MeshValidationScope scope;
+		PikminPsp::validateMeshArray(GX_VA_POS, positions, sizeof(positions));
+		compareList(list, sizeof(list));
+		MeshCacheKey key; meshCacheKey(key);
+		auto* entry = findCachedMesh(list, sizeof(list), key);
+		assert(entry && entry->inputs[0].generation != firstGeneration);
+	}
+	// Outside a validated model scope, direct writes still use byte snapshots.
+	positions[2][1] = 5;
+	meshCacheGpuIdle(); compareList(list, sizeof(list));
+	positions[2][1] = 9;
+	meshCacheGpuIdle(); compareList(list, sizeof(list));
+	{
+		PikminPsp::MeshValidationScope scope;
+		// An undersized registration must not bypass checks for other vertices.
+		PikminPsp::validateMeshArray(GX_VA_POS, positions, sizeof(positions[0]));
+		meshCacheGpuIdle(); compareList(list, sizeof(list));
+		positions[1][2] = 7;
+		meshCacheGpuIdle(); compareList(list, sizeof(list));
+	}
+	clearMeshCache();
+	assert(sMeshArrayBytes == 0);
+}
+
 void movieFrame()
 {
 	resetState(); resetDraws();
@@ -154,6 +289,54 @@ struct Reader {
 	void align() { pos = (pos + 31) & ~31U; }
 };
 
+struct ModelDraw { const u8* list; u32 bytes; PspGxState state; u32 arrayBytes[GX_VA_MAX_ATTR]; };
+struct RecordedModel {
+	std::vector<u8> data;
+	std::vector<std::array<f32,3>> positions, normals;
+	std::vector<std::array<f32,2>> uv[8];
+	std::vector<u32> colours;
+	std::vector<ModelDraw> draws;
+};
+std::vector<RecordedModel> recordedModels;
+
+void benchmarkModels(const std::vector<ModelDraw>& modelDraws)
+{
+	// Replay entire model frames, so the benchmark exposes capacity misses
+	// instead of repeatedly warming only one draw in an otherwise empty cache.
+	recordGeometry = false;
+	double milliseconds[2];
+	for (bool cached : {false, true}) {
+		clearMeshCache();
+		u64 beforeDecoded = 0, beforeHits = 0;
+		std::chrono::steady_clock::time_point start;
+		for (u32 frame = 0; frame < 13; ++frame) {
+			meshCacheGpuIdle();
+			if (frame == 1) {
+				start = std::chrono::steady_clock::now();
+				beforeDecoded = sTimings.decodedVertices; beforeHits = sTimings.meshCacheHits;
+			}
+			PikminPsp::MeshValidationScope validation;
+			const void* previousPositions = nullptr;
+			for (const auto& draw : modelDraws) {
+				if (draw.state.attributes[GX_VA_POS].array != previousPositions) {
+					for (u32 attr = 0; attr < GX_VA_MAX_ATTR; ++attr)
+						if (draw.arrayBytes[attr]) PikminPsp::validateMeshArray((GXAttr)attr, draw.state.attributes[attr].array, draw.arrayBytes[attr]);
+					previousPositions = draw.state.attributes[GX_VA_POS].array;
+				}
+				sState = draw.state; resetDraws();
+				assert(drawMeshList(draw.list, draw.list + draw.bytes, cached));
+			}
+		}
+		milliseconds[cached] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / 12;
+		printf("  %s: native conversion %.3f ms/frame, decoded %.0f, cache hits %.0f, cache bytes %u\n",
+		       cached ? "cached" : "uncached", milliseconds[cached],
+		       (sTimings.decodedVertices - beforeDecoded) / 12.0, (sTimings.meshCacheHits - beforeHits) / 12.0, sMeshCacheBytes);
+	}
+	printf("  native conversion ratio: %.2fx (not PSP FPS)\n", milliseconds[0] / milliseconds[1]);
+	recordGeometry = true;
+	clearMeshCache();
+}
+
 void modelTest(const char* path)
 {
 	std::ifstream file(path, std::ios::binary);
@@ -165,6 +348,7 @@ void modelTest(const char* path)
 	std::vector<std::array<f32, 2>> uv[8];
 	std::vector<u32> colours;
 	u32 oldDraws = 0, newDraws = 0;
+	std::vector<ModelDraw> modelDraws;
 	resetState();
 	while (r.pos + 8 <= r.data.size()) {
 		u32 chunk = r.read32(), length = r.read32(), next = r.pos + length;
@@ -210,6 +394,12 @@ void modelTest(const char* path)
 					for (u32 l = 0; l < lists; ++l) {
 						r.read32(); r.read32(); u32 size = r.read32(); r.align();
 						oldDraws += compareList(r.data.data() + r.pos, size);
+						ModelDraw draw = {r.data.data() + r.pos, size, sState, {}};
+						draw.arrayBytes[GX_VA_POS] = positions.size() * sizeof(positions[0]);
+						draw.arrayBytes[GX_VA_NRM] = normals.size() * sizeof(normals[0]);
+						draw.arrayBytes[GX_VA_CLR0] = colours.size() * sizeof(colours[0]);
+						for (u32 t = 0; t < 8; ++t) draw.arrayBytes[GX_VA_TEX0 + t] = uv[t].size() * sizeof(uv[t][0]);
+						modelDraws.push_back(draw);
 						if (!normals.empty()) {
 							Mtx reflection = {{0.5f,0,0,0.5f},{0,0.5f,0,0.5f},{0,0,0,1}};
 							GXLoadTexMtxImm(reflection, GX_TEXMTX0, GX_MTX2x4);
@@ -225,10 +415,18 @@ void modelTest(const char* path)
 		r.pos = next;
 	}
 	printf("%s: identical triangles, GPU draws %u -> %u\n", path, oldDraws, newDraws);
+	benchmarkModels(modelDraws);
+	RecordedModel keep;
+	keep.data = std::move(r.data); keep.positions = std::move(positions); keep.normals = std::move(normals);
+	keep.colours = std::move(colours); keep.draws = std::move(modelDraws);
+	for (u32 i = 0; i < 8; ++i) keep.uv[i] = std::move(uv[i]);
+	recordedModels.push_back(std::move(keep));
 }
 } // namespace
 
 extern "C" {
+unsigned int sceKernelGetSystemTimeLow(void) { return 0; }
+void sceKernelDcacheWritebackRange(const void*, unsigned int) {}
 void* sceGuGetMemory(int size) { u32 start = used; used += (size + 15) & ~15U; assert(used <= sizeof(memory)); return memory + start; }
 int sceGuCheckList() { return used; }
 int sceGuFinish() { return 0; }
@@ -257,6 +455,7 @@ void sceGuBoneMatrix(unsigned int index, const ScePspFMatrix4* matrix) { assert(
 void sceGuDrawArray(int primitive, int format, int count, const void* indexData, const void* vertexData)
 {
 	++drawCalls;
+	if (!recordGeometry) return;
 	if (primitive == GU_SPRITES) {
 		assert(format == (GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D));
 		assert(count == 2 && !indexData);
@@ -419,10 +618,44 @@ void onionMaterialTint()
 	compareList(list,sizeof(list));
 	for (const auto& vertex : triangles) assert(vertex.colour == GU_RGBA(128,64,32,255));
 	GXSetTevColorS10(GX_TEVREG0, (GXColorS10){-100,512,255,255});
+	assert(prepareMaterialTint());
 	assert(materialTint(0xffffffff) == GU_RGBA(0,255,255,255));
 	// Restore the title's ordinary modulate state with no tint leaking into it.
 	GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
-	assert(materialTint(0xffffffff) == 0xffffffff);
+	assert(!prepareMaterialTint());
+}
+
+// Compare every byte value against the previous arithmetic, including signed
+// S10 endpoints, all scales, alpha preservation, and cached-state changes.
+void materialTintLookup()
+{
+	resetState();
+	GXSetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_C0, GX_CC_RASC, GX_CC_ZERO);
+	for (GXTevScale scale : {GX_CS_SCALE_1, GX_CS_SCALE_2, GX_CS_SCALE_4, GX_CS_DIVIDE_2}) {
+		GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, scale, GX_FALSE, GX_TEVPREV);
+		for (int tint = -1024; tint <= 1023; ++tint) {
+			GXSetTevColorS10(GX_TEVREG0, (GXColorS10){(s16)tint,(s16)(1023-tint-1024),(s16)(tint/2),255});
+			assert(prepareMaterialTint());
+			assert(prepareMaterialTint()); // Reusing the same table must be identical.
+			for (u32 input = 0; input < 256; ++input) {
+				u32 colour = GU_RGBA(input, 255-input, input ^ 85, input);
+				u32 expected = colour & 0xff000000;
+				const s16 components[] = {sState.tevColour0.r,sState.tevColour0.g,sState.tevColour0.b};
+				for (u32 c = 0; c < 3; ++c) {
+					s32 value = ((colour >> (c*8)) & 255) * (s32)components[c];
+					if (scale == GX_CS_DIVIDE_2) value /= 2;
+					else value *= 1 << (u32)scale;
+					value /= 255;
+					expected |= (u32)MAX(0, MIN(255, value)) << (c*8);
+				}
+				assert(materialTint(colour) == expected);
+			}
+		}
+	}
+	GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_SUB, GX_TB_ZERO, GX_CS_SCALE_1, GX_FALSE, GX_TEVPREV);
+	assert(!prepareMaterialTint());
+	GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ADDHALF, GX_CS_SCALE_1, GX_FALSE, GX_TEVPREV);
+	assert(!prepareMaterialTint());
 }
 
 void shadowCopies()
@@ -455,12 +688,21 @@ void shadowCopies()
 int main(int argc, char** argv)
 {
 	onionMaterialTint();
+	materialTintLookup();
 	reflectionCoordinates();
 	titleColourCompatibility();
 	shadowCopies();
 	syntheticLists();
+	meshCacheInvalidation();
+	sharedMeshArrays();
 	movieFrame();
 	particleColours();
 	for (int i = 1; i < argc; ++i) modelTest(argv[i]);
+	if (recordedModels.size() >= 2) {
+		std::vector<ModelDraw> combined = recordedModels[0].draws;
+		combined.insert(combined.end(), recordedModels[1].draws.begin(), recordedModels[1].draws.end());
+		puts("Combined first two models (shared cache working set):");
+		benchmarkModels(combined);
+	}
 	puts("PSP Onion tint, reflection coordinates, title colour, shadow copy, GPU mesh, particle colour, and movie frame checks passed");
 }

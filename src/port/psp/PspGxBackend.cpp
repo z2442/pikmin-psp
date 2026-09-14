@@ -1,5 +1,8 @@
 #include "Dolphin/gx.h"
 #include "Dolphin/os.h"
+#include "port/psp/PspPlatform.h"
+#include "port/psp/PspPerformance.h"
+#include "port/psp/PspGxMeshCache.h"
 
 #include <pspgu.h>
 #include <pspgum.h>
@@ -10,6 +13,7 @@
 #include <malloc.h>
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 namespace {
 
@@ -100,6 +104,69 @@ u32 sDebugTextureLoads;
 u32 sDebugTextureFailures;
 u32 sDebugListSplits;
 u32 sDebugBatchedPrimitives;
+u64 sMeshCacheEpoch = 1;
+void meshCacheGpuIdle() { ++sMeshCacheEpoch; }
+
+struct FrameTimings {
+	u32 start, frames;
+	u64 presentWait, listWait, copyTime, draws, vertices, copies, splits;
+	u64 decodedVertices, skinnedVertices, fallbackLists, textureMisses, meshCacheHits, cachedVertices, meshCacheValidation, arrayValidation;
+	bool wroteHeader;
+};
+FrameTimings sTimings;
+u32 sPreviousMetrics[PikminPsp::PerformanceMetricCount];
+u32 sPreviousMainCpu, sPreviousAudioCpu;
+
+void snapshotPerformanceCounters()
+{
+	for (u32 i = 0; i < PikminPsp::PerformanceMetricCount; ++i)
+		sPreviousMetrics[i] = PikminPsp::performanceCounter((PikminPsp::PerformanceMetric)i);
+	sPreviousMainCpu = PikminPsp::performanceThreadMicroseconds(false);
+	sPreviousAudioCpu = PikminPsp::performanceThreadMicroseconds(true);
+}
+
+void recordFrameTimings()
+{
+	sTimings.draws += sDebugDrawCalls;
+	sTimings.vertices += sDebugVertexCount;
+	if (++sTimings.frames < 120) return;
+	u32 now = sceKernelGetSystemTimeLow();
+	u32 elapsed = now - sTimings.start;
+	u32 metrics[PikminPsp::PerformanceMetricCount];
+	for (u32 i = 0; i < PikminPsp::PerformanceMetricCount; ++i)
+		metrics[i] = PikminPsp::performanceCounter((PikminPsp::PerformanceMetric)i) - sPreviousMetrics[i];
+	u32 mainCpu = PikminPsp::performanceThreadMicroseconds(false) - sPreviousMainCpu;
+	u32 audioCpu = PikminPsp::performanceThreadMicroseconds(true) - sPreviousAudioCpu;
+	char path[512];
+	if (PikminPsp::resolvePath(path, sizeof(path), "performance.log")) {
+		FILE* file = fopen(path, sTimings.wroteHeader ? "a" : "w");
+		if (file) {
+			if (!sTimings.wroteHeader) {
+				fputs("Mesh cache: shared array versions, aligned snapshots and direct GPU buffers.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
+			}
+			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
+			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
+			        sTimings.presentWait / 120000.0, sTimings.listWait / 120000.0, sTimings.copyTime / 120000.0,
+			        sTimings.draws / 120.0, sTimings.vertices / 120.0, sTimings.copies / 120.0, sTimings.splits / 120.0);
+			fprintf(file, "  main_cpu_ms=%.2f audio_cpu_ms=%.2f render_ms=%.2f mesh_ms=%.2f texture_ms=%.2f pacing_ms=%.2f audio_work_ms=%.2f audio_lock_ms=%.2f decoded_vertices=%.1f skinned_vertices=%.1f fallback_lists=%.1f texture_misses=%.1f mesh_cache_hits=%.1f cached_vertices=%.1f cache_validate_ms=%.2f array_validate_ms=%.2f\n",
+			        mainCpu / 120000.0, audioCpu / 120000.0,
+			        metrics[PikminPsp::PerformanceRender] / 120000.0, metrics[PikminPsp::PerformanceMesh] / 120000.0,
+			        metrics[PikminPsp::PerformanceTexture] / 120000.0, metrics[PikminPsp::PerformancePacing] / 120000.0,
+			        metrics[PikminPsp::PerformanceAudioWork] / 120000.0, metrics[PikminPsp::PerformanceAudioLock] / 120000.0,
+			        sTimings.decodedVertices / 120.0, sTimings.skinnedVertices / 120.0,
+			        sTimings.fallbackLists / 120.0, sTimings.textureMisses / 120.0,
+			        sTimings.meshCacheHits / 120.0, sTimings.cachedVertices / 120.0, sTimings.meshCacheValidation / 120000.0, sTimings.arrayValidation / 120000.0);
+			fclose(file);
+			sTimings.wroteHeader = true;
+		}
+	}
+	bool wroteHeader = sTimings.wroteHeader;
+	sTimings = {};
+	sTimings.wroteHeader = wroteHeader;
+	// Exclude the occasional log write itself from the next timing window.
+	snapshotPerformanceCounters();
+	sTimings.start = sceKernelGetSystemTimeLow();
+}
 
 const int kBufferWidth  = 512;
 const int kScreenWidth  = 480;
@@ -267,6 +334,7 @@ PspGxTexture* convertTexture(const void* source, u16 width, u16 height, GXTexFmt
 		}
 	}
 
+	++sTimings.textureMisses;
 	u32 sampleStep = 1;
 	while ((width + sampleStep - 1) / sampleStep > 512 || (height + sampleStep - 1) / sampleStep > 512) sampleStep <<= 1;
 	u16 activeWidth = (width + sampleStep - 1) / sampleStep;
@@ -375,19 +443,41 @@ void transformPosition(u8 matrixIndex, f32& x, f32& y, f32& z)
 
 // The Onion's animated body uses C0 * raster colour, followed by an
 // additive specular channel. Keep the tint even while specular is approximate.
+// Build channel lookup tables only when the tint or scale changes. The same
+// material is used by every vertex in a draw, so divisions belong here.
+u8 sMaterialTintTable[3][256];
+GXColorS10 sCachedMaterialTint;
+GXTevScale sCachedMaterialScale;
+bool sMaterialTintValid;
+
+bool prepareMaterialTint()
+{
+	if (!sState.multiplyTevColour0 || sState.tevColourOp != GX_TEV_ADD || sState.tevColourBias != GX_TB_ZERO) return false;
+	const GXColorS10& tint = sState.tevColour0;
+	if (!sMaterialTintValid || tint.r != sCachedMaterialTint.r || tint.g != sCachedMaterialTint.g
+	    || tint.b != sCachedMaterialTint.b || sState.tevColourScale != sCachedMaterialScale) {
+		const s16 components[3] = {tint.r, tint.g, tint.b};
+		for (u32 component = 0; component < 3; ++component) {
+			for (u32 input = 0; input < 256; ++input) {
+				s32 value = (s32)input * components[component];
+				if (sState.tevColourScale == GX_CS_DIVIDE_2) value /= 2;
+				else value *= 1 << (u32)sState.tevColourScale;
+				value /= 255;
+				sMaterialTintTable[component][input] = MAX(0, MIN(255, value));
+			}
+		}
+		sCachedMaterialTint = tint;
+		sCachedMaterialScale = sState.tevColourScale;
+		sMaterialTintValid = true;
+	}
+	return true;
+}
+
 u32 materialTint(u32 colour)
 {
-	if (!sState.multiplyTevColour0 || sState.tevColourOp != GX_TEV_ADD || sState.tevColourBias != GX_TB_ZERO) return colour;
-	const s16 tint[3] = {sState.tevColour0.r, sState.tevColour0.g, sState.tevColour0.b};
-	u32 result = colour & 0xff000000;
-	for (u32 component = 0; component < 3; ++component) {
-		s32 value = (s32)((colour >> (component * 8)) & 255) * tint[component];
-		if (sState.tevColourScale == GX_CS_DIVIDE_2) value /= 2;
-		else value *= 1 << (u32)sState.tevColourScale;
-		value /= 255;
-		result |= (u32)MAX(0, MIN(255, value)) << (component * 8);
-	}
-	return result;
+	return (colour & 0xff000000) | sMaterialTintTable[0][colour & 255]
+	    | ((u32)sMaterialTintTable[1][(colour >> 8) & 255] << 8)
+	    | ((u32)sMaterialTintTable[2][(colour >> 16) & 255] << 16);
 }
 
 void generateTexCoord(PspGxVertex& vertex, f32 x, f32 y, f32 z, GXTexGenSrc source = GX_TG_POS,
@@ -558,8 +648,12 @@ void reserveDisplayListMemory(u32 byteCount)
 	// GE state and frame/depth buffers persist across direct lists.  Waiting
 	// here also makes it safe for later transient allocations to reuse the
 	// beginning of the list without clobbering vertices still in flight.
+	u32 waitStart = sceKernelGetSystemTimeLow();
 	sceGuFinish();
 	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+	meshCacheGpuIdle();
+	sTimings.listWait += (u32)(sceKernelGetSystemTimeLow() - waitStart);
+	++sTimings.splits;
 	sceGuStart(GU_DIRECT, sGxDisplayList);
 	if (sDebugListSplits < 12) {
 		OSReport("Pikmin PSP GX: continued frame in a fresh GU list (%u-byte vertex request)\n", byteCount);
@@ -626,13 +720,293 @@ u32 meshMatrixIndex(const u8* vertex, const MeshLayout& layout)
 	    : MIN(meshIndex(vertex, layout, GX_VA_PNMTXIDX) / 3, 9U);
 }
 
+// Cache native rigid vertices, but keep a snapshot of every input byte they
+// depend on. Model matrices remain live GE state and are deliberately excluded.
+// Native buffers go directly to the GE. Entries stay pinned until a GPU sync
+// completes; replacements can never free geometry that is still in flight.
+struct MeshCacheKey {
+	PspGxAttribute attributes[GX_VA_MAX_ATTR];
+	u32 currentColour, currentMatrix;
+	GXColorS10 tint;
+	GXTevOp tintOp;
+	GXTevBias tintBias;
+	GXTevScale tintScale;
+	bool tintEnabled;
+	GXTexGenSrc texSource;
+	GXTexGenType texType;
+	u32 texMatrix;
+	Mtx textureMatrices[10];
+};
+
+// Equality only: unlike memcmp, no byte ordering result is needed. PSP libc
+// compares an entire buffer bytewise if either input starts unaligned.
+struct __attribute__((packed, may_alias)) MeshUnalignedWord { unsigned int value; };
+struct __attribute__((may_alias)) MeshAlignedWord { unsigned int value; };
+
+template <typename Word> bool meshBytesEqualWords(const u8* a, const u8* b, u32 bytes)
+{
+	while (bytes >= 16) {
+		unsigned int difference = reinterpret_cast<const Word*>(a)->value ^ reinterpret_cast<const Word*>(b)->value;
+		difference |= reinterpret_cast<const Word*>(a + 4)->value ^ reinterpret_cast<const Word*>(b + 4)->value;
+		difference |= reinterpret_cast<const Word*>(a + 8)->value ^ reinterpret_cast<const Word*>(b + 8)->value;
+		difference |= reinterpret_cast<const Word*>(a + 12)->value ^ reinterpret_cast<const Word*>(b + 12)->value;
+		if (difference) return false;
+		a += 16; b += 16; bytes -= 16;
+	}
+	while (bytes >= 4) {
+		if (reinterpret_cast<const Word*>(a)->value != reinterpret_cast<const Word*>(b)->value) return false;
+		a += 4; b += 4; bytes -= 4;
+	}
+	while (bytes--) if (*a++ != *b++) return false;
+	return true;
+}
+
+bool meshBytesEqual(const void* left, const void* right, u32 bytes)
+{
+	const auto* a = static_cast<const u8*>(left);
+	const auto* b = static_cast<const u8*>(right);
+	if ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b)) & 3)
+		return meshBytesEqualWords<MeshUnalignedWord>(a, b, bytes);
+	return meshBytesEqualWords<MeshAlignedWord>(a, b, bytes);
+}
+
+struct MeshArraySnapshot {
+	const u8* source;
+	u8* snapshot;
+	u32 bytes;
+	u64 generation, lastUse;
+};
+MeshArraySnapshot sMeshArrays[64][4];
+u32 sMeshArrayBytes;
+u64 sMeshArrayGeneration, sMeshArrayUse;
+const u32 kMeshArrayLimit = 2 * 1024 * 1024;
+PikminPsp::MeshValidationScope* sMeshValidationScope;
+
+void releaseMeshArray(MeshArraySnapshot& array)
+{
+	if (array.snapshot) { free(array.snapshot); sMeshArrayBytes -= array.bytes; }
+	array = {};
+}
+
+MeshArraySnapshot* validateMeshArrayStorage(const void* source, u32 bytes)
+{
+	if (!source || !bytes || bytes > kMeshArrayLimit) return nullptr;
+	uintptr_t address = reinterpret_cast<uintptr_t>(source);
+	MeshArraySnapshot* set = sMeshArrays[((address >> 5) ^ (address >> 13)) & 63];
+	MeshArraySnapshot* slot = nullptr;
+	for (u32 i = 0; i < 4; ++i) {
+		MeshArraySnapshot& entry = set[i];
+		if (entry.snapshot && entry.source == source && entry.bytes == bytes) {
+			if (!meshBytesEqual(source, entry.snapshot, bytes)) {
+				memcpy(entry.snapshot, source, bytes);
+				entry.generation = ++sMeshArrayGeneration;
+			}
+			entry.lastUse = ++sMeshArrayUse;
+			return &entry;
+		}
+		if (!slot || !entry.snapshot || (slot->snapshot && entry.lastUse < slot->lastUse)) slot = &entry;
+	}
+	releaseMeshArray(*slot);
+	while (sMeshArrayBytes + bytes > kMeshArrayLimit) {
+		MeshArraySnapshot* oldest = nullptr;
+		for (auto& bucket : sMeshArrays) for (auto& entry : bucket)
+			if (entry.snapshot && (!oldest || entry.lastUse < oldest->lastUse)) oldest = &entry;
+		if (!oldest) return nullptr;
+		releaseMeshArray(*oldest);
+	}
+	u8* snapshot = static_cast<u8*>(memalign(64, bytes));
+	if (!snapshot) return nullptr;
+	memcpy(snapshot, source, bytes);
+	slot->source = static_cast<const u8*>(source); slot->snapshot = snapshot; slot->bytes = bytes;
+	slot->generation = ++sMeshArrayGeneration; slot->lastUse = ++sMeshArrayUse;
+	sMeshArrayBytes += bytes;
+	return slot;
+}
+
+struct MeshInputRange {
+	const u8* begin;
+	const u8* end;
+	u64 generation;
+	void include(const void* address, u32 bytes) {
+		const u8* p = static_cast<const u8*>(address);
+		if (!begin || p < begin) begin = p;
+		if (!end || p + bytes > end) end = p + bytes;
+	}
+};
+
+MeshArraySnapshot* validatedMeshRange(const MeshInputRange& range, u32 index)
+{
+	if (!sMeshValidationScope || !range.begin) return nullptr;
+	GXAttr attr = index == 0 ? GX_VA_POS : index == 1 ? GX_VA_CLR0 : index == 2 ? GX_VA_TEX0
+	    : sState.attributes[GX_VA_NBT].source != GX_NONE ? GX_VA_NBT : GX_VA_NRM;
+	auto* array = static_cast<MeshArraySnapshot*>(sMeshValidationScope->arrays[attr]);
+	if (!array || !array->snapshot || array->source != sState.attributes[attr].array) return nullptr;
+	if ((uintptr_t)range.begin < (uintptr_t)array->source
+	    || (uintptr_t)range.end > (uintptr_t)array->source + array->bytes) return nullptr;
+	return array;
+}
+
+struct MeshCacheEntry {
+	const u8* list;
+	u8* storage;
+	u32 listBytes, nativeBytes, allocationBytes, indexCount, vertexCount, primitiveCount, rigidMatrix;
+	u64 lastUse, gpuEpoch;
+	MeshInputRange inputs[4];
+};
+
+const u32 kMeshCacheLimit = 4 * 1024 * 1024;
+const u32 kMeshCacheDataOffset = (sizeof(MeshCacheKey) + 63) & ~63U;
+u64 meshCacheAlignedSize(u64 bytes) { return (bytes + 63) & ~63ULL; }
+// The title has 606 lists; eight ways avoid repeatedly rebuilding lists that
+// collide in the same bucket despite fitting comfortably in the byte budget.
+MeshCacheEntry sMeshCache[256][8];
+u32 sMeshCacheBytes;
+u64 sMeshCacheUse;
+
+void releaseMeshCacheEntry(MeshCacheEntry& entry)
+{
+	if (entry.storage) { free(entry.storage); sMeshCacheBytes -= entry.allocationBytes; }
+	entry = {};
+}
+
+void clearMeshCache()
+{
+	bool pinned = false;
+	for (auto& set : sMeshCache) for (auto& entry : set)
+		if (entry.storage && entry.gpuEpoch == sMeshCacheEpoch) pinned = true;
+	if (pinned) { sceGuFinish(); sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE); meshCacheGpuIdle(); }
+	for (auto& set : sMeshCache) for (auto& entry : set) releaseMeshCacheEntry(entry);
+	sMeshCacheUse = 0;
+	for (auto& set : sMeshArrays) for (auto& array : set) releaseMeshArray(array);
+}
+
+void meshCacheKey(MeshCacheKey& key)
+{
+	memset(&key, 0, sizeof(key));
+	memcpy(key.attributes, sState.attributes, sizeof(key.attributes));
+	key.currentColour = sState.attributes[GX_VA_CLR0].source == GX_NONE ? sState.currentColour : 0;
+	key.currentMatrix = sState.attributes[GX_VA_PNMTXIDX].source == GX_NONE ? sState.currentPositionMatrix : 0;
+	key.tintEnabled = sState.multiplyTevColour0 && sState.tevColourOp == GX_TEV_ADD && sState.tevColourBias == GX_TB_ZERO;
+	if (key.tintEnabled) {
+		key.tint = sState.tevColour0;
+		key.tintOp = sState.tevColourOp; key.tintBias = sState.tevColourBias; key.tintScale = sState.tevColourScale;
+	}
+	// Ordinary UVs do not depend on texture-matrix animation elsewhere.
+	if (sState.texSource == GX_TG_POS || sState.texSource == GX_TG_NRM) {
+		key.texSource = sState.texSource; key.texType = sState.texType; key.texMatrix = sState.texMatrix;
+		memcpy(key.textureMatrices, sState.textureMatrices, sizeof(key.textureMatrices));
+	}
+
+}
+
+u32 meshCacheSet(const u8* list)
+{
+	uintptr_t address = reinterpret_cast<uintptr_t>(list);
+	return ((address >> 5) ^ (address >> 13)) & 255;
+}
+
+MeshCacheEntry* findCachedMesh(const u8* list, u32 bytes, const MeshCacheKey& key)
+{
+	for (auto& entry : sMeshCache[meshCacheSet(list)]) {
+		if (!entry.storage || entry.list != list || entry.listBytes != bytes) continue;
+		if (!meshBytesEqual(entry.storage, &key, sizeof(key))) continue;
+		const u8* snapshot = entry.storage + kMeshCacheDataOffset + meshCacheAlignedSize(entry.nativeBytes);
+		if (!meshBytesEqual(snapshot, list, bytes)) continue;
+		snapshot += meshCacheAlignedSize(bytes);
+		bool equal = true;
+		for (u32 i = 0; i < 4; ++i) {
+			const auto& range = entry.inputs[i];
+			if (!range.begin) continue;
+			if (range.generation) {
+				MeshArraySnapshot* array = validatedMeshRange(range, i);
+				if (!array || array->generation != range.generation) { equal = false; break; }
+				continue;
+			}
+			u32 length = range.end - range.begin;
+			if (!meshBytesEqual(snapshot, range.begin, length)) { equal = false; break; }
+			snapshot += meshCacheAlignedSize(length);
+		}
+		if (equal) { entry.lastUse = ++sMeshCacheUse; return &entry; }
+	}
+	return nullptr;
+}
+
+void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const MeshInputRange (&inputs)[4],
+               const void* vertices, u32 nativeBytes, u32 indexCount, u32 vertexCount, u32 primitives, u32 matrix)
+{
+	MeshInputRange savedInputs[4];
+	memcpy(savedInputs, inputs, sizeof(savedInputs));
+	u64 total = kMeshCacheDataOffset + meshCacheAlignedSize(listBytes) + meshCacheAlignedSize(nativeBytes);
+	for (u32 i = 0; i < 4; ++i) {
+		auto& range = savedInputs[i];
+		if (!range.begin) continue;
+		if (MeshArraySnapshot* array = validatedMeshRange(range, i)) range.generation = array->generation;
+		else total += meshCacheAlignedSize(range.end - range.begin);
+	}
+	if (total > kMeshCacheLimit) return;
+	MeshCacheEntry* slot = nullptr;
+	for (auto& entry : sMeshCache[meshCacheSet(list)]) {
+		if (!entry.storage) { slot = &entry; break; }
+		if (entry.gpuEpoch == sMeshCacheEpoch) continue;
+		if (entry.list == list && entry.listBytes == listBytes) { slot = &entry; break; }
+		if (!slot || entry.lastUse < slot->lastUse) slot = &entry;
+	}
+	if (!slot) return; // All ways are still referenced by pending draws.
+	releaseMeshCacheEntry(*slot);
+	while (sMeshCacheBytes + total > kMeshCacheLimit) {
+		MeshCacheEntry* oldest = nullptr;
+		for (auto& set : sMeshCache) for (auto& entry : set)
+			if (entry.storage && entry.gpuEpoch != sMeshCacheEpoch && (!oldest || entry.lastUse < oldest->lastUse)) oldest = &entry;
+		if (!oldest) return;
+		releaseMeshCacheEntry(*oldest);
+	}
+	u8* storage = static_cast<u8*>(memalign(64, total));
+	if (!storage) return; // Memory pressure preserves the uncached draw path.
+	memcpy(storage, &key, sizeof(key));
+	memcpy(storage + kMeshCacheDataOffset, vertices, nativeBytes);
+	sceKernelDcacheWritebackRange(storage + kMeshCacheDataOffset, meshCacheAlignedSize(nativeBytes));
+	u8* snapshot = storage + kMeshCacheDataOffset + meshCacheAlignedSize(nativeBytes);
+	memcpy(snapshot, list, listBytes); snapshot += meshCacheAlignedSize(listBytes);
+	for (const auto& range : savedInputs) if (range.begin && !range.generation) {
+		u32 bytes = range.end - range.begin;
+		memcpy(snapshot, range.begin, bytes); snapshot += meshCacheAlignedSize(bytes);
+	}
+	slot->list = list; slot->storage = storage; slot->listBytes = listBytes; slot->nativeBytes = nativeBytes;
+	slot->allocationBytes = total; slot->indexCount = indexCount; slot->vertexCount = vertexCount;
+	slot->primitiveCount = primitives; slot->rigidMatrix = matrix; slot->lastUse = ++sMeshCacheUse;
+	memcpy(slot->inputs, savedInputs, sizeof(slot->inputs));
+	sMeshCacheBytes += total;
+}
+
 // Retail model lists contain thousands of short strips. Submit a whole list
 // as indexed triangles. Positions stay in model space: the GE transforms and
 // clips them. Rigid meshes use GU_MODEL, while mixed matrices use GE bones.
-bool drawMeshList(const u8* input, const u8* end)
+bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 {
 	MeshLayout layout;
 	if (!meshLayout(layout)) return false;
+	const u8* listStart = input;
+	MeshCacheKey key = {};
+	if (useCache) {
+		meshCacheKey(key);
+		u32 validationStart = sceKernelGetSystemTimeLow();
+		MeshCacheEntry* cached = findCachedMesh(input, end - input, key);
+		sTimings.meshCacheValidation += (u32)(sceKernelGetSystemTimeLow() - validationStart);
+		if (cached) {
+			reserveDisplayListMemory(0);
+			u8* vertices = cached->storage + kMeshCacheDataOffset;
+			cached->gpuEpoch = sMeshCacheEpoch;
+			u16* indices = reinterpret_cast<u16*>(vertices + cached->vertexCount * sizeof(PspGxVertex));
+			loadGuPositionMatrix(cached->rigidMatrix);
+			submitVertices(vertices, cached->indexCount, GU_TRIANGLES, indices);
+			if (cached->rigidMatrix != sState.currentPositionMatrix) loadGuPositionMatrix(sState.currentPositionMatrix);
+			sDebugBatchedPrimitives += cached->primitiveCount;
+			++sTimings.meshCacheHits;
+			sTimings.cachedVertices += cached->vertexCount;
+			return true;
+		}
+	}
+	MeshInputRange inputs[4] = {};
 	u32 vertexCount = 0, indexCount = 0, primitiveCount = 0, matrixMask = 0;
 	for (const u8* scan = input; scan < end;) {
 		u8 command = *scan++;
@@ -657,13 +1031,17 @@ bool drawMeshList(const u8* input, const u8* end)
 	}
 	if (matrixCount > 8) return false;
 	bool skinned = matrixCount > 1;
+	const bool cacheable = useCache && !skinned;
 	u32 vertexSize = skinned ? sizeof(PspGxSkinnedVertex) : sizeof(PspGxVertex);
 	u32 byteCount = vertexCount * vertexSize + indexCount * sizeof(u16);
 	if (byteCount + 8 + kDisplayListCommandReserve > sizeof(sGxDisplayList)) return false;
 	reserveDisplayListMemory(byteCount);
 	u8* vertices = static_cast<u8*>(sceGuGetMemory(byteCount));
+	sTimings.decodedVertices += vertexCount;
+	if (skinned) sTimings.skinnedVertices += vertexCount;
 	u16* indices = reinterpret_cast<u16*>(vertices + vertexCount * vertexSize);
 	u32 base = 0, index = 0;
+	const bool tintVertices = prepareMaterialTint();
 	const PspGxAttribute& pos = sState.attributes[GX_VA_POS];
 	const PspGxAttribute& col = sState.attributes[GX_VA_CLR0];
 	const PspGxAttribute& uv = sState.attributes[GX_VA_TEX0];
@@ -683,13 +1061,19 @@ bool drawMeshList(const u8* input, const u8* end)
 			PspGxVertex& out = *reinterpret_cast<PspGxVertex*>(destination);
 			const f32* xyz = reinterpret_cast<const f32*>(pos.array + meshIndex(input, layout, GX_VA_POS) * pos.stride);
 			out.x = xyz[0]; out.y = xyz[1]; out.z = pos.count == GX_POS_XY ? 0.0f : xyz[2];
+			if (cacheable) inputs[0].include(xyz, pos.count == GX_POS_XY ? 8 : 12);
 			out.colour = sState.currentColour;
-			if (col.source != GX_NONE) memcpy(&out.colour, col.array + meshIndex(input, layout, GX_VA_CLR0) * col.stride, 4);
-			out.colour = materialTint(out.colour);
+			if (col.source != GX_NONE) {
+				const u8* colour = col.array + meshIndex(input, layout, GX_VA_CLR0) * col.stride;
+				memcpy(&out.colour, colour, 4);
+				if (cacheable) inputs[1].include(colour, 4);
+			}
+			if (tintVertices) out.colour = materialTint(out.colour);
 			out.u = out.v = 0.0f;
 			if (uv.source != GX_NONE) {
 				const f32* st = reinterpret_cast<const f32*>(uv.array + meshIndex(input, layout, GX_VA_TEX0) * uv.stride);
 				out.u = st[0]; out.v = uv.count == GX_TEX_S ? 0.0f : st[1];
+				if (cacheable) inputs[2].include(st, uv.count == GX_TEX_S ? 4 : 8);
 			}
 			u32 textureMatrix = layout.offset[GX_VA_TEX0MTXIDX] >= 0
 			    ? meshIndex(input, layout, GX_VA_TEX0MTXIDX) : sState.texMatrix;
@@ -700,6 +1084,7 @@ bool drawMeshList(const u8* input, const u8* end)
 				if (layout.offset[normalAttr] >= 0 && normal.array && normal.componentType == GX_F32) {
 					const f32* n = reinterpret_cast<const f32*>(normal.array + meshIndex(input, layout, normalAttr) * normal.stride);
 					generateTexCoord(out, n[0], n[1], n[2], GX_TG_NRM, textureMatrix);
+					if (cacheable) inputs[3].include(n, 12);
 				}
 			}
 		}
@@ -719,6 +1104,8 @@ bool drawMeshList(const u8* input, const u8* end)
 		}
 		base += count;
 	}
+	if (cacheable) cacheMesh(listStart, end - listStart, key, inputs, vertices, byteCount, indexCount,
+	                         vertexCount, primitiveCount, rigidMatrix);
 	if (skinned) {
 		ScePspFMatrix4 identity = identityMatrix();
 		sceGuSetMatrix(GU_MODEL, &identity);
@@ -730,7 +1117,7 @@ bool drawMeshList(const u8* input, const u8* end)
 		loadGuPositionMatrix(rigidMatrix);
 	}
 	submitVertices(vertices, indexCount, GU_TRIANGLES, indices, skinned);
-	loadGuPositionMatrix(sState.currentPositionMatrix);
+	if (skinned || rigidMatrix != sState.currentPositionMatrix) loadGuPositionMatrix(sState.currentPositionMatrix);
 	sDebugBatchedPrimitives += primitiveCount;
 	return true;
 }
@@ -738,6 +1125,17 @@ bool drawMeshList(const u8* input, const u8* end)
 } // namespace
 
 namespace PikminPsp {
+MeshValidationScope::MeshValidationScope() : previous(sMeshValidationScope), arrays{} { sMeshValidationScope = this; }
+MeshValidationScope::~MeshValidationScope() { sMeshValidationScope = previous; }
+
+void validateMeshArray(GXAttr attribute, const void* source, u32 bytes)
+{
+	if (!sMeshValidationScope || (u32)attribute >= GX_VA_MAX_ATTR) return;
+	u32 start = sceKernelGetSystemTimeLow();
+	sMeshValidationScope->arrays[attribute] = validateMeshArrayStorage(source, bytes);
+	sTimings.arrayValidation += (u32)(sceKernelGetSystemTimeLow() - start);
+}
+
 void drawMovieFrame(const u16* pixels, u32 width, u32 height, u32 stride)
 {
 	if (!sState.listOpen || !pixels) return;
@@ -857,7 +1255,9 @@ void PspGXWriteF32(f32) { }
 void PspGXEnd(void)
 {
 	if (!sState.inPrimitive) return;
-	for (u32 i = 0; i < sState.vertexCount; ++i) sState.vertices[i].colour = materialTint(sState.vertices[i].colour);
+	if (prepareMaterialTint()) {
+		for (u32 i = 0; i < sState.vertexCount; ++i) sState.vertices[i].colour = materialTint(sState.vertices[i].colour);
+	}
 	if (!sState.verticesPretransformed) for (u32 i = 0; i < sState.vertexCount; ++i) {
 		PspGxVertex& vertex = sState.vertices[i];
 		generateTexCoord(vertex, vertex.x, vertex.y, vertex.z);
@@ -890,6 +1290,10 @@ void PspGXEnd(void)
 
 GXFifoObj* GXInit(void*, u32)
 {
+	clearMeshCache();
+	sTimings = {};
+	snapshotPerformanceCounters();
+	sTimings.start = sceKernelGetSystemTimeLow();
 	memset(&sState, 0, sizeof(sState));
 	sState.currentColour = 0xffffffff;
 	sState.clearColour = 0xff000000;
@@ -917,6 +1321,7 @@ GXFifoObj* GXInit(void*, u32)
 	sceGuSetMatrix(GU_MODEL, &identity);
 	sceGuFinish();
 	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+	meshCacheGpuIdle();
 	sceDisplayWaitVblankStart();
 	sceGuDisplay(GU_TRUE);
 	void* displayBuffer = reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(sceGeEdramGetAddr()) | 0x40000000U) + kFrameBytes);
@@ -1081,8 +1486,11 @@ void GXCopyDisp(void*, GXBool clear)
 		         sDebugBatchedPrimitives);
 	}
 	++sDebugFrameCount;
+	u32 waitStart = sceKernelGetSystemTimeLow();
 	sceGuFinish();
 	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+	meshCacheGpuIdle();
+	sTimings.presentWait += (u32)(sceKernelGetSystemTimeLow() - waitStart);
 	sState.drawBufferOffset = reinterpret_cast<uintptr_t>(sceGuSwapBuffers());
 	if (!sState.displayEnabled) {
 		sceGuDisplay(GU_TRUE);
@@ -1095,6 +1503,7 @@ void GXCopyDisp(void*, GXBool clear)
 		sceGuClearDepth((u16)sState.clearDepth);
 		sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
 	}
+	recordFrameTimings();
 	sDebugDrawCalls = 0;
 	sDebugVertexCount = 0;
 	sDebugTexturedDrawCalls = 0;
@@ -1125,7 +1534,9 @@ void copyFramebuffer(u8* output, const u32* framebuffer)
 void GXCopyTex(void* destination, GXBool clear) {
 	if (!destination || !sState.listOpen || !sState.copyDestWidth || !sState.copyDestHeight) return;
 	if (sState.copyFormat != GX_TF_I8 && sState.copyFormat != GX_TF_RGB565) return;
+	u32 copyStart = sceKernelGetSystemTimeLow();
 	sceGuFinish(); sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+	meshCacheGpuIdle();
 	const u32* framebuffer = reinterpret_cast<const u32*>((reinterpret_cast<uintptr_t>(sceGeEdramGetAddr()) | 0x40000000U) + sState.drawBufferOffset);
 	copyFramebuffer(static_cast<u8*>(destination), framebuffer);
 	// Refresh in place: DGX caches the active Texture pointer and may omit
@@ -1150,6 +1561,8 @@ void GXCopyTex(void* destination, GXBool clear) {
 		sceGuClearColor(sState.clearColour); sceGuClearDepth(sState.clearDepth);
 		sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
 	}
+	sTimings.copyTime += (u32)(sceKernelGetSystemTimeLow() - copyStart);
+	++sTimings.copies;
 }
 
 void GXSetColorUpdate(GXBool enabled) { sceGuPixelMask(enabled ? 0 : 0xffffffff); }
@@ -1252,6 +1665,7 @@ void GXLoadTexObj(GXTexObj* object, GXTexMapID id)
 	// The first TEV texture is the closest useful approximation on the PSP's
 	// fixed-function single-texture stage.  Extra TEV maps are ignored for now.
 	if (!object || id != GX_TEXMAP0) return;
+	PikminPsp::PerformanceScope timing(PikminPsp::PerformanceTexture);
 	GXTexObjPriv* source = reinterpret_cast<GXTexObjPriv*>(object);
 	u16 width = source->image0 >> 16;
 	u16 height = source->image0 & 0xffff;
@@ -1311,9 +1725,11 @@ u32 GXEndDisplayList(void) { return 0; }
 void GXCallDisplayList(void* displayList, u32 byteCount)
 {
 	if (!displayList || byteCount == 0) return;
+	PikminPsp::PerformanceScope timing(PikminPsp::PerformanceMesh);
 	const u8* input = static_cast<const u8*>(displayList);
 	const u8* end = input + byteCount;
 	if (drawMeshList(input, end)) return;
+	++sTimings.fallbackLists;
 	while (input < end) {
 		u8 command = *input++;
 		if (command == GX_CMD_NOP) continue;
@@ -1321,6 +1737,7 @@ void GXCallDisplayList(void* displayList, u32 byteCount)
 		if (opcode >= GX_CMD_DRAW_QUADS && opcode <= GX_CMD_DRAW_POINTS) {
 			if (end - input < 2) break;
 			u16 vertexCount = readBig16(input);
+			sTimings.decodedVertices += vertexCount;
 			GXBegin((GXPrimitive)opcode, (GXVtxFmt)(command & GX_VAT_MASK), vertexCount);
 			sState.verticesPretransformed = true;
 			for (u32 vertex = 0; vertex < vertexCount && input < end; ++vertex) decodeMeshVertex(input);

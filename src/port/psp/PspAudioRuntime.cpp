@@ -1,5 +1,6 @@
 #include "port/psp/PspAudio.h"
 #include "port/psp/PspPlatform.h"
+#include "port/psp/PspPerformance.h"
 #include "port/psp/PspMovie.h"
 #include "jaudio/aictrl.h"
 #include "jaudio/aramcall.h"
@@ -78,6 +79,7 @@ int audioThread(SceSize, void*)
 {
 	unsigned buffer = 0;
 	while (sRunning) {
+		u32 workStart = sceKernelGetSystemTimeLow();
 		for (unsigned sub = 0; sub < 8 && sRunning; ++sub) {
 			u32 frame = sCounter + 1;
 			bool trace = frame >= 9 && frame <= 24;
@@ -100,6 +102,7 @@ int audioThread(SceSize, void*)
 			}
 			if (trace) PikminPsp::audioLog("audio frame %u: lock complete", (unsigned)frame);
 		}
+		PikminPsp::performanceAdd(PikminPsp::PerformanceAudioWork, (u32)(sceKernelGetSystemTimeLow() - workStart));
 		if (sRunning) {
 			sceKernelDcacheWritebackRange(sOutput[buffer], sizeof(sOutput[buffer]));
 			int result = sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, sOutput[buffer]);
@@ -124,7 +127,11 @@ namespace PikminPsp {
 bool audioReady() { return sReady; }
 void* audioBankData() { return sBank; }
 void audioFault() { sReady = sRunning = false; }
-void audioLock() { if (sLock >= 0) sceKernelWaitSema(sLock, 1, nullptr); }
+void audioLock()
+{
+	PerformanceScope timing(PerformanceAudioLock);
+	if (sLock >= 0) sceKernelWaitSema(sLock, 1, nullptr);
+}
 void audioUnlock() { if (sLock >= 0) sceKernelSignalSema(sLock, 1); }
 
 void audioLogReset()
@@ -245,6 +252,7 @@ void audioStart()
 	}
 	sRunning = true;
 	sThread = sceKernelCreateThread("Pikmin audio", audioThread, 0x18, 0x10000, PSP_THREAD_ATTR_USER, nullptr);
+	performanceSetAudioThread(sThread);
 	if (sThread < 0 || sceKernelStartThread(sThread, 0, nullptr) < 0) {
 		sRunning = false;
 		if (sThread >= 0) sceKernelDeleteThread(sThread);

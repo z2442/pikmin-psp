@@ -11,8 +11,9 @@ extern "C" {
 }
 
 namespace {
-struct Stream {
+struct alignas(64) Stream {
 	u8 input[16384];
+	u32 inputGeneration;
 	u32 cursor, available, remainingBytes;
 	u32 sampleCount, sampleRate, frameRate, format, id, position, fraction, step;
 	u32 decodedPosition;
@@ -23,6 +24,9 @@ struct Stream {
 	bool ready, playing, paused, finished;
 };
 Stream sStream __attribute__((aligned(64)));
+u32 sStreamInputGeneration;
+bool sStreamInputDirty;
+struct alignas(64) MeStreamState { u32 inputGeneration; } sMeStreamState;
 SceUID sFile = -1;
 StreamCallback sCallback;
 
@@ -31,6 +35,19 @@ void cacheRange(uintptr_t& start, u32& size)
 	uintptr_t end = (start + size + 63) & ~uintptr_t(63);
 	start &= ~uintptr_t(63);
 	size = u32(end - start);
+}
+
+void streamStateRange(uintptr_t& start, u32& size)
+{
+	start = (uintptr_t)&sStream.inputGeneration;
+	size = sizeof(sStream) - sizeof(sStream.input);
+	cacheRange(start, size);
+}
+
+void streamInputChanged()
+{
+	sStream.inputGeneration = ++sStreamInputGeneration;
+	sStreamInputDirty = true;
 }
 
 u32 be32(const u8* b) { return (u32(b[0]) << 24) | (u32(b[1]) << 16) | (u32(b[2]) << 8) | b[3]; }
@@ -81,25 +98,35 @@ bool nextSample(s16* pair)
 namespace PikminPsp {
 void audioStreamCpuPublish()
 {
-	uintptr_t start = (uintptr_t)&sStream; u32 size = sizeof(sStream); cacheRange(start, size);
+	// Stream bytes are CPU-owned and read-only on the ME. Only refills or
+	// resets require publishing them; decoder state still crosses each job.
+	if (sStreamInputDirty) {
+		sceKernelDcacheWritebackRange(sStream.input, sizeof(sStream.input));
+		sStreamInputDirty = false;
+	}
+	uintptr_t start; u32 size; streamStateRange(start, size);
 	sceKernelDcacheWritebackRange((void*)start, size);
 }
 
 void audioStreamCpuAcquire()
 {
-	uintptr_t start = (uintptr_t)&sStream; u32 size = sizeof(sStream); cacheRange(start, size);
+	uintptr_t start; u32 size; streamStateRange(start, size);
 	sceKernelDcacheInvalidateRange((void*)start, size);
 }
 
 void audioStreamMeAcquire()
 {
-	uintptr_t start = (uintptr_t)&sStream; u32 size = sizeof(sStream); cacheRange(start, size);
+	uintptr_t start; u32 size; streamStateRange(start, size);
 	meLibDcacheInvalidateRange((u32)start, size);
+	if (sMeStreamState.inputGeneration != sStream.inputGeneration) {
+		meLibDcacheInvalidateRange((u32)(uintptr_t)sStream.input, sizeof(sStream.input));
+		sMeStreamState.inputGeneration = sStream.inputGeneration;
+	}
 }
 
 void audioStreamMePublish()
 {
-	uintptr_t start = (uintptr_t)&sStream; u32 size = sizeof(sStream); cacheRange(start, size);
+	uintptr_t start; u32 size; streamStateRange(start, size);
 	meLibDcacheWritebackRange((u32)start, size);
 }
 
@@ -111,6 +138,7 @@ void audioStreamUpdate()
 	u32 available = sStream.available - sStream.cursor;
 	if (available >= 4096 || !sStream.remainingBytes) return;
 	memmove(sStream.input, sStream.input + sStream.cursor, available);
+	streamInputChanged();
 	sStream.cursor = 0;
 	sStream.available = available;
 	u32 bytes = sizeof(sStream.input) - available;
@@ -140,12 +168,13 @@ void audioStreamShutdown() { if (sFile >= 0) closeStream(); }
 }
 
 extern "C" {
-void Init_StreamAudio() { sFile = -1; memset(&sStream, 0, sizeof(sStream)); }
+void Init_StreamAudio() { sFile = -1; memset(&sStream, 0, sizeof(sStream)); streamInputChanged(); }
 void RegisterStreamCallback(StreamCallback callback) { sCallback = callback; }
 BOOL StreamAudio_Start(u32, int id, const char* name, BOOL, BOOL, StreamHeader_*)
 {
 	if (sFile >= 0) closeStream();
 	memset(&sStream, 0, sizeof(sStream));
+	streamInputChanged();
 	sStream.id = id;
 	char path[512], relative[384];
 	while (*name == '/') ++name;

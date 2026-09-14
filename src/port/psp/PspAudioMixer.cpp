@@ -1,4 +1,5 @@
 #include "port/psp/PspAudio.h"
+#include "port/psp/PspAudioMixerJob.h"
 #include "port/psp/PspAudioDecode.h"
 #include "port/psp/PspPlatform.h"
 #include "jaudio/dspinterface.h"
@@ -26,8 +27,8 @@ struct Voice {
 Voice sVoices[64] __attribute__((aligned(64)));
 // Main CPU publishes a snapshot; only completion flags and volume ramp state
 // come back. The ME never calls game, OS, file, or allocator functions.
-struct Job {
-	DSPchannel_ channels[64];
+struct alignas(64) Job {
+	PikminPsp::AudioMixerChannel channels[64];
 	s16 output[80 * 2];
 	u32 mono, gain;
 };
@@ -60,7 +61,7 @@ __attribute__((noinline, aligned(4))) int initialiseMeWithoutSuspendHook()
 	return table;
 }
 
-s16 voiceSample(DSPchannel_& c, Voice& v, bool onMe)
+s16 voiceSample(PikminPsp::AudioMixerChannel& c, Voice& v, bool onMe)
 {
 	using namespace PikminPsp;
 	const u32 end = c.loopStartPosition;
@@ -110,7 +111,7 @@ void render()
 	const bool onMe = meLibGetCpuId() != 0;
 	s32 mix[160] = {};
 	for (unsigned index = 0; index < 64; ++index) {
-		DSPchannel_& c = sJob.channels[index];
+		AudioMixerChannel& c = sJob.channels[index];
 		Voice& v = sVoices[index];
 		if (!c.enabled || c.done) continue;
 		if (c.resetVpb) {
@@ -235,6 +236,8 @@ bool audioBootMe()
 	}
 	printf("[audio] %s (libme-core %d)\n", sMeAvailable ? "ME decoder ready" : "ME unavailable; using CPU decoder", result);
 	audioLog("%s (libme-core result=%d)", sMeAvailable ? "ME decoder ready" : "ME unavailable; CPU decoder active", result);
+	audioLog("ME transport: channel=%u job=%u bytes, stream input sent only on refill/reset",
+	         (unsigned)sizeof(AudioMixerChannel), (unsigned)sizeof(sJob));
 	return sMeAvailable;
 }
 
@@ -243,7 +246,7 @@ void audioMix(s16* output, u32 frames)
 	if (frames != 80 || sMeFailed) { memset(output, 0, frames * 4); return; }
 	u32 activeVoices = 0;
 	for (unsigned i = 0; i < 64; ++i) {
-		sJob.channels[i] = *GetDspHandle(i);
+		audioReadMixerChannel(sJob.channels[i], *GetDspHandle(i));
 		if (sJob.channels[i].enabled && !sJob.channels[i].done) ++activeVoices;
 	}
 	if (activeVoices && !sLoggedActiveVoices) {
@@ -276,9 +279,7 @@ void audioMix(s16* output, u32 frames)
 	}
 	for (unsigned i = 0; i < 64; ++i) {
 		DSPchannel_* c = GetDspHandle(i);
-		c->done = sJob.channels[i].done;
-		c->resetVpb = sJob.channels[i].resetVpb;
-		for (unsigned b = 0; b < 6; ++b) c->mixChannels[b].currentVolume = sJob.channels[i].mixChannels[b].currentVolume;
+		audioWriteMixerChannel(*c, sJob.channels[i]);
 	}
 	memcpy(output, sJob.output, frames * 4);
 	if (!sLoggedNonzeroPcm) {

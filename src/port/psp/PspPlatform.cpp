@@ -1,4 +1,5 @@
 #include "port/psp/PspPlatform.h"
+#include "port/psp/PspPerformance.h"
 #if defined(PIKMIN_PSP_AUDIO)
 #include "port/psp/PspAudio.h"
 #endif
@@ -20,6 +21,8 @@ namespace {
 volatile bool sQuitRequested;
 u32 sPreviousButtons;
 char sExecutableRoot[384] = ".";
+volatile u32 sPerformanceCounters[PikminPsp::PerformanceMetricCount];
+SceUID sPerformanceMainThread = -1, sPerformanceAudioThread = -1;
 
 #if defined(PIKMIN_PSP_GPROF)
 char sGprofOutputPath[512];
@@ -87,8 +90,31 @@ bool pathExists(const char* path)
 
 namespace PikminPsp {
 
+void performanceAdd(PerformanceMetric metric, u32 microseconds)
+{
+	__sync_fetch_and_add(&sPerformanceCounters[metric], microseconds);
+}
+
+u32 performanceCounter(PerformanceMetric metric) { return sPerformanceCounters[metric]; }
+void performanceSetAudioThread(SceUID thread) { sPerformanceAudioThread = thread; }
+
+u32 performanceThreadMicroseconds(bool audio)
+{
+	SceUID thread = audio ? sPerformanceAudioThread : sPerformanceMainThread;
+	if (thread < 0) return 0;
+	SceKernelThreadRunStatus status = {};
+	status.size = sizeof(status);
+	if (sceKernelReferThreadRunStatus(thread, &status) < 0) return 0;
+	// Despite the SDK's low/high parameter names, this API returns seconds
+	// followed by the microsecond remainder (see PPSSPP sceKernelTime.cpp).
+	unsigned int seconds, microseconds;
+	if (sceKernelSysClock2USec(&status.runClocks, &seconds, &microseconds) < 0) return 0;
+	return seconds * 1000000U + microseconds;
+}
+
 bool initialise(int argc, char** argv)
 {
+	sPerformanceMainThread = sceKernelGetThreadId();
 	sQuitRequested  = false;
 	sPreviousButtons = 0;
 	findExecutableRoot(argc, argv);
