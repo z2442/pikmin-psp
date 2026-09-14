@@ -14,6 +14,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 
 namespace {
 
@@ -142,7 +143,7 @@ void recordFrameTimings()
 		FILE* file = fopen(path, sTimings.wroteHeader ? "a" : "w");
 		if (file) {
 			if (!sTimings.wroteHeader) {
-				fputs("Mesh cache: explicit model revisions and direct GPU buffers.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
+				fputs("Mesh cache: explicit model revisions, compact state keys and direct GPU buffers.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -724,9 +725,14 @@ u32 meshMatrixIndex(const u8* vertex, const MeshLayout& layout)
 // depend on. Model matrices remain live GE state and are deliberately excluded.
 // Native buffers go directly to the GE. Entries stay pinned until a GPU sync
 // completes; replacements can never free geometry that is still in flight.
+struct MeshAttributeKey {
+	const u8* array;
+	u8 source, count, componentType, fraction, stride;
+};
+
 struct MeshCacheKey {
 	u64 modelRevision;
-	PspGxAttribute attributes[GX_VA_MAX_ATTR];
+	MeshAttributeKey attributes[GX_VA_MAX_ATTR];
 	u32 currentColour, currentMatrix;
 	GXColorS10 tint;
 	GXTevOp tintOp;
@@ -736,8 +742,14 @@ struct MeshCacheKey {
 	GXTexGenSrc texSource;
 	GXTexGenType texType;
 	u32 texMatrix;
+	bool generatedTexCoords;
 	Mtx textureMatrices[10];
 };
+
+u32 meshCacheKeyBytes(const MeshCacheKey& key)
+{
+	return offsetof(MeshCacheKey, textureMatrices) + (key.generatedTexCoords ? sizeof(key.textureMatrices) : 0);
+}
 
 // Equality only: unlike memcmp, no byte ordering result is needed. PSP libc
 // compares an entire buffer bytewise if either input starts unaligned.
@@ -883,9 +895,19 @@ void clearMeshCache()
 
 void meshCacheKey(MeshCacheKey& key)
 {
-	memset(&key, 0, sizeof(key));
+	memset(&key, 0, offsetof(MeshCacheKey, textureMatrices));
 	key.modelRevision = sMeshValidationScope ? sMeshValidationScope->modelRevision : 0;
-	memcpy(key.attributes, sState.attributes, sizeof(key.attributes));
+	for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) {
+		const auto& source = sState.attributes[i];
+		auto& target = key.attributes[i];
+		target.source = source.source;
+		if (source.source == GX_NONE) continue;
+		target.array = source.array;
+		target.count = source.count;
+		target.componentType = source.componentType;
+		target.fraction = source.fraction;
+		target.stride = source.stride;
+	}
 	key.currentColour = sState.attributes[GX_VA_CLR0].source == GX_NONE ? sState.currentColour : 0;
 	key.currentMatrix = sState.attributes[GX_VA_PNMTXIDX].source == GX_NONE ? sState.currentPositionMatrix : 0;
 	key.tintEnabled = sState.multiplyTevColour0 && sState.tevColourOp == GX_TEV_ADD && sState.tevColourBias == GX_TB_ZERO;
@@ -895,6 +917,7 @@ void meshCacheKey(MeshCacheKey& key)
 	}
 	// Ordinary UVs do not depend on texture-matrix animation elsewhere.
 	if (sState.texSource == GX_TG_POS || sState.texSource == GX_TG_NRM) {
+		key.generatedTexCoords = true;
 		key.texSource = sState.texSource; key.texType = sState.texType; key.texMatrix = sState.texMatrix;
 		memcpy(key.textureMatrices, sState.textureMatrices, sizeof(key.textureMatrices));
 	}
@@ -911,7 +934,7 @@ MeshCacheEntry* findCachedMesh(const u8* list, u32 bytes, const MeshCacheKey& ke
 {
 	for (auto& entry : sMeshCache[meshCacheSet(list)]) {
 		if (!entry.storage || entry.list != list || entry.listBytes != bytes) continue;
-		if (!meshBytesEqual(entry.storage, &key, sizeof(key))) continue;
+		if (!meshBytesEqual(entry.storage, &key, meshCacheKeyBytes(key))) continue;
 		if (key.modelRevision) { entry.lastUse = ++sMeshCacheUse; return &entry; }
 		const u8* snapshot = entry.storage + kMeshCacheDataOffset + meshCacheAlignedSize(entry.nativeBytes);
 		if (!meshBytesEqual(snapshot, list, bytes)) continue;
@@ -967,7 +990,7 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 	}
 	u8* storage = static_cast<u8*>(memalign(64, total));
 	if (!storage) return; // Memory pressure preserves the uncached draw path.
-	memcpy(storage, &key, sizeof(key));
+	memcpy(storage, &key, meshCacheKeyBytes(key));
 	memcpy(storage + kMeshCacheDataOffset, vertices, nativeBytes);
 	sceKernelDcacheWritebackRange(storage + kMeshCacheDataOffset, meshCacheAlignedSize(nativeBytes));
 	u8* snapshot = storage + kMeshCacheDataOffset + meshCacheAlignedSize(nativeBytes);
@@ -992,7 +1015,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 	MeshLayout layout;
 	if (!meshLayout(layout)) return false;
 	const u8* listStart = input;
-	MeshCacheKey key = {};
+	MeshCacheKey key;
 	if (useCache) {
 		meshCacheKey(key);
 		u32 validationStart = sceKernelGetSystemTimeLow();

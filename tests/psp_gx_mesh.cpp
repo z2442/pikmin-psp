@@ -730,6 +730,20 @@ void shadowCopies()
 
 int main(int argc, char** argv)
 {
+	resetState();
+	sState.texSource = GX_TG_TEX0;
+	MeshCacheKey ordinary, changed;
+	meshCacheKey(ordinary);
+	sState.textureMatrices[0][0][0] += 1;
+	meshCacheKey(changed);
+	assert(meshBytesEqual(&ordinary, &changed, meshCacheKeyBytes(ordinary)));
+	assert(meshCacheKeyBytes(ordinary) < sizeof(ordinary));
+	sState.texSource = GX_TG_POS;
+	meshCacheKey(ordinary);
+	sState.textureMatrices[0][0][0] += 1;
+	meshCacheKey(changed);
+	assert(!meshBytesEqual(&ordinary, &changed, meshCacheKeyBytes(ordinary)));
+	printf("Mesh state key: ordinary %u bytes, generated UV %u bytes\n", meshCacheKeyBytes(changed) - (u32)sizeof(changed.textureMatrices), meshCacheKeyBytes(changed));
 	// All alignment combinations, tails, and mismatch positions. Exact-sized
 	// allocations let ASan catch reads past the requested input buffer.
 	for (unsigned aOffset = 0; aOffset < 4; ++aOffset)

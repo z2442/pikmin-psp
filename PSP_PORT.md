@@ -96,7 +96,9 @@ invalidate it at binding; the slime's position/normal deformation explicitly
 invalidates it at the mutation sites. Future code that edits a model's arrays or
 mesh display lists must call `BaseShape::invalidatePspMesh()` on PSP. Model
 matrices and material state remain live; rigid animation needs no source scan.
-Revision-tracked entries store no array or display-list snapshots.
+Revision-tracked entries store no array or display-list snapshots. Compact
+state keys retain active attribute settings and compare texture matrices only
+when generating texture coordinates from positions or normals.
 
 Generic GX calls outside a revision-tracked model draw still compare source
 bytes. Shared array validation is available for callers that can guarantee
