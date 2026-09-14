@@ -351,6 +351,10 @@ public:
 	LightGroup mLightGroup;             // _7C
 	ObjCollInfo mCollisionInfo;         // _E8
 	u32 mVertexCacheFlags;              // _13C, see VertexCacheFlags enum
+#if defined(PLATFORM_PSP)
+	u64 mPspMeshRevision;
+	void invalidatePspMesh();
+#endif
 	BoundBox mCourseExtents;            // _140
 	f32 mGridSize;                      // _158
 	int mGridSizeX;                     // _15C

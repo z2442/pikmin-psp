@@ -89,17 +89,22 @@ geometry checks. To measure the gain, repeat the same scene and duration on PSP
 with the updated build. Keep each capture with its matching ELF before rebuilding;
 profiling overhead and time spent waiting can distort the flat-profile rankings.
 
-Rigid mesh conversion now has a bounded 4 MiB cache. It retains native vertices
-and triangle indices, checks the display list and source array versions before
-reuse, and applies the current model matrix at draw time. Model draw scopes
-compare shared array snapshots once when binding the model, rather than once
-per material. These snapshots have a separate 2 MiB budget. Calls outside these
-scopes retain per-entry byte comparisons. Changes
-to positions, UVs, vertex colors, tint, normals, or reflection state invalidate
-the affected entry. Skinned meshes retain their existing path. Allocation failure
-falls back to conversion. Cached buffers are submitted directly to the GPU and
-remain protected from eviction until a GPU sync completes. Aligned snapshots
-avoid the PSP library's byte-at-a-time comparison path.
+Rigid mesh conversion has a bounded 4 MiB cache of native vertices and triangle
+indices. Normal model draws carry a globally unique revision, assigned at model
+construction/loading and replaced when source data changes. Array dirty flags
+invalidate it at binding; the slime's position/normal deformation explicitly
+invalidates it at the mutation sites. Future code that edits a model's arrays or
+mesh display lists must call `BaseShape::invalidatePspMesh()` on PSP. Model
+matrices and material state remain live; rigid animation needs no source scan.
+Revision-tracked entries store no array or display-list snapshots.
+
+Generic GX calls outside a revision-tracked model draw still compare source
+bytes. Shared array validation is available for callers that can guarantee
+read-only arrays within a draw scope, with a separate 2 MiB snapshot budget.
+Snapshot comparisons use unrolled word equality checks, including unaligned
+word loads. Skinned meshes retain their existing conversion path. Allocation
+failure falls back to conversion. Cached buffers are submitted directly to the
+GPU and remain protected from eviction until a GPU sync completes.
 
 The native GX checks exercise reuse, source mutations, animated matrices,
 reflection changes, and eviction protection. Replaying the opening and logo
@@ -107,8 +112,9 @@ models together reproduces the title's 71,010 decoded vertices per frame; after
 warmup the eight-way cache avoids all 71,010 conversions in that replay. The reported native benchmark
 ratio is not a PSP FPS measurement. In `performance.log`, `mesh_cache_hits` and
 `cached_vertices` report reuse, while `cache_validate_ms` measures lookup and
-snapshot checks within `mesh_ms`. `array_validate_ms` measures the shared array
-comparisons inside `render_ms`, outside `mesh_ms`.
+state checks within `mesh_ms` (plus byte comparisons for unversioned calls).
+`array_validate_ms` measures shared array comparisons inside `render_ms`, outside
+`mesh_ms`; normal revision-tracked model draws do not perform these comparisons.
 
 The normal build also writes `performance.log` beside the EBOOT every 120
 presented frames. It reports average FPS, frame time, final GPU wait, display-list

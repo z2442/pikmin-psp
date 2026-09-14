@@ -259,6 +259,53 @@ void sharedMeshArrays()
 	assert(sMeshArrayBytes == 0);
 }
 
+void revisionedMeshes()
+{
+	clearMeshCache(); resetState();
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	u8 list[] = {GX_TRIANGLES,0,3,0,1,2};
+	u64 revision = PikminPsp::nextMeshRevision();
+	{
+		PikminPsp::MeshValidationScope scope;
+		PikminPsp::bindMeshRevision(revision);
+		compareList(list, sizeof(list));
+		MeshCacheKey key; meshCacheKey(key);
+		auto* entry = findCachedMesh(list, sizeof(list), key);
+		assert(entry && entry->allocationBytes == kMeshCacheDataOffset + meshCacheAlignedSize(entry->nativeBytes));
+		assert(sMeshArrayBytes == 0); // No source snapshots allocated.
+		u64 decoded = sTimings.decodedVertices;
+		sState.positionMatrices[0][0][3] += 7;
+		compareList(list, sizeof(list));
+		assert(sTimings.decodedVertices == decoded);
+		const u8* pinned = entry->storage;
+		std::vector<u8> before(pinned, pinned + entry->allocationBytes);
+		positions[1][0] = 8;
+		PikminPsp::bindMeshRevision(PikminPsp::nextMeshRevision());
+		compareList(list, sizeof(list));
+		assert(sTimings.decodedVertices > decoded);
+		assert(entry->storage == pinned && !memcmp(pinned, before.data(), before.size()));
+		list[3] = 2;
+		PikminPsp::bindMeshRevision(PikminPsp::nextMeshRevision());
+		compareList(list, sizeof(list));
+		// Same addresses reused by a new model must not reuse old geometry.
+		positions[2][1] = 9;
+		{
+			PikminPsp::MeshValidationScope nested;
+			PikminPsp::bindMeshRevision(PikminPsp::nextMeshRevision());
+			compareList(list, sizeof(list));
+		}
+		assert(sMeshValidationScope == &scope);
+	}
+	// An unscoped draw cannot accept the revision-only cache entry.
+	positions[1][1] = 4;
+	compareList(list, sizeof(list));
+	clearMeshCache();
+	assert(PikminPsp::nextMeshRevision() > revision); // Lifetime IDs survive cache resets.
+}
+
 void movieFrame()
 {
 	resetState(); resetDraws();
@@ -307,6 +354,7 @@ void benchmarkModels(const std::vector<ModelDraw>& modelDraws)
 	double milliseconds[2];
 	for (bool cached : {false, true}) {
 		clearMeshCache();
+		const u64 revision = PikminPsp::nextMeshRevision();
 		u64 beforeDecoded = 0, beforeHits = 0;
 		std::chrono::steady_clock::time_point start;
 		for (u32 frame = 0; frame < 13; ++frame) {
@@ -316,13 +364,8 @@ void benchmarkModels(const std::vector<ModelDraw>& modelDraws)
 				beforeDecoded = sTimings.decodedVertices; beforeHits = sTimings.meshCacheHits;
 			}
 			PikminPsp::MeshValidationScope validation;
-			const void* previousPositions = nullptr;
+			PikminPsp::bindMeshRevision(revision);
 			for (const auto& draw : modelDraws) {
-				if (draw.state.attributes[GX_VA_POS].array != previousPositions) {
-					for (u32 attr = 0; attr < GX_VA_MAX_ATTR; ++attr)
-						if (draw.arrayBytes[attr]) PikminPsp::validateMeshArray((GXAttr)attr, draw.state.attributes[attr].array, draw.arrayBytes[attr]);
-					previousPositions = draw.state.attributes[GX_VA_POS].array;
-				}
 				sState = draw.state; resetDraws();
 				assert(drawMeshList(draw.list, draw.list + draw.bytes, cached));
 			}
@@ -687,6 +730,20 @@ void shadowCopies()
 
 int main(int argc, char** argv)
 {
+	// All alignment combinations, tails, and mismatch positions. Exact-sized
+	// allocations let ASan catch reads past the requested input buffer.
+	for (unsigned aOffset = 0; aOffset < 4; ++aOffset)
+		for (unsigned bOffset = 0; bOffset < 4; ++bOffset)
+			for (unsigned bytes = 0; bytes <= 129; ++bytes) {
+				std::vector<u8> a(bytes + aOffset), b(bytes + bOffset);
+				for (unsigned i = 0; i < bytes; ++i) a[aOffset + i] = b[bOffset + i] = (u8)(i * 37);
+				assert(meshBytesEqual(a.data() + aOffset, b.data() + bOffset, bytes));
+				for (unsigned i = 0; i < bytes; ++i) {
+					b[bOffset + i] ^= 1;
+					assert(!meshBytesEqual(a.data() + aOffset, b.data() + bOffset, bytes));
+					b[bOffset + i] ^= 1;
+				}
+			}
 	onionMaterialTint();
 	materialTintLookup();
 	reflectionCoordinates();
@@ -695,6 +752,7 @@ int main(int argc, char** argv)
 	syntheticLists();
 	meshCacheInvalidation();
 	sharedMeshArrays();
+	revisionedMeshes();
 	movieFrame();
 	particleColours();
 	for (int i = 1; i < argc; ++i) modelTest(argv[i]);

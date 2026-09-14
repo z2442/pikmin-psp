@@ -1223,12 +1223,8 @@ static GXVtxAttrFmtList meshVAT[] = {
 void DGXGraphics::initMesh(Shape* model)
 {
 #if defined(PLATFORM_PSP)
-	if (model->mVertexCount > 0) PikminPsp::validateMeshArray(GX_VA_POS, model->mVertexList, model->mVertexCount * sizeof(Vector3f));
-	if (model->mNormalCount > 0) PikminPsp::validateMeshArray(GX_VA_NRM, model->mNormalList, model->mNormalCount * sizeof(Vector3f));
-	if (model->mNBTCount > 0) PikminPsp::validateMeshArray(GX_VA_NBT, model->mNBTList, model->mNBTCount * sizeof(NBT));
-	if (model->mVtxColorCount > 0) PikminPsp::validateMeshArray(GX_VA_CLR0, model->mVtxColorList, model->mVtxColorCount * sizeof(Colour));
-	for (int i = 0; i < model->mTotalActiveTexCoords; ++i)
-		if (model->mTexCoordCounts[i] > 0) PikminPsp::validateMeshArray((GXAttr)(GX_VA_TEX0 + i), model->mTexCoordList[i], model->mTexCoordCounts[i] * sizeof(Vector2f));
+	if (model->mVertexCacheFlags) model->invalidatePspMesh();
+	PikminPsp::bindMeshRevision(model->mPspMeshRevision);
 #endif
 	oldTevGroup = 0;
 	GXSetVtxAttrFmtv(GX_VTXFMT0, meshVAT);

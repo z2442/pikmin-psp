@@ -142,7 +142,7 @@ void recordFrameTimings()
 		FILE* file = fopen(path, sTimings.wroteHeader ? "a" : "w");
 		if (file) {
 			if (!sTimings.wroteHeader) {
-				fputs("Mesh cache: shared array versions, aligned snapshots and direct GPU buffers.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
+				fputs("Mesh cache: explicit model revisions and direct GPU buffers.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -725,6 +725,7 @@ u32 meshMatrixIndex(const u8* vertex, const MeshLayout& layout)
 // Native buffers go directly to the GE. Entries stay pinned until a GPU sync
 // completes; replacements can never free geometry that is still in flight.
 struct MeshCacheKey {
+	u64 modelRevision;
 	PspGxAttribute attributes[GX_VA_MAX_ATTR];
 	u32 currentColour, currentMatrix;
 	GXColorS10 tint;
@@ -883,6 +884,7 @@ void clearMeshCache()
 void meshCacheKey(MeshCacheKey& key)
 {
 	memset(&key, 0, sizeof(key));
+	key.modelRevision = sMeshValidationScope ? sMeshValidationScope->modelRevision : 0;
 	memcpy(key.attributes, sState.attributes, sizeof(key.attributes));
 	key.currentColour = sState.attributes[GX_VA_CLR0].source == GX_NONE ? sState.currentColour : 0;
 	key.currentMatrix = sState.attributes[GX_VA_PNMTXIDX].source == GX_NONE ? sState.currentPositionMatrix : 0;
@@ -910,6 +912,7 @@ MeshCacheEntry* findCachedMesh(const u8* list, u32 bytes, const MeshCacheKey& ke
 	for (auto& entry : sMeshCache[meshCacheSet(list)]) {
 		if (!entry.storage || entry.list != list || entry.listBytes != bytes) continue;
 		if (!meshBytesEqual(entry.storage, &key, sizeof(key))) continue;
+		if (key.modelRevision) { entry.lastUse = ++sMeshCacheUse; return &entry; }
 		const u8* snapshot = entry.storage + kMeshCacheDataOffset + meshCacheAlignedSize(entry.nativeBytes);
 		if (!meshBytesEqual(snapshot, list, bytes)) continue;
 		snapshot += meshCacheAlignedSize(bytes);
@@ -936,7 +939,9 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 {
 	MeshInputRange savedInputs[4];
 	memcpy(savedInputs, inputs, sizeof(savedInputs));
-	u64 total = kMeshCacheDataOffset + meshCacheAlignedSize(listBytes) + meshCacheAlignedSize(nativeBytes);
+	if (key.modelRevision) memset(savedInputs, 0, sizeof(savedInputs));
+	const u32 snapshotListBytes = key.modelRevision ? 0 : listBytes;
+	u64 total = kMeshCacheDataOffset + meshCacheAlignedSize(snapshotListBytes) + meshCacheAlignedSize(nativeBytes);
 	for (u32 i = 0; i < 4; ++i) {
 		auto& range = savedInputs[i];
 		if (!range.begin) continue;
@@ -966,7 +971,8 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 	memcpy(storage + kMeshCacheDataOffset, vertices, nativeBytes);
 	sceKernelDcacheWritebackRange(storage + kMeshCacheDataOffset, meshCacheAlignedSize(nativeBytes));
 	u8* snapshot = storage + kMeshCacheDataOffset + meshCacheAlignedSize(nativeBytes);
-	memcpy(snapshot, list, listBytes); snapshot += meshCacheAlignedSize(listBytes);
+	if (snapshotListBytes) memcpy(snapshot, list, snapshotListBytes);
+	snapshot += meshCacheAlignedSize(snapshotListBytes);
 	for (const auto& range : savedInputs) if (range.begin && !range.generation) {
 		u32 bytes = range.end - range.begin;
 		memcpy(snapshot, range.begin, bytes); snapshot += meshCacheAlignedSize(bytes);
@@ -1125,8 +1131,19 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 } // namespace
 
 namespace PikminPsp {
-MeshValidationScope::MeshValidationScope() : previous(sMeshValidationScope), arrays{} { sMeshValidationScope = this; }
+MeshValidationScope::MeshValidationScope() : previous(sMeshValidationScope), arrays{}, modelRevision(0) { sMeshValidationScope = this; }
 MeshValidationScope::~MeshValidationScope() { sMeshValidationScope = previous; }
+
+u64 nextMeshRevision()
+{
+	static u64 revision;
+	return ++revision;
+}
+
+void bindMeshRevision(u64 revision)
+{
+	if (sMeshValidationScope) sMeshValidationScope->modelRevision = revision;
+}
 
 void validateMeshArray(GXAttr attribute, const void* source, u32 bytes)
 {

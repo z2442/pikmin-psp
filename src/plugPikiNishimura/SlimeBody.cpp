@@ -136,6 +136,9 @@ void SlimeBody::makeMaxRadius()
  */
 void SlimeBody::setSpherePosition()
 {
+#if defined(PLATFORM_PSP)
+	mSlime->mShapeObject->mShape->invalidatePspMesh();
+#endif
 	for (int i = 0; i < mSlime->mShapeObject->mShape->mVertexCount; i++) {
 		mSlime->mShapeObject->mShape->mVertexList[i].x = mMaxRadius * mNormalisedVertexPositions[i].x;
 		mSlime->mShapeObject->mShape->mVertexList[i].y = mMaxRadius * mNormalisedVertexPositions[i].y;
@@ -209,6 +212,9 @@ void SlimeBody::sortPosition(Vector3f* outVertex, Vector3f* outNormal, immut Vec
  */
 void SlimeBody::makeSlimeBody()
 {
+#if defined(PLATFORM_PSP)
+	mSlime->mShapeObject->mShape->invalidatePspMesh();
+#endif
 	Vector3f up(0.0f, C_SLIME_PARM(mSlime, mBodyHeight), 0.0f);
 	for (int i = 0; i < mSlime->mShapeObject->mShape->mVertexCount; i++) {
 		sortPosition(&mSlime->mShapeObject->mShape->mVertexList[i], &mSlime->mShapeObject->mShape->mNormalList[mVertexNormalIndices[i]],

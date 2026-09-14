@@ -1845,6 +1845,9 @@ void ShapeDynMaterials::updateContext()
  */
 BaseShape::BaseShape()
 {
+#if defined(PLATFORM_PSP)
+	invalidatePspMesh();
+#endif
 	mName             = "noname";
 	mAnimMatrices     = nullptr;
 	mAnimMtxCount     = 0;
@@ -2253,8 +2256,18 @@ void BaseShape::recAddMatpoly(Joint* parentJoint, int flag)
 /**
  * @todo: Documentation
  */
+#if defined(PLATFORM_PSP)
+void BaseShape::invalidatePspMesh()
+{
+	mPspMeshRevision = PikminPsp::nextMeshRevision();
+}
+#endif
+
 void BaseShape::read(RandomAccessStream& stream)
 {
+#if defined(PLATFORM_PSP)
+	invalidatePspMesh();
+#endif
 	int unused = 0;
 
 	u32 freeBefore; // This is not supposed to be reused in every switch case BUT doing so fixes stack for the DOL.
