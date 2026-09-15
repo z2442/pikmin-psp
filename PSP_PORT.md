@@ -97,7 +97,9 @@ invalidates it at the mutation sites. Future code that edits a model's arrays or
 mesh display lists must call `BaseShape::invalidatePspMesh()` on PSP. Model
 matrices and material state remain live; rigid animation needs no source scan.
 Revision-tracked entries store no array or display-list snapshots. Compact
-state keys retain active attribute settings and compare texture matrices only
+state keys retain every attribute source (which determines FIFO offsets), but
+array metadata only for position, primary color/UV, and normal/NBT inputs.
+Cache hits skip vertex-layout reconstruction. Keys compare texture matrices only
 when generating texture coordinates from positions or normals.
 
 Generic GX calls outside a revision-tracked model draw still compare source
@@ -299,3 +301,31 @@ to exit.
 The renderer should translate the existing GX-facing game code rather than
 changing simulation or gameplay code. This keeps the port reviewable and lets
 the original decompilation continue to match independently.
+
+### Active-voice ME transport
+
+Mixer jobs now pack only enabled, unfinished voices and carry their original
+channel IDs to preserve decoder history across packing changes. Inactive DSP
+channels are untouched. The cache exchange is 448 bytes plus 80 bytes per active
+voice, rounded to 64 bytes (576 bytes for one voice, versus 5,504 previously).
+The 64-voice limit, 80-sample tick, sequence cadence, and output rate are unchanged.
+Native transport tests cover sparse/full/empty jobs, completion, slot reuse, and
+return-field ownership. Actual speedup and ME cache coherence need PSP testing.
+Compare the same scene's `audio_cpu_ms`, `audio_mix_ms`, `cache_validate_ms`, and
+`frame_ms`; audio totals are per rendered frame, so they also fall when FPS rises.
+
+### GPU bandwidth and ME idle polling
+
+Converted 4444 textures at least 8 by 8 pixels now use the GE's 16-byte by
+8-row swizzled layout. Smaller textures and movie frames remain linear.
+Framebuffer-copy refreshes use the same layout as their cached texture.
+Texture dimensions, pixel values, filtering, and UV scales are preserved.
+The renderer also tracks the model matrix actually loaded in GU, skipping
+redundant uploads and invalidating that state on matrix edits or temporary
+identity matrices used for skinning and pretransformed vertices.
+
+The idle ME uses a bounded 256-iteration register-only loop between mailbox
+polls instead of continuously reading shared uncached memory. This targets
+shared-bus contention without changing audio tick or output timing; job pickup
+can be delayed by a few microseconds. PSP measurements are still required to
+verify the performance effect and audio/video behavior.

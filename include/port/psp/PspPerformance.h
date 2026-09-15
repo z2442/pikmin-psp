@@ -12,6 +12,12 @@ enum PerformanceMetric {
 	PerformancePacing,
 	PerformanceAudioWork,
 	PerformanceAudioLock,
+	PerformanceAudioSequence,
+	PerformanceAudioChannels,
+	PerformanceAudioStream,
+	PerformanceAudioMix,
+	PerformanceAudioMeWait,
+	PerformanceAudioMovie,
 	PerformanceMetricCount
 };
 

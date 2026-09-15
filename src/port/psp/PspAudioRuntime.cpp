@@ -88,16 +88,31 @@ int audioThread(SceSize, void*)
 				PikminPsp::AudioLock lock;
 				++sCounter;
 				if (trace) PikminPsp::audioLog("audio frame %u: sequence begin", (unsigned)frame);
-				DspPlayerCallback();
+				{
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioSequence);
+					DspPlayerCallback();
+				}
 				if (trace) PikminPsp::audioLog("audio frame %u: channels begin", (unsigned)frame);
-				UpdateDSPchannelAll();
+				{
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioChannels);
+					UpdateDSPchannelAll();
 				if (trace) PikminPsp::audioLog("audio frame %u: callbacks begin", (unsigned)frame);
 				PlayerCallback();
+				}
 				if (trace) PikminPsp::audioLog("audio frame %u: stream begin", (unsigned)frame);
-				PikminPsp::audioStreamUpdate();
+				{
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioStream);
+					PikminPsp::audioStreamUpdate();
+				}
 				if (trace) PikminPsp::audioLog("audio frame %u: mix begin", (unsigned)frame);
-				PikminPsp::audioMix(sOutput[buffer] + sub * 160, 80);
-				PikminPsp::movieMix(sOutput[buffer] + sub * 160, 80);
+				{
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioMix);
+					PikminPsp::audioMix(sOutput[buffer] + sub * 160, 80);
+				}
+				{
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioMovie);
+					PikminPsp::movieMix(sOutput[buffer] + sub * 160, 80);
+				}
 				if (trace) PikminPsp::audioLog("audio frame %u: mix complete", (unsigned)frame);
 			}
 			if (trace) PikminPsp::audioLog("audio frame %u: lock complete", (unsigned)frame);

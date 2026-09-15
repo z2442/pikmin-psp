@@ -81,6 +81,33 @@ int main()
 	}
 	audioWriteMixerChannel(returned, packed);
 	assert(!memcmp(&returned, &expected, sizeof(returned)));
+	// Sparse jobs retain original channel IDs and leave inactive DSP state alone.
+	DSPchannel_ voices[64] = {};
+	AudioMixerJob job = {};
+	audioPackMixerJob(job, voices);
+	assert(job.channelCount == 0);
+	assert(audioMixerJobBytes(job) == offsetof(AudioMixerJob, channels));
+	voices[3] = original; voices[3].enabled = 1; voices[3].done = 0;
+	voices[61] = voices[3];
+	voices[9] = voices[3]; voices[9].done = 1;
+	audioPackMixerJob(job, voices);
+	assert(job.channelCount == 2 && job.channelIds[0] == 3 && job.channelIds[1] == 61);
+	assert(audioMixerJobBytes(job) % 64 == 0 && audioMixerJobBytes(job) < sizeof(job));
+	assert(!memcmp(&job.channels[0], &job.channels[1], sizeof(AudioMixerChannel)));
+	DSPchannel_ inactive = voices[9];
+	job.channels[0].done = 1; job.channels[1].mixChannels[2].currentVolume = 321;
+	audioUnpackMixerJob(voices, job);
+	assert(voices[3].done == 1 && voices[61].mixChannels[2].currentVolume == 321);
+	assert(!memcmp(&inactive, &voices[9], sizeof(inactive)));
+	// Completion and channel reuse must not associate a new voice with the
+	// decoder history of the previous packed slot.
+	voices[0] = voices[61];
+	audioPackMixerJob(job, voices);
+	assert(job.channelCount == 2 && job.channelIds[0] == 0 && job.channelIds[1] == 61);
+	for (u32 i = 0; i < 64; ++i) { voices[i].enabled = 1; voices[i].done = 0; }
+	audioPackMixerJob(job, voices);
+	assert(job.channelCount == 64 && audioMixerJobBytes(job) == sizeof(job));
+	for (u32 i = 0; i < 64; ++i) assert(job.channelIds[i] == i);
 	printf("ME channel snapshot: %u -> %u bytes/channel, return fields preserved\n", (unsigned)sizeof(original), (unsigned)sizeof(packed));
 	printf("PSP audio transport: unchanged stream exchange %u -> %u bytes/job per cache operation; refill/reset/channel ownership checks passed\n", (unsigned)sizeof(sStream), (unsigned)stateBytes);
 }

@@ -18,6 +18,7 @@ namespace {
 alignas(16) u8 memory[8 * 1024 * 1024];
 u32 used;
 u32 drawCalls;
+u32 modelMatrixUploads;
 bool recordGeometry = true;
 ScePspFMatrix4 modelMatrix;
 ScePspFMatrix4 bones[8];
@@ -39,6 +40,7 @@ void transform(PspGxVertex& vertex, const ScePspFMatrix4& matrix)
 void resetDraws()
 {
 	used = drawCalls = 0;
+	sState.guPositionMatrixValid = false;
 	triangles.clear();
 	sprites.clear();
 	modelMatrix = positionMatrix(sState.positionMatrices[sState.currentPositionMatrix]);
@@ -493,7 +495,7 @@ void sceGuTexScale(float, float) {}
 void sceGuTexOffset(float, float) {}
 void sceGuTexFlush() {}
 void OSReport(const char*, ...) {}
-void sceGuSetMatrix(int type, const ScePspFMatrix4* matrix) { if (type == GU_MODEL) modelMatrix = *matrix; }
+void sceGuSetMatrix(int type, const ScePspFMatrix4* matrix) { if (type == GU_MODEL) { modelMatrix = *matrix; ++modelMatrixUploads; } }
 void sceGuBoneMatrix(unsigned int index, const ScePspFMatrix4* matrix) { assert(index < 8); bones[index] = *matrix; }
 void sceGuDrawArray(int primitive, int format, int count, const void* indexData, const void* vertexData)
 {
@@ -728,8 +730,70 @@ void shadowCopies()
 		assert(decodeTexturePixel(buffer.data(),16,GX_TF_RGB565,x,y) == GU_RGBA(255,0,0,255));
 }
 
+void matrixReuse()
+{
+	resetState();
+	modelMatrixUploads = 0;
+	loadGuPositionMatrix(0);
+	for (u32 i = 0; i < 606; ++i) loadGuPositionMatrix(0);
+	assert(modelMatrixUploads == 1);
+	Mtx matrix;
+	memcpy(matrix, sState.positionMatrices[0], sizeof(matrix));
+	GXLoadPosMtxImm(matrix, 0);
+	GXSetCurrentMtx(0);
+	assert(modelMatrixUploads == 1);
+	matrix[0][3] += 1;
+	GXLoadPosMtxImm(matrix, 0);
+	assert(modelMatrixUploads == 2);
+	loadGuPositionMatrix(1);
+	assert(modelMatrixUploads == 3);
+	// Mutating the matrix actually loaded in GU must invalidate it even if
+	// GX's current matrix selects a different slot.
+	GXLoadPosMtxImm(matrix, 3);
+	assert(!sState.guPositionMatrixValid);
+	loadGuPositionMatrix(1);
+	assert(modelMatrixUploads == 4);
+	ScePspFMatrix4 expected = positionMatrix(matrix);
+	assert(!memcmp(&expected, &modelMatrix, sizeof(expected)));
+	GXSetCurrentMtx(0);
+	assert(modelMatrixUploads == 5);
+}
+
+void swizzledTextures()
+{
+	const u16 dimensions[][2] = {{1,1}, {4,16}, {16,4}, {8,8}, {13,9}, {32,16}, {64,32}, {512,512}};
+	for (const auto& size : dimensions) {
+		u32 width = size[0], height = size[1];
+		std::vector<u8> source(((width + 7) / 8) * ((height + 3) / 4) * 32);
+		for (u32 i = 0; i < source.size(); ++i) source[i] = (i * 37 + i / 11) & 255;
+		PspGxTexture* texture = convertTexture(source.data(), width, height, GX_TF_I8);
+		assert(texture);
+		u32 w = texture->storageWidth, h = texture->storageHeight;
+		bool swizzled = w >= 8 && h >= 8;
+		// Read the actual output in GE block order, independently of the
+		// production offset helper. Check every pixel, including padding.
+		for (u32 i = 0; i < w * h; ++i) {
+			u32 x = i % w, y = i / w;
+			if (swizzled) {
+				u32 block = i / 64;
+				x = (block % (w / 8)) * 8 + i % 8;
+				y = (block / (w / 8)) * 8 + (i % 64) / 8;
+			}
+			u16 expected = 0;
+			if (x < width && y < height) {
+				u32 c = decodeTexturePixel(source.data(), width, GX_TF_I8, x, y);
+				expected = rgbaTo4444(c & 255, (c >> 8) & 255, (c >> 16) & 255, c >> 24);
+			}
+			assert(texture->pixels[i] == expected);
+		}
+		releaseTexture(*texture);
+	}
+}
+
 int main(int argc, char** argv)
 {
+	matrixReuse();
+	swizzledTextures();
 	resetState();
 	sState.texSource = GX_TG_TEX0;
 	MeshCacheKey ordinary, changed;
@@ -738,6 +802,15 @@ int main(int argc, char** argv)
 	meshCacheKey(changed);
 	assert(meshBytesEqual(&ordinary, &changed, meshCacheKeyBytes(ordinary)));
 	assert(meshCacheKeyBytes(ordinary) < sizeof(ordinary));
+	// Unused secondary UV array metadata does not affect decoded vertices,
+	// but its source still affects the byte offsets of subsequent attributes.
+	sState.attributes[GX_VA_TEX1].stride = 16;
+	meshCacheKey(changed);
+	assert(meshBytesEqual(&ordinary, &changed, meshCacheKeyBytes(ordinary)));
+	sState.attributes[GX_VA_TEX1].source = GX_INDEX16;
+	meshCacheKey(changed);
+	assert(!meshBytesEqual(&ordinary, &changed, meshCacheKeyBytes(ordinary)));
+	sState.attributes[GX_VA_TEX1].source = GX_NONE;
 	sState.texSource = GX_TG_POS;
 	meshCacheKey(ordinary);
 	sState.textureMatrices[0][0][0] += 1;

@@ -2,6 +2,7 @@
 #include "port/psp/PspAudioMixerJob.h"
 #include "port/psp/PspAudioDecode.h"
 #include "port/psp/PspPlatform.h"
+#include "port/psp/PspPerformance.h"
 #include "jaudio/dspinterface.h"
 #include "jaudio/aictrl.h"
 #include <stdio.h>
@@ -27,12 +28,7 @@ struct Voice {
 Voice sVoices[64] __attribute__((aligned(64)));
 // Main CPU publishes a snapshot; only completion flags and volume ramp state
 // come back. The ME never calls game, OS, file, or allocator functions.
-struct alignas(64) Job {
-	PikminPsp::AudioMixerChannel channels[64];
-	s16 output[80 * 2];
-	u32 mono, gain;
-};
-Job sJob __attribute__((aligned(64)));
+PikminPsp::AudioMixerJob sJob __attribute__((aligned(64)));
 
 void meInvalidateRange(const void* address, u32 size)
 {
@@ -59,6 +55,14 @@ __attribute__((noinline, aligned(4))) int initialiseMeWithoutSuspendHook()
 	meCoreSelectSystemTable(table);
 	meLibReset();
 	return table;
+}
+
+inline void meIdlePollDelay()
+{
+	// Do not hammer the shared RAM bus while waiting for a 2.5 ms audio tick.
+	// This bounded register-only loop adds a few microseconds of pickup latency
+	// without requiring an interrupt/wakeup path on the bare-metal ME.
+	for (unsigned i = 0; i < 256; ++i) asm volatile("nop");
 }
 
 s16 voiceSample(PikminPsp::AudioMixerChannel& c, Voice& v, bool onMe)
@@ -110,9 +114,9 @@ void render()
 	using namespace PikminPsp;
 	const bool onMe = meLibGetCpuId() != 0;
 	s32 mix[160] = {};
-	for (unsigned index = 0; index < 64; ++index) {
+	for (unsigned index = 0; index < sJob.channelCount; ++index) {
 		AudioMixerChannel& c = sJob.channels[index];
-		Voice& v = sVoices[index];
+		Voice& v = sVoices[sJob.channelIds[index]];
 		if (!c.enabled || c.done) continue;
 		if (c.resetVpb) {
 			v.position = v.fraction = 0;
@@ -184,13 +188,15 @@ extern "C" void meLibOnProcess()
 			// Allegrex owns the job snapshot. Discard the ME's prior clean copy
 			// before consuming it; writing that old copy back here can replace a
 			// newly-started voice with the previous all-idle snapshot.
-			meInvalidateRange(&sJob, sizeof(sJob));
+			meInvalidateRange(&sJob, offsetof(PikminPsp::AudioMixerJob, channels));
+			const u32 jobBytes = PikminPsp::audioMixerJobBytes(sJob);
+			meInvalidateRange(sJob.channels, jobBytes - offsetof(PikminPsp::AudioMixerJob, channels));
 			render();
-			meWritebackRange(&sJob, sizeof(sJob));
+			meWritebackRange(&sJob, jobBytes);
 			meLibSync();
 			if (MAIL[0] == Mix) MAIL[0] = Idle;
 			meLibSync();
-		} else { meLibDelayPipeline(); }
+		} else { meIdlePollDelay(); }
 	}
 	MAIL[0] = Halted;
 	meLibSync();
@@ -236,7 +242,7 @@ bool audioBootMe()
 	}
 	printf("[audio] %s (libme-core %d)\n", sMeAvailable ? "ME decoder ready" : "ME unavailable; using CPU decoder", result);
 	audioLog("%s (libme-core result=%d)", sMeAvailable ? "ME decoder ready" : "ME unavailable; CPU decoder active", result);
-	audioLog("ME transport: channel=%u job=%u bytes, stream input sent only on refill/reset",
+	audioLog("ME transport: channel=%u max job=%u bytes, active voices only; stream input on refill/reset",
 	         (unsigned)sizeof(AudioMixerChannel), (unsigned)sizeof(sJob));
 	return sMeAvailable;
 }
@@ -244,11 +250,8 @@ bool audioBootMe()
 void audioMix(s16* output, u32 frames)
 {
 	if (frames != 80 || sMeFailed) { memset(output, 0, frames * 4); return; }
-	u32 activeVoices = 0;
-	for (unsigned i = 0; i < 64; ++i) {
-		audioReadMixerChannel(sJob.channels[i], *GetDspHandle(i));
-		if (sJob.channels[i].enabled && !sJob.channels[i].done) ++activeVoices;
-	}
+	audioPackMixerJob(sJob, GetDspHandle(0));
+	u32 activeVoices = sJob.channelCount;
 	if (activeVoices && !sLoggedActiveVoices) {
 		audioLog("first active DSP voices=%u", (unsigned)activeVoices);
 		sLoggedActiveVoices = true;
@@ -257,11 +260,12 @@ void audioMix(s16* output, u32 frames)
 	sJob.gain = sMasterGain;
 	if (sMeAvailable) {
 		audioStreamCpuPublish();
-		sceKernelDcacheWritebackRange(&sJob, (sizeof(sJob) + 63) & ~63U);
+		sceKernelDcacheWritebackRange(&sJob, audioMixerJobBytes(sJob));
 		MAIL[0] = Mix;
 		meLibSync();
 		u32 start = sceKernelGetSystemTimeLow();
 		while (MAIL[0] == Mix && sceKernelGetSystemTimeLow() - start < 250000) sceKernelDelayThread(100);
+		performanceAdd(PerformanceAudioMeWait, (u32)(sceKernelGetSystemTimeLow() - start));
 		if (MAIL[0] != Idle) {
 			// Never race a stalled ME by running the same job on the main CPU.
 			// Its private job and arenas remain allocated until process exit.
@@ -272,15 +276,12 @@ void audioMix(s16* output, u32 frames)
 			memset(output, 0, frames * 4);
 			return;
 		}
-		sceKernelDcacheInvalidateRange(&sJob, (sizeof(sJob) + 63) & ~63U);
+		sceKernelDcacheInvalidateRange(&sJob, audioMixerJobBytes(sJob));
 		audioStreamCpuAcquire();
 	} else {
 		render();
 	}
-	for (unsigned i = 0; i < 64; ++i) {
-		DSPchannel_* c = GetDspHandle(i);
-		audioWriteMixerChannel(*c, sJob.channels[i]);
-	}
+	audioUnpackMixerJob(GetDspHandle(0), sJob);
 	memcpy(output, sJob.output, frames * 4);
 	if (!sLoggedNonzeroPcm) {
 		u32 peak = 0;

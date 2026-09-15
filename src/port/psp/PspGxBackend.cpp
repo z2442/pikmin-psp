@@ -64,6 +64,8 @@ struct PspGxState {
 	bool listOpen;
 	bool displayEnabled;
 	u32 currentPositionMatrix;
+	u32 guPositionMatrix;
+	bool guPositionMatrixValid;
 	PspGxAttribute attributes[GX_VA_MAX_ATTR];
 	Mtx positionMatrices[10];
 	Mtx textureMatrices[10];
@@ -143,7 +145,7 @@ void recordFrameTimings()
 		FILE* file = fopen(path, sTimings.wroteHeader ? "a" : "w");
 		if (file) {
 			if (!sTimings.wroteHeader) {
-				fputs("Mesh cache: explicit model revisions, compact state keys and direct GPU buffers.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
+				fputs("Mesh cache: consumed-array keys and direct GPU buffers. GPU: matrix reuse and swizzled textures. Audio: active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -157,6 +159,13 @@ void recordFrameTimings()
 			        sTimings.decodedVertices / 120.0, sTimings.skinnedVertices / 120.0,
 			        sTimings.fallbackLists / 120.0, sTimings.textureMisses / 120.0,
 			        sTimings.meshCacheHits / 120.0, sTimings.cachedVertices / 120.0, sTimings.meshCacheValidation / 120000.0, sTimings.arrayValidation / 120000.0);
+			fprintf(file, "  audio_sequence_ms=%.2f audio_channels_ms=%.2f audio_stream_ms=%.2f audio_mix_ms=%.2f audio_me_wait_ms=%.2f audio_movie_ms=%.2f\n",
+			        metrics[PikminPsp::PerformanceAudioSequence] / 120000.0,
+			        metrics[PikminPsp::PerformanceAudioChannels] / 120000.0,
+			        metrics[PikminPsp::PerformanceAudioStream] / 120000.0,
+			        metrics[PikminPsp::PerformanceAudioMix] / 120000.0,
+			        metrics[PikminPsp::PerformanceAudioMeWait] / 120000.0,
+			        metrics[PikminPsp::PerformanceAudioMovie] / 120000.0);
 			fclose(file);
 			sTimings.wroteHeader = true;
 		}
@@ -323,6 +332,16 @@ PspGxTexture* oldestResidentTexture()
 	return result;
 }
 
+// GE swizzling groups 16 bytes by eight rows. Keep tiny images linear so
+// texture dimensions, UV scales, and wrap behavior remain unchanged.
+bool textureSwizzled(u32 width, u32 height) { return width >= 8 && height >= 8; }
+
+u32 texturePixelOffset(u32 x, u32 y, u32 width, u32 height)
+{
+	if (!textureSwizzled(width, height)) return y * width + x;
+	return (y >> 3) * width * 8 + (x >> 3) * 64 + (y & 7) * 8 + (x & 7);
+}
+
 PspGxTexture* convertTexture(const void* source, u16 width, u16 height, GXTexFmt format)
 {
 	if (!source || !width || !height) return nullptr;
@@ -361,7 +380,7 @@ PspGxTexture* convertTexture(const void* source, u16 width, u16 height, GXTexFmt
 		for (u32 x = 0; x < activeWidth; ++x) {
 			u32 colour = decodeTexturePixel(input, width, format, MIN(x * sampleStep, (u32)width - 1),
 			                                MIN(y * sampleStep, (u32)height - 1));
-			pixels[y * storageWidth + x] = rgbaTo4444(colour & 0xff, (colour >> 8) & 0xff, (colour >> 16) & 0xff,
+			pixels[texturePixelOffset(x, y, storageWidth, storageHeight)] = rgbaTo4444(colour & 0xff, (colour >> 8) & 0xff, (colour >> 16) & 0xff,
 			                                                 colour >> 24);
 		}
 	}
@@ -664,10 +683,14 @@ void reserveDisplayListMemory(u32 byteCount)
 
 void loadGuPositionMatrix(u32 index)
 {
-	ScePspFMatrix4 converted = positionMatrix(sState.positionMatrices[MIN(index, 9U)]);
+	index = MIN(index, 9U);
+	if (sState.guPositionMatrixValid && sState.guPositionMatrix == index) return;
+	ScePspFMatrix4 converted = positionMatrix(sState.positionMatrices[index]);
 	// Draws are submitted with sceGuDrawArray, not sceGumDrawArray.  Send the
 	// matrix directly to the GE rather than only updating GUM's software stack.
 	sceGuSetMatrix(GU_MODEL, &converted);
+	sState.guPositionMatrix = index;
+	sState.guPositionMatrixValid = true;
 }
 
 struct MeshLayout {
@@ -732,7 +755,9 @@ struct MeshAttributeKey {
 
 struct MeshCacheKey {
 	u64 modelRevision;
-	MeshAttributeKey attributes[GX_VA_MAX_ATTR];
+	// Every source affects FIFO offsets; only these five arrays supply output.
+	u8 sources[GX_VA_MAX_ATTR];
+	MeshAttributeKey attributes[5];
 	u32 currentColour, currentMatrix;
 	GXColorS10 tint;
 	GXTevOp tintOp;
@@ -897,8 +922,10 @@ void meshCacheKey(MeshCacheKey& key)
 {
 	memset(&key, 0, offsetof(MeshCacheKey, textureMatrices));
 	key.modelRevision = sMeshValidationScope ? sMeshValidationScope->modelRevision : 0;
-	for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) {
-		const auto& source = sState.attributes[i];
+	for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) key.sources[i] = sState.attributes[i].source;
+	const GXAttr consumed[] = { GX_VA_POS, GX_VA_CLR0, GX_VA_TEX0, GX_VA_NRM, GX_VA_NBT };
+	for (u32 i = 0; i < ARRAY_SIZE(consumed); ++i) {
+		const auto& source = sState.attributes[consumed[i]];
 		auto& target = key.attributes[i];
 		target.source = source.source;
 		if (source.source == GX_NONE) continue;
@@ -1012,8 +1039,6 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 // clips them. Rigid meshes use GU_MODEL, while mixed matrices use GE bones.
 bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 {
-	MeshLayout layout;
-	if (!meshLayout(layout)) return false;
 	const u8* listStart = input;
 	MeshCacheKey key;
 	if (useCache) {
@@ -1035,6 +1060,8 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 			return true;
 		}
 	}
+	MeshLayout layout;
+	if (!meshLayout(layout)) return false;
 	MeshInputRange inputs[4] = {};
 	u32 vertexCount = 0, indexCount = 0, primitiveCount = 0, matrixMask = 0;
 	for (const u8* scan = input; scan < end;) {
@@ -1138,6 +1165,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 	if (skinned) {
 		ScePspFMatrix4 identity = identityMatrix();
 		sceGuSetMatrix(GU_MODEL, &identity);
+		sState.guPositionMatrixValid = false;
 		for (u32 i = 0; i < 10; ++i) if (matrixMask & (1U << i)) {
 			ScePspFMatrix4 matrix = positionMatrix(sState.positionMatrices[i]);
 			sceGuBoneMatrix(boneSlots[i], &matrix);
@@ -1305,6 +1333,7 @@ void PspGXEnd(void)
 	if (sState.verticesPretransformed) {
 		ScePspFMatrix4 identity = identityMatrix();
 		sceGuSetMatrix(GU_MODEL, &identity);
+		sState.guPositionMatrixValid = false;
 	}
 	if (sState.primitive == GX_QUADS) {
 		u32 sourceCount = sState.vertexCount;
@@ -1359,6 +1388,7 @@ GXFifoObj* GXInit(void*, u32)
 	sceGuSetMatrix(GU_PROJECTION, &identity);
 	sceGuSetMatrix(GU_VIEW, &identity);
 	sceGuSetMatrix(GU_MODEL, &identity);
+	sState.guPositionMatrixValid = false;
 	sceGuFinish();
 	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
 	meshCacheGpuIdle();
@@ -1389,7 +1419,10 @@ void GXSetProjection(const Mtx44 matrix, GXProjectionType)
 void GXLoadPosMtxImm(const Mtx matrix, u32 id)
 {
 	u32 index = MIN(id / 3, 9U);
-	memcpy(sState.positionMatrices[index], matrix, sizeof(Mtx));
+	if (memcmp(sState.positionMatrices[index], matrix, sizeof(Mtx)) != 0) {
+		memcpy(sState.positionMatrices[index], matrix, sizeof(Mtx));
+		if (sState.guPositionMatrix == index) sState.guPositionMatrixValid = false;
+	}
 	if (index == sState.currentPositionMatrix) loadGuPositionMatrix(index);
 }
 
@@ -1589,7 +1622,7 @@ void GXCopyTex(void* destination, GXBool clear) {
 				u32 colour = decodeTexturePixel(static_cast<const u8*>(destination), texture.sourceWidth, texture.format,
 				                                x * texture.sourceWidth / texture.activeWidth,
 				                                y * texture.sourceHeight / texture.activeHeight);
-				texture.pixels[y * texture.storageWidth + x] = rgbaTo4444(colour & 255, (colour >> 8) & 255,
+				texture.pixels[texturePixelOffset(x, y, texture.storageWidth, texture.storageHeight)] = rgbaTo4444(colour & 255, (colour >> 8) & 255,
 				                                                       (colour >> 16) & 255, colour >> 24);
 			}
 		}
@@ -1716,7 +1749,7 @@ void GXLoadTexObj(GXTexObj* object, GXTexMapID id)
 		return;
 	}
 	++sDebugTextureLoads;
-	sceGuTexMode(GU_PSM_4444, 0, 0, GU_FALSE);
+	sceGuTexMode(GU_PSM_4444, 0, 0, textureSwizzled(texture->storageWidth, texture->storageHeight) ? GU_TRUE : GU_FALSE);
 	sceGuTexImage(0, texture->storageWidth, texture->storageHeight, texture->storageWidth, texture->pixels);
 	sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
 	int filter = source->mode1 ? GU_LINEAR : GU_NEAREST;
