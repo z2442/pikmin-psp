@@ -55,7 +55,9 @@ f32 calcImpulse(immut Vector3f& relativePos, f32 mass, immut Vector3f& collision
 {
 	f32 normalSpeed    = collisionNormal.DP(relativeVel);
 	f32 normalSepSpeed = collisionNormal.DP(separationVel);
+#if !defined(PLATFORM_PSP)
 	f32 restitution    = -(normalSepSpeed / normalSpeed);
+#endif
 
 	Vector3f angularComponent;
 	Vector3f unused;
@@ -64,7 +66,13 @@ f32 calcImpulse(immut Vector3f& relativePos, f32 mass, immut Vector3f& collision
 	angularComponent.CP(collisionNormal);
 	angularComponent.multMatrix(inertiaTensor);
 	angularComponent.CP(relativePos);
+#if defined(PLATFORM_PSP)
+	// Algebraically cancel the normal-speed division. Resting and tangential
+	// contacts have zero normal speed, so the restitution ratio would be 0/0.
+	f32 tmp = normalSepSpeed - normalSpeed;
+#else
 	f32 tmp = (-1.0f - restitution) * normalSpeed;
+#endif
 	return tmp / (angularComponent.DP(collisionNormal) + 1.0f / mass);
 }
 

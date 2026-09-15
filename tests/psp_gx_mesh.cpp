@@ -19,6 +19,7 @@ alignas(16) u8 memory[8 * 1024 * 1024];
 u32 used;
 u32 drawCalls;
 u32 modelMatrixUploads;
+u32 deferredDrawCalls;
 bool recordGeometry = true;
 ScePspFMatrix4 modelMatrix;
 ScePspFMatrix4 bones[8];
@@ -39,7 +40,8 @@ void transform(PspGxVertex& vertex, const ScePspFMatrix4& matrix)
 
 void resetDraws()
 {
-	used = drawCalls = 0;
+	used = drawCalls = deferredDrawCalls = 0;
+	sCachedDrawBatch = 0;
 	sState.guPositionMatrixValid = false;
 	triangles.clear();
 	sprites.clear();
@@ -101,6 +103,19 @@ u32 compareList(const u8* input, u32 size)
 	assert(drawMeshList(input, input + size));
 	assert(drawCalls == 1 && triangles.size() == expected.size());
 	for (u32 i = 0; i < triangles.size(); ++i) equalVertex(triangles[i], expected[i]);
+	// Consecutive cache hits must preserve command order and geometry while
+	// only one in sixteen needs a direct SDK draw/stall update.
+	if (sTimings.meshCacheHits && !expected.empty()) {
+		u64 hits = sTimings.meshCacheHits;
+		resetDraws();
+		for (u32 draw = 0; draw < 33; ++draw) {
+			triangles.clear();
+			assert(drawMeshList(input, input + size));
+			assert(triangles.size() == expected.size());
+			for (u32 i = 0; i < triangles.size(); ++i) equalVertex(triangles[i], expected[i]);
+		}
+		if (sTimings.meshCacheHits - hits == 33) assert(deferredDrawCalls == 30);
+	}
 	return oldDraws;
 }
 
@@ -533,6 +548,39 @@ void sceGuDrawArray(int primitive, int format, int count, const void* indexData,
 		}
 	}
 }
+}
+
+extern "C" void sceGuSendCommandi(int command, int argument)
+{
+	static u32 base, vertexAddress, indexAddress;
+	static int format;
+	switch (command) {
+	case 0x12: format = argument; break;
+	case 0x10: base = (argument & 0xf0000) << 8; break;
+	case 0x01: vertexAddress = base | (argument & 0xffffff); break;
+	case 0x02: indexAddress = base | (argument & 0xffffff); break;
+	case 0x04: {
+		// Host pointers are wider than GE addresses. Resolve through the live
+		// cache, verifying that both encoded addresses select the same entry.
+		const void* vertices = nullptr;
+		const u16* indices = nullptr;
+		for (auto& set : sMeshCache) for (auto& entry : set) {
+			if (!entry.storage) continue;
+			auto* v = entry.storage + kMeshCacheDataOffset;
+			auto* i = reinterpret_cast<u16*>(v + entry.vertexCount * sizeof(PspGxVertex));
+			if ((reinterpret_cast<uintptr_t>(v) & 0xfffffff) == vertexAddress
+			    && (reinterpret_cast<uintptr_t>(i) & 0xfffffff) == indexAddress) {
+				assert(entry.gpuEpoch == sMeshCacheEpoch);
+				vertices = v; indices = i;
+			}
+		}
+		assert(vertices && indices);
+		++deferredDrawCalls;
+		sceGuDrawArray((argument >> 16) & 7, format, argument & 0xffff, indices, vertices);
+		break;
+	}
+	default: assert(false);
+	}
 }
 
 void particleColours()

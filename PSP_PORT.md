@@ -173,6 +173,17 @@ short-circuiting:
 python3 tools/check_psp_conditions.py
 ```
 
+PSP collision impulses calculate the change in normal velocity directly. The
+original restitution calculation divided by the incoming normal speed, causing
+an FPU invalid-operation exception (`div.s`) on resting or tangential contacts
+with zero normal speed. The simplified expression preserves ordinary collision
+response and avoids that intermediate division. Check resting, tangential,
+bouncing, and off-centre contacts with floating-point exception checks:
+
+```sh
+python3 tools/check_psp_impulse.py
+```
+
 Environment texture generation handles zero-scale model matrices without
 dividing by zero. Collapsed models use the texture centre; ordinary and mirrored
 scales retain their original mapping. Check the arithmetic with:
@@ -329,3 +340,21 @@ polls instead of continuously reading shared uncached memory. This targets
 shared-bus contention without changing audio tick or output timing; job pickup
 can be delayed by a few microseconds. PSP measurements are still required to
 verify the performance effect and audio/video behavior.
+
+### Cached draw submission batches
+
+The installed PSPSDK's `sceGuDrawArray` calls `sceGeListUpdateStallAddr` for
+every draw in a direct list. Persistent cached meshes now emit the same GE
+vertex-format/address/primitive commands with `sceGuSendCommandi`, using a
+normal SDK draw for the first and each subsequent sixteenth cached draw to
+publish preceding commands. Ordinary draws and list completion also publish
+pending commands. Draw order, matrices, indices, and cache pinning are unchanged;
+list splits, framebuffer copies, and presentation still finish/synchronize
+before storage reuse. This bounds deferred work to 15 cached draws.
+
+`gpu_cached_kicks` counts cached draws using the SDK submission path;
+`gpu_deferred_draws` counts those using command-only emission (both per frame).
+These are not total GPU syscall counts: transient draws and allocations can
+also publish commands. Native tests decode the emitted command words, resolve
+both addresses against pinned cache entries, and compare triangles and winding
+through batch boundaries. Hardware testing must establish the FPS effect.

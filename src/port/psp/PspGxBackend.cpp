@@ -108,11 +108,13 @@ u32 sDebugTextureFailures;
 u32 sDebugListSplits;
 u32 sDebugBatchedPrimitives;
 u64 sMeshCacheEpoch = 1;
-void meshCacheGpuIdle() { ++sMeshCacheEpoch; }
+u32 sCachedDrawBatch;
+void meshCacheGpuIdle() { ++sMeshCacheEpoch; sCachedDrawBatch = 0; }
 
 struct FrameTimings {
 	u32 start, frames;
 	u64 presentWait, listWait, copyTime, draws, vertices, copies, splits;
+	u64 cachedDrawKicks, deferredCachedDraws;
 	u64 decodedVertices, skinnedVertices, fallbackLists, textureMisses, meshCacheHits, cachedVertices, meshCacheValidation, arrayValidation;
 	bool wroteHeader;
 };
@@ -145,7 +147,7 @@ void recordFrameTimings()
 		FILE* file = fopen(path, sTimings.wroteHeader ? "a" : "w");
 		if (file) {
 			if (!sTimings.wroteHeader) {
-				fputs("Mesh cache: consumed-array keys and direct GPU buffers. GPU: matrix reuse and swizzled textures. Audio: active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
+				fputs("Mesh cache: consumed-array keys and direct GPU buffers. GPU: batched cached-draw kicks, matrix reuse and swizzled textures. Audio: active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -166,6 +168,8 @@ void recordFrameTimings()
 			        metrics[PikminPsp::PerformanceAudioMix] / 120000.0,
 			        metrics[PikminPsp::PerformanceAudioMeWait] / 120000.0,
 			        metrics[PikminPsp::PerformanceAudioMovie] / 120000.0);
+			fprintf(file, "  gpu_cached_kicks=%.1f gpu_deferred_draws=%.1f\n",
+			        sTimings.cachedDrawKicks / 120.0, sTimings.deferredCachedDraws / 120.0);
 			fclose(file);
 			sTimings.wroteHeader = true;
 		}
@@ -642,7 +646,24 @@ ScePspFMatrix4 identityMatrix()
 	return result;
 }
 
-void submitVertices(const void* vertices, u32 count, int primitive, const u16* indices = nullptr, bool skinned = false)
+// Match PSPSDK sceGuDrawArray's command encoding, but defer its
+// sceGeListUpdateStallAddr syscall. Only persistent, GPU-pinned cache buffers
+// use this path. Every sixteenth draw uses the SDK to publish the whole batch;
+// ordinary draws and sceGuFinish also publish all preceding commands.
+void queueCachedDraw(const void* vertices, u32 count, int primitive, const u16* indices, int format)
+{
+	enum { VertexAddress = 0x01, IndexAddress = 0x02, Primitive = 0x04, BaseAddress = 0x10, VertexType = 0x12 };
+	sceGuSendCommandi(VertexType, format);
+	uintptr_t address = reinterpret_cast<uintptr_t>(indices);
+	sceGuSendCommandi(BaseAddress, (address >> 8) & 0x000f0000);
+	sceGuSendCommandi(IndexAddress, address & 0x00ffffff);
+	address = reinterpret_cast<uintptr_t>(vertices);
+	sceGuSendCommandi(BaseAddress, (address >> 8) & 0x000f0000);
+	sceGuSendCommandi(VertexAddress, address & 0x00ffffff);
+	sceGuSendCommandi(Primitive, (primitive << 16) | count);
+}
+
+void submitVertices(const void* vertices, u32 count, int primitive, const u16* indices = nullptr, bool skinned = false, bool persistent = false)
 {
 	if (!vertices || count == 0) {
 		return;
@@ -655,7 +676,14 @@ void submitVertices(const void* vertices, u32 count, int primitive, const u16* i
 	                 | (indices ? GU_INDEX_16BIT : 0)
 	                 | (skinned ? GU_WEIGHT_32BITF | GU_WEIGHTS(8) : 0)
 	                 | (sState.transform3D ? GU_TRANSFORM_3D : GU_TRANSFORM_2D);
-	sceGuDrawArray(primitive, format, count, indices, vertices);
+	if (persistent && (sCachedDrawBatch++ & 15)) {
+		++sTimings.deferredCachedDraws;
+		queueCachedDraw(vertices, count, primitive, indices, format);
+	} else {
+		if (!persistent) sCachedDrawBatch = 0;
+		else ++sTimings.cachedDrawKicks;
+		sceGuDrawArray(primitive, format, count, indices, vertices);
+	}
 }
 
 void reserveDisplayListMemory(u32 byteCount)
@@ -1052,7 +1080,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 			cached->gpuEpoch = sMeshCacheEpoch;
 			u16* indices = reinterpret_cast<u16*>(vertices + cached->vertexCount * sizeof(PspGxVertex));
 			loadGuPositionMatrix(cached->rigidMatrix);
-			submitVertices(vertices, cached->indexCount, GU_TRIANGLES, indices);
+			submitVertices(vertices, cached->indexCount, GU_TRIANGLES, indices, false, true);
 			if (cached->rigidMatrix != sState.currentPositionMatrix) loadGuPositionMatrix(sState.currentPositionMatrix);
 			sDebugBatchedPrimitives += cached->primitiveCount;
 			++sTimings.meshCacheHits;
