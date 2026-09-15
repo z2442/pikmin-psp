@@ -323,6 +323,90 @@ void revisionedMeshes()
 	assert(PikminPsp::nextMeshRevision() > revision); // Lifetime IDs survive cache resets.
 }
 
+void animatedCachedMeshes()
+{
+	clearMeshCache(); resetState();
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_PNMTXIDX, GX_DIRECT);
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	// Nonconsecutive slots, including the highest GX slot, must preserve
+	// their mapping onto GE bones on both direct and deferred cache hits.
+	u8 list[] = {GX_TRIANGLES,0,3, 0,0, 12,1, 27,2};
+	sState.texSource = GX_TG_TEX0;
+	compareList(list, sizeof(list));
+	u64 decoded = sTimings.decodedVertices;
+	for (u32 frame = 0; frame < 3; ++frame) {
+		meshCacheGpuIdle();
+		sState.positionMatrices[4][0][3] += 3;
+		sState.positionMatrices[9][1][3] -= 2;
+		compareList(list, sizeof(list));
+		assert(sTimings.decodedVertices == decoded);
+	}
+	// Unversioned edits must still invalidate the complete weighted buffer.
+	positions[1][0] += 2;
+	compareList(list, sizeof(list));
+	assert(sTimings.decodedVertices == decoded + 3);
+	list[5] = 3;
+	compareList(list, sizeof(list));
+	assert(sTimings.decodedVertices == decoded + 6);
+	clearMeshCache();
+}
+
+void meshMaterialVariants()
+{
+	clearMeshCache(); resetState();
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	u8 list[] = {GX_TRIANGLES,0,3,0,1,2};
+	PikminPsp::MeshValidationScope scope;
+	PikminPsp::bindMeshRevision(PikminPsp::nextMeshRevision());
+	Mtx projection = {{0.5f,0,0,0.5f},{0,0.5f,0,0.5f},{0,0,0,1}};
+	u64 decoded = sTimings.decodedVertices;
+	for (u32 frame = 0; frame < 20; ++frame) {
+		// Animated projection precedes the ordinary material pass. It must
+		// not replace that pass solely because both use the same list address.
+		meshCacheGpuIdle();
+		projection[0][3] += 0.125f;
+		GXLoadTexMtxImm(projection, GX_TEXMTX0, GX_MTX3x4);
+		GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_POS, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+		compareList(list, sizeof(list));
+		u64 afterProjection = sTimings.decodedVertices;
+		// Updating an unrelated texture matrix must not invalidate this pass.
+		GXLoadTexMtxImm(projection, GX_TEXMTX1, GX_MTX3x4);
+		compareList(list, sizeof(list));
+		assert(sTimings.decodedVertices == afterProjection);
+		GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_TEX0, GX_IDENTITY, GX_FALSE, GX_PTIDENTITY);
+		compareList(list, sizeof(list));
+		assert(sTimings.decodedVertices == afterProjection + (frame == 0 ? 3 : 0));
+	}
+	assert(sTimings.decodedVertices == decoded + 63);
+	// Nonzero uniform selectors use the packed single-matrix key too.
+	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_POS, GX_TEXMTX1, GX_FALSE, GX_PTIDENTITY);
+	compareList(list, sizeof(list));
+	decoded = sTimings.decodedVertices;
+	projection[1][3] += 0.5f;
+	GXLoadTexMtxImm(projection, GX_TEXMTX0, GX_MTX3x4);
+	compareList(list, sizeof(list));
+	assert(sTimings.decodedVertices == decoded);
+	GXLoadTexMtxImm(projection, GX_TEXMTX1, GX_MTX3x4);
+	compareList(list, sizeof(list));
+	assert(sTimings.decodedVertices == decoded + 3);
+	// Per-vertex selectors still require every selectable texture matrix.
+	GXSetVtxDesc(GX_VA_TEX0MTXIDX, GX_DIRECT);
+	u8 selected[] = {GX_TRIANGLES,0,3, GX_TEXMTX0,0, GX_TEXMTX1,1, GX_TEXMTX0,2};
+	compareList(selected, sizeof(selected));
+	decoded = sTimings.decodedVertices;
+	projection[0][3] += 0.5f;
+	GXLoadTexMtxImm(projection, GX_TEXMTX1, GX_MTX3x4);
+	compareList(selected, sizeof(selected));
+	assert(sTimings.decodedVertices == decoded + 3);
+	clearMeshCache();
+}
+
 void movieFrame()
 {
 	resetState(); resetDraws();
@@ -567,7 +651,7 @@ extern "C" void sceGuSendCommandi(int command, int argument)
 		for (auto& set : sMeshCache) for (auto& entry : set) {
 			if (!entry.storage) continue;
 			auto* v = entry.storage + kMeshCacheDataOffset;
-			auto* i = reinterpret_cast<u16*>(v + entry.vertexCount * sizeof(PspGxVertex));
+			auto* i = reinterpret_cast<u16*>(v + entry.vertexCount * entry.vertexSize);
 			if ((reinterpret_cast<uintptr_t>(v) & 0xfffffff) == vertexAddress
 			    && (reinterpret_cast<uintptr_t>(i) & 0xfffffff) == indexAddress) {
 				assert(entry.gpuEpoch == sMeshCacheEpoch);
@@ -860,11 +944,12 @@ int main(int argc, char** argv)
 	assert(!meshBytesEqual(&ordinary, &changed, meshCacheKeyBytes(ordinary)));
 	sState.attributes[GX_VA_TEX1].source = GX_NONE;
 	sState.texSource = GX_TG_POS;
+	sState.texMatrix = GX_TEXMTX0;
 	meshCacheKey(ordinary);
 	sState.textureMatrices[0][0][0] += 1;
 	meshCacheKey(changed);
 	assert(!meshBytesEqual(&ordinary, &changed, meshCacheKeyBytes(ordinary)));
-	printf("Mesh state key: ordinary %u bytes, generated UV %u bytes\n", meshCacheKeyBytes(changed) - (u32)sizeof(changed.textureMatrices), meshCacheKeyBytes(changed));
+	printf("Mesh state key: ordinary %u bytes, single-matrix generated UV %u bytes\n", (u32)offsetof(MeshCacheKey, textureMatrices), meshCacheKeyBytes(changed));
 	// All alignment combinations, tails, and mismatch positions. Exact-sized
 	// allocations let ASan catch reads past the requested input buffer.
 	for (unsigned aOffset = 0; aOffset < 4; ++aOffset)
@@ -888,6 +973,8 @@ int main(int argc, char** argv)
 	meshCacheInvalidation();
 	sharedMeshArrays();
 	revisionedMeshes();
+	animatedCachedMeshes();
+	meshMaterialVariants();
 	movieFrame();
 	particleColours();
 	for (int i = 1; i < argc; ++i) modelTest(argv[i]);

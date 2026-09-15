@@ -89,7 +89,7 @@ geometry checks. To measure the gain, repeat the same scene and duration on PSP
 with the updated build. Keep each capture with its matching ELF before rebuilding;
 profiling overhead and time spent waiting can distort the flat-profile rankings.
 
-Rigid mesh conversion has a bounded 4 MiB cache of native vertices and triangle
+Mesh conversion has a bounded 4 MiB cache of native vertices and triangle
 indices. Normal model draws carry a globally unique revision, assigned at model
 construction/loading and replaced when source data changes. Array dirty flags
 invalidate it at binding; the slime's position/normal deformation explicitly
@@ -98,15 +98,21 @@ mesh display lists must call `BaseShape::invalidatePspMesh()` on PSP. Model
 matrices and material state remain live; rigid animation needs no source scan.
 Revision-tracked entries store no array or display-list snapshots. Compact
 state keys retain every attribute source (which determines FIFO offsets), but
-array metadata only for position, primary color/UV, and normal/NBT inputs.
+array metadata only for position, primary color/UV, and consumed normal/NBT inputs.
 Cache hits skip vertex-layout reconstruction. Keys compare texture matrices only
-when generating texture coordinates from positions or normals.
+when generating texture coordinates from positions or normals. Uniform texture
+matrix selection compares only that matrix; per-vertex selectors retain all ten.
+Unused normal arrays do not invalidate ordinary UV materials. Replacement uses
+the matching state or the least recently used unpinned entry, preserving separate
+material/projection variants of one display list.
 
 Generic GX calls outside a revision-tracked model draw still compare source
 bytes. Shared array validation is available for callers that can guarantee
 read-only arrays within a draw scope, with a separate 2 MiB snapshot budget.
 Snapshot comparisons use unrolled word equality checks, including unaligned
-word loads. Skinned meshes retain their existing conversion path. Allocation
+word loads. Skinned meshes cache their native vertices, fixed weights and index
+buffers too; each submission uploads the current bone matrices in the original
+slot order. CPU-deformed source arrays still require revision invalidation. Allocation
 failure falls back to conversion. Cached buffers are submitted directly to the
 GPU and remain protected from eviction until a GPU sync completes.
 
@@ -119,6 +125,17 @@ ratio is not a PSP FPS measurement. In `performance.log`, `mesh_cache_hits` and
 state checks within `mesh_ms` (plus byte comparisons for unversioned calls).
 `array_validate_ms` measures shared array comparisons inside `render_ms`, outside
 `mesh_ms`; normal revision-tracked model draws do not perform these comparisons.
+
+Gameplay cache diagnostics are averages per frame: `mesh_miss_absent` means no
+entry for that list address/length, `mesh_miss_state` means its revision or render
+state changed, and `mesh_miss_source` means unversioned source validation failed.
+`mesh_store_failures` counts capacity, allocation, or GPU-pinning failures;
+`mesh_evictions` counts replacements during insertion. These distinguish changing
+inputs from cache pressure without per-vertex logging. The native Olimar
+`pikis/nv3Model.mod` replay previously rebuilt 1,300 skinned vertices every frame;
+after warmup it now rebuilds zero and reuses all 12 lists. This verifies conversion
+reuse, not an on-device FPS gain. Repeat the same gameplay route on PSP and compare
+`main_cpu_ms`, `mesh_ms`, `decoded_vertices`, and the miss counters.
 
 The normal build also writes `performance.log` beside the EBOOT every 120
 presented frames. It reports average FPS, frame time, final GPU wait, display-list

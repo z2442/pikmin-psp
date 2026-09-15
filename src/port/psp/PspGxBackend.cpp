@@ -116,6 +116,7 @@ struct FrameTimings {
 	u64 presentWait, listWait, copyTime, draws, vertices, copies, splits;
 	u64 cachedDrawKicks, deferredCachedDraws;
 	u64 decodedVertices, skinnedVertices, fallbackLists, textureMisses, meshCacheHits, cachedVertices, meshCacheValidation, arrayValidation;
+	u64 meshMissAbsent, meshMissState, meshMissSource, meshStoreFailures, meshEvictions;
 	bool wroteHeader;
 };
 FrameTimings sTimings;
@@ -147,7 +148,7 @@ void recordFrameTimings()
 		FILE* file = fopen(path, sTimings.wroteHeader ? "a" : "w");
 		if (file) {
 			if (!sTimings.wroteHeader) {
-				fputs("Mesh cache: consumed-array keys and direct GPU buffers. GPU: batched cached-draw kicks, matrix reuse and swizzled textures. Audio: active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
+				fputs("Mesh cache: rigid/skinned buffers, material variants and selected texture matrices. GPU: batched cached-draw kicks, matrix reuse and swizzled textures. Audio: active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -170,6 +171,9 @@ void recordFrameTimings()
 			        metrics[PikminPsp::PerformanceAudioMovie] / 120000.0);
 			fprintf(file, "  gpu_cached_kicks=%.1f gpu_deferred_draws=%.1f\n",
 			        sTimings.cachedDrawKicks / 120.0, sTimings.deferredCachedDraws / 120.0);
+			fprintf(file, "  mesh_miss_absent=%.1f mesh_miss_state=%.1f mesh_miss_source=%.1f mesh_store_failures=%.1f mesh_evictions=%.1f\n",
+			        sTimings.meshMissAbsent / 120.0, sTimings.meshMissState / 120.0, sTimings.meshMissSource / 120.0,
+			        sTimings.meshStoreFailures / 120.0, sTimings.meshEvictions / 120.0);
 			fclose(file);
 			sTimings.wroteHeader = true;
 		}
@@ -726,6 +730,24 @@ struct MeshLayout {
 	s32 offset[GX_VA_MAX_ATTR];
 };
 
+// Bone assignments are part of the list, but the matrices animate each draw.
+// Reuse the same slot ordering for conversion and cached submissions.
+bool loadMeshMatrices(u32 mask, u32 rigidMatrix)
+{
+	bool skinned = (mask & (mask - 1)) != 0;
+	if (skinned) {
+		ScePspFMatrix4 identity = identityMatrix();
+		sceGuSetMatrix(GU_MODEL, &identity);
+		sState.guPositionMatrixValid = false;
+		u32 slot = 0;
+		for (u32 i = 0; i < 10; ++i) if (mask & (1U << i)) {
+			ScePspFMatrix4 matrix = positionMatrix(sState.positionMatrices[i]);
+			sceGuBoneMatrix(slot++, &matrix);
+		}
+	} else loadGuPositionMatrix(rigidMatrix);
+	return skinned;
+}
+
 bool meshLayout(MeshLayout& layout)
 {
 	layout.stride = 0;
@@ -772,8 +794,8 @@ u32 meshMatrixIndex(const u8* vertex, const MeshLayout& layout)
 	    : MIN(meshIndex(vertex, layout, GX_VA_PNMTXIDX) / 3, 9U);
 }
 
-// Cache native rigid vertices, but keep a snapshot of every input byte they
-// depend on. Model matrices remain live GE state and are deliberately excluded.
+// Cache native vertices and fixed bone weights, with snapshots of their input
+// bytes. Model matrices remain live GE state and are deliberately excluded.
 // Native buffers go directly to the GE. Entries stay pinned until a GPU sync
 // completes; replacements can never free geometry that is still in flight.
 struct MeshAttributeKey {
@@ -801,7 +823,8 @@ struct MeshCacheKey {
 
 u32 meshCacheKeyBytes(const MeshCacheKey& key)
 {
-	return offsetof(MeshCacheKey, textureMatrices) + (key.generatedTexCoords ? sizeof(key.textureMatrices) : 0);
+	return offsetof(MeshCacheKey, textureMatrices) + (!key.generatedTexCoords ? 0
+	    : key.sources[GX_VA_TEX0MTXIDX] != GX_NONE ? sizeof(key.textureMatrices) : sizeof(Mtx));
 }
 
 // Equality only: unlike memcmp, no byte ordering result is needed. PSP libc
@@ -915,7 +938,7 @@ MeshArraySnapshot* validatedMeshRange(const MeshInputRange& range, u32 index)
 struct MeshCacheEntry {
 	const u8* list;
 	u8* storage;
-	u32 listBytes, nativeBytes, allocationBytes, indexCount, vertexCount, primitiveCount, rigidMatrix;
+	u32 listBytes, nativeBytes, allocationBytes, indexCount, vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize;
 	u64 lastUse, gpuEpoch;
 	MeshInputRange inputs[4];
 };
@@ -953,6 +976,7 @@ void meshCacheKey(MeshCacheKey& key)
 	for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) key.sources[i] = sState.attributes[i].source;
 	const GXAttr consumed[] = { GX_VA_POS, GX_VA_CLR0, GX_VA_TEX0, GX_VA_NRM, GX_VA_NBT };
 	for (u32 i = 0; i < ARRAY_SIZE(consumed); ++i) {
+		if (i >= 3 && sState.texSource != GX_TG_NRM) continue;
 		const auto& source = sState.attributes[consumed[i]];
 		auto& target = key.attributes[i];
 		target.source = source.source;
@@ -974,7 +998,15 @@ void meshCacheKey(MeshCacheKey& key)
 	if (sState.texSource == GX_TG_POS || sState.texSource == GX_TG_NRM) {
 		key.generatedTexCoords = true;
 		key.texSource = sState.texSource; key.texType = sState.texType; key.texMatrix = sState.texMatrix;
-		memcpy(key.textureMatrices, sState.textureMatrices, sizeof(key.textureMatrices));
+		if (sState.attributes[GX_VA_TEX0MTXIDX].source != GX_NONE) {
+			memcpy(key.textureMatrices, sState.textureMatrices, sizeof(key.textureMatrices));
+		} else {
+			// No per-vertex matrix selector: compare just the selected matrix,
+			// packed into slot zero instead of clearing/copying all ten slots.
+			if (key.texMatrix >= GX_TEXMTX0 && key.texMatrix < GX_IDENTITY)
+				memcpy(key.textureMatrices[0], sState.textureMatrices[(key.texMatrix - GX_TEXMTX0) / 3], sizeof(Mtx));
+			else memset(key.textureMatrices[0], 0, sizeof(Mtx));
+		}
 	}
 
 }
@@ -987,9 +1019,12 @@ u32 meshCacheSet(const u8* list)
 
 MeshCacheEntry* findCachedMesh(const u8* list, u32 bytes, const MeshCacheKey& key)
 {
+	bool foundList = false, foundState = false;
 	for (auto& entry : sMeshCache[meshCacheSet(list)]) {
 		if (!entry.storage || entry.list != list || entry.listBytes != bytes) continue;
+		foundList = true;
 		if (!meshBytesEqual(entry.storage, &key, meshCacheKeyBytes(key))) continue;
+		foundState = true;
 		if (key.modelRevision) { entry.lastUse = ++sMeshCacheUse; return &entry; }
 		const u8* snapshot = entry.storage + kMeshCacheDataOffset + meshCacheAlignedSize(entry.nativeBytes);
 		if (!meshBytesEqual(snapshot, list, bytes)) continue;
@@ -1009,11 +1044,15 @@ MeshCacheEntry* findCachedMesh(const u8* list, u32 bytes, const MeshCacheKey& ke
 		}
 		if (equal) { entry.lastUse = ++sMeshCacheUse; return &entry; }
 	}
+	if (foundState) ++sTimings.meshMissSource;
+	else if (foundList) ++sTimings.meshMissState;
+	else ++sTimings.meshMissAbsent;
 	return nullptr;
 }
 
 void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const MeshInputRange (&inputs)[4],
-               const void* vertices, u32 nativeBytes, u32 indexCount, u32 vertexCount, u32 primitives, u32 matrix)
+               const void* vertices, u32 nativeBytes, u32 indexCount, u32 vertexCount, u32 primitives, u32 matrix,
+               u32 matrixMask, u32 vertexSize)
 {
 	MeshInputRange savedInputs[4];
 	memcpy(savedInputs, inputs, sizeof(savedInputs));
@@ -1026,25 +1065,30 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 		if (MeshArraySnapshot* array = validatedMeshRange(range, i)) range.generation = array->generation;
 		else total += meshCacheAlignedSize(range.end - range.begin);
 	}
-	if (total > kMeshCacheLimit) return;
+	if (total > kMeshCacheLimit) { ++sTimings.meshStoreFailures; return; }
 	MeshCacheEntry* slot = nullptr;
 	for (auto& entry : sMeshCache[meshCacheSet(list)]) {
 		if (!entry.storage) { slot = &entry; break; }
 		if (entry.gpuEpoch == sMeshCacheEpoch) continue;
-		if (entry.list == list && entry.listBytes == listBytes) { slot = &entry; break; }
+		// A list can have several live material/projection variants. Replacing
+		// the first matching address evicts unrelated variants on every pass.
+		if (entry.list == list && entry.listBytes == listBytes
+		    && meshBytesEqual(entry.storage, &key, meshCacheKeyBytes(key))) { slot = &entry; break; }
 		if (!slot || entry.lastUse < slot->lastUse) slot = &entry;
 	}
-	if (!slot) return; // All ways are still referenced by pending draws.
+	if (!slot) { ++sTimings.meshStoreFailures; return; } // All ways are GPU-pinned.
+	if (slot->storage) ++sTimings.meshEvictions;
 	releaseMeshCacheEntry(*slot);
 	while (sMeshCacheBytes + total > kMeshCacheLimit) {
 		MeshCacheEntry* oldest = nullptr;
 		for (auto& set : sMeshCache) for (auto& entry : set)
 			if (entry.storage && entry.gpuEpoch != sMeshCacheEpoch && (!oldest || entry.lastUse < oldest->lastUse)) oldest = &entry;
-		if (!oldest) return;
+		if (!oldest) { ++sTimings.meshStoreFailures; return; }
+		++sTimings.meshEvictions;
 		releaseMeshCacheEntry(*oldest);
 	}
 	u8* storage = static_cast<u8*>(memalign(64, total));
-	if (!storage) return; // Memory pressure preserves the uncached draw path.
+	if (!storage) { ++sTimings.meshStoreFailures; return; }
 	memcpy(storage, &key, meshCacheKeyBytes(key));
 	memcpy(storage + kMeshCacheDataOffset, vertices, nativeBytes);
 	sceKernelDcacheWritebackRange(storage + kMeshCacheDataOffset, meshCacheAlignedSize(nativeBytes));
@@ -1058,6 +1102,7 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 	slot->list = list; slot->storage = storage; slot->listBytes = listBytes; slot->nativeBytes = nativeBytes;
 	slot->allocationBytes = total; slot->indexCount = indexCount; slot->vertexCount = vertexCount;
 	slot->primitiveCount = primitives; slot->rigidMatrix = matrix; slot->lastUse = ++sMeshCacheUse;
+	slot->matrixMask = matrixMask; slot->vertexSize = vertexSize;
 	memcpy(slot->inputs, savedInputs, sizeof(slot->inputs));
 	sMeshCacheBytes += total;
 }
@@ -1078,10 +1123,10 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 			reserveDisplayListMemory(0);
 			u8* vertices = cached->storage + kMeshCacheDataOffset;
 			cached->gpuEpoch = sMeshCacheEpoch;
-			u16* indices = reinterpret_cast<u16*>(vertices + cached->vertexCount * sizeof(PspGxVertex));
-			loadGuPositionMatrix(cached->rigidMatrix);
-			submitVertices(vertices, cached->indexCount, GU_TRIANGLES, indices, false, true);
-			if (cached->rigidMatrix != sState.currentPositionMatrix) loadGuPositionMatrix(sState.currentPositionMatrix);
+			u16* indices = reinterpret_cast<u16*>(vertices + cached->vertexCount * cached->vertexSize);
+			bool skinned = loadMeshMatrices(cached->matrixMask, cached->rigidMatrix);
+			submitVertices(vertices, cached->indexCount, GU_TRIANGLES, indices, skinned, true);
+			if (skinned || cached->rigidMatrix != sState.currentPositionMatrix) loadGuPositionMatrix(sState.currentPositionMatrix);
 			sDebugBatchedPrimitives += cached->primitiveCount;
 			++sTimings.meshCacheHits;
 			sTimings.cachedVertices += cached->vertexCount;
@@ -1115,7 +1160,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 	}
 	if (matrixCount > 8) return false;
 	bool skinned = matrixCount > 1;
-	const bool cacheable = useCache && !skinned;
+	const bool cacheable = useCache;
 	u32 vertexSize = skinned ? sizeof(PspGxSkinnedVertex) : sizeof(PspGxVertex);
 	u32 byteCount = vertexCount * vertexSize + indexCount * sizeof(u16);
 	if (byteCount + 8 + kDisplayListCommandReserve > sizeof(sGxDisplayList)) return false;
@@ -1189,18 +1234,8 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 		base += count;
 	}
 	if (cacheable) cacheMesh(listStart, end - listStart, key, inputs, vertices, byteCount, indexCount,
-	                         vertexCount, primitiveCount, rigidMatrix);
-	if (skinned) {
-		ScePspFMatrix4 identity = identityMatrix();
-		sceGuSetMatrix(GU_MODEL, &identity);
-		sState.guPositionMatrixValid = false;
-		for (u32 i = 0; i < 10; ++i) if (matrixMask & (1U << i)) {
-			ScePspFMatrix4 matrix = positionMatrix(sState.positionMatrices[i]);
-			sceGuBoneMatrix(boneSlots[i], &matrix);
-		}
-	} else {
-		loadGuPositionMatrix(rigidMatrix);
-	}
+	                         vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize);
+	loadMeshMatrices(matrixMask, rigidMatrix);
 	submitVertices(vertices, indexCount, GU_TRIANGLES, indices, skinned);
 	if (skinned || rigidMatrix != sState.currentPositionMatrix) loadGuPositionMatrix(sState.currentPositionMatrix);
 	sDebugBatchedPrimitives += primitiveCount;
