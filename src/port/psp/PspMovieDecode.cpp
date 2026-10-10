@@ -20,6 +20,20 @@ bool validFrame(const u8* p, u32 size, bool intra)
 	return true;
 }
 int clip(int n) { return n < 0 ? 0 : n > 255 ? 255 : n; }
+
+struct MovieColourTable {
+	int luma[256], red[256], greenU[256], greenV[256], blue[256];
+	constexpr MovieColourTable() : luma{}, red{}, greenU{}, greenV{}, blue{} {
+		for (int i = 0; i < 256; ++i) {
+			luma[i] = 298 * (i - 16) + 128;
+			red[i] = 409 * (i - 128);
+			greenU[i] = -100 * (i - 128);
+			greenV[i] = -208 * (i - 128);
+			blue[i] = 516 * (i - 128);
+		}
+	}
+};
+constexpr MovieColourTable movieColours;
 }
 
 namespace PikminPsp {
@@ -178,18 +192,28 @@ void MovieAudio::mix(s16* output, u32 frames)
 }
 void movieConvertRgb565(const u8* yuv, u32 width, u32 height, u16* output, u32 outWidth, u32 outHeight, u32 stride)
 {
+	if (!outWidth || !outHeight) return;
 	const u8* u = yuv + width * height;
 	const u8* v = u + width * height / 4;
+	// Playback uses 360 columns. Hoist scaling divisions out of the pixel
+	// loop, with a bounded stack allocation and a generic wide-output path.
+	u32 sourceX[640];
+	if (outWidth <= 640)
+		for (u32 x = 0; x < outWidth; ++x) sourceX[x] = x * width / outWidth;
 	for (u32 y = 0; y < outHeight; ++y) {
 		u32 sy = y * height / outHeight;
+		const u8* rowY = yuv + sy * width;
+		const u8* rowU = u + (sy / 2) * (width / 2);
+		const u8* rowV = v + (sy / 2) * (width / 2);
+		u16* rowOut = output + y * stride;
 		for (u32 x = 0; x < outWidth; ++x) {
-			u32 sx = x * width / outWidth, uv = (sy / 2) * (width / 2) + sx / 2;
-			int luma = 298 * (int(yuv[sy * width + sx]) - 16);
-			int cb = int(u[uv]) - 128, cr = int(v[uv]) - 128;
-			int r = clip((luma + 409 * cr + 128) >> 8);
-			int g = clip((luma - 100 * cb - 208 * cr + 128) >> 8);
-			int b = clip((luma + 516 * cb + 128) >> 8);
-			output[y * stride + x] = u16((r >> 3) | (g >> 2) << 5 | (b >> 3) << 11);
+			u32 sx = outWidth <= 640 ? sourceX[x] : x * width / outWidth;
+			int luma = movieColours.luma[rowY[sx]];
+			u8 cb = rowU[sx / 2], cr = rowV[sx / 2];
+			int r = clip((luma + movieColours.red[cr]) >> 8);
+			int g = clip((luma + movieColours.greenU[cb] + movieColours.greenV[cr]) >> 8);
+			int b = clip((luma + movieColours.blue[cb]) >> 8);
+			rowOut[x] = u16((r >> 3) | (g >> 2) << 5 | (b >> 3) << 11);
 		}
 	}
 }

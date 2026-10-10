@@ -2,6 +2,7 @@
 #include "port/psp/PspMovieDecode.h"
 #include "port/psp/PspAudio.h"
 #include "port/psp/PspPlatform.h"
+#include "port/psp/PspPerformance.h"
 #include "jaudio/app_inter.h"
 #include <pspkernel.h>
 #include <malloc.h>
@@ -24,15 +25,27 @@ bool queueAudio(const u8* data, u32 size, void*)
 }
 bool decodeFrame()
 {
-	int result = sMovie.nextFrame(queueAudio);
+	int result;
+	{
+		PikminPsp::PerformanceScope timing(PikminPsp::PerformanceMovieDecode);
+		result = sMovie.nextFrame(queueAudio);
+	}
 	if (result <= 0) {
 		if (result < 0) PikminPsp::audioLog("movie decode failed: %s", sMovie.error());
 		else PikminPsp::audioLog("movie finished: %u frames", (unsigned)sMovie.decodedFrames());
 		sDone = true;
 		return false;
 	}
-	PikminPsp::movieConvertRgb565(sMovie.picture(), sMovie.width(), sMovie.height(), sRgb, Width, Height, Stride);
-	sceKernelDcacheWritebackRange(sRgb, Stride * 512 * sizeof(u16));
+	{
+		PikminPsp::PerformanceScope timing(PikminPsp::PerformanceMovieConvert);
+		PikminPsp::movieConvertRgb565(sMovie.picture(), sMovie.width(), sMovie.height(), sRgb, Width, Height, Stride);
+	}
+	{
+		PikminPsp::PerformanceScope timing(PikminPsp::PerformanceMoviePublish);
+		// Conversion changes only the displayed rows; padding was cleared at
+		// allocation. Publish it once there, then only these rows each frame.
+		sceKernelDcacheWritebackRange(sRgb, Stride * Height * sizeof(u16));
+	}
 	sPicture = sNewPicture = true;
 	return true;
 }
@@ -79,6 +92,7 @@ extern "C" void Jac_StreamMovieInit(const char* name, u8*, int)
 	sRgb = (u16*)memalign(64, Stride * 512 * sizeof(u16));
 	if (!sRgb) { audioLog("movie RGB allocation failed"); movieShutdown(); return; }
 	memset(sRgb, 0, Stride * 512 * sizeof(u16));
+	sceKernelDcacheWritebackRange(sRgb, Stride * 512 * sizeof(u16));
 	{
 		AudioLock lock;
 		if (audioReady()) {

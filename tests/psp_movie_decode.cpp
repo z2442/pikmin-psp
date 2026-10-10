@@ -3,6 +3,54 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
+
+static void referenceRgb565(const u8* yuv, u32 width, u32 height, u16* output, u32 outWidth, u32 outHeight, u32 stride)
+{
+	const u8* u = yuv + width * height;
+	const u8* v = u + width * height / 4;
+	auto clip = [](int n) { return n < 0 ? 0 : n > 255 ? 255 : n; };
+	for (u32 y = 0; y < outHeight; ++y) for (u32 x = 0; x < outWidth; ++x) {
+		u32 sx = x * width / outWidth, sy = y * height / outHeight;
+		u32 uv = (sy / 2) * (width / 2) + sx / 2;
+		int luma = 298 * (int(yuv[sy * width + sx]) - 16);
+		int cb = int(u[uv]) - 128, cr = int(v[uv]) - 128;
+		int r = clip((luma + 409 * cr + 128) >> 8);
+		int g = clip((luma - 100 * cb - 208 * cr + 128) >> 8);
+		int b = clip((luma + 516 * cb + 128) >> 8);
+		output[y * stride + x] = u16((r >> 3) | (g >> 2) << 5 | (b >> 3) << 11);
+	}
+}
+
+static void colourConversion()
+{
+	// Exercise every chroma pair at luma endpoints and clipping boundaries.
+	std::vector<u8> yuv(512 * 512 * 3 / 2);
+	for (u32 i = 0; i < 256 * 256; ++i) {
+		yuv[512 * 512 + i] = i % 256;
+		yuv[512 * 512 * 5 / 4 + i] = i / 256;
+	}
+	std::vector<u16> expected(512 * 512), actual(expected.size());
+	for (u8 luma : {0, 15, 16, 17, 64, 128, 234, 235, 236, 255}) {
+		memset(yuv.data(), luma, 512 * 512);
+		referenceRgb565(yuv.data(), 512, 512, expected.data(), 512, 512, 512);
+		PikminPsp::movieConvertRgb565(yuv.data(), 512, 512, actual.data(), 512, 512, 512);
+		assert(actual == expected);
+	}
+	// Real playback scaling, upscaling, noninteger ratios, the wide-output
+	// fallback and row padding. The sentinel checks all untouched storage.
+	const u32 sizes[][4] = {{640,480,360,270}, {16,8,3,5}, {8,8,17,13}, {2,2,1,1}, {8,8,641,3}};
+	for (const auto& s : sizes) {
+		yuv.resize(s[0] * s[1] * 3 / 2);
+		for (u32 i = 0; i < yuv.size(); ++i) yuv[i] = (i * 37 + i / 11) & 255;
+		u32 stride = s[2] + 7;
+		expected.assign(stride * (s[3] + 1), 0x5a5a); actual = expected;
+		referenceRgb565(yuv.data(), s[0], s[1], expected.data(), s[2], s[3], stride);
+		PikminPsp::movieConvertRgb565(yuv.data(), s[0], s[1], actual.data(), s[2], s[3], stride);
+		assert(actual == expected);
+	}
+	puts("Movie RGB565 reference, chroma, scaling and padding checks passed");
+}
 
 static bool audio(const u8* data, u32 size, void* context)
 {
@@ -11,6 +59,7 @@ static bool audio(const u8* data, u32 size, void* context)
 
 int main(int argc, char** argv)
 {
+	colourConversion();
 	u8 black[24]; memset(black, 128, sizeof(black)); memset(black, 16, 16);
 	u16 rgb[16];
 	PikminPsp::movieConvertRgb565(black, 4, 4, rgb, 4, 4, 4);
@@ -48,6 +97,9 @@ int main(int argc, char** argv)
 			}
 			if (frames == 60) {
 				PikminPsp::movieConvertRgb565(yuv, movie.width(), movie.height(), image, 360, 270, 360);
+				u16 reference[360 * 270];
+				referenceRgb565(yuv, movie.width(), movie.height(), reference, 360, 270, 360);
+				assert(!memcmp(image, reference, sizeof(image)));
 				if (const char* path = getenv("PIKMIN_MOVIE_TEST_PPM")) {
 					FILE* f = fopen(path, "wb"); assert(f);
 					fprintf(f, "P6\n360 270\n255\n");

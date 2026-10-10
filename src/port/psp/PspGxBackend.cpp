@@ -41,7 +41,13 @@ struct PspGxAttribute {
 	u8 stride;
 };
 
+struct GuRasterState {
+	u32 knownEnables, enables, knownValues;
+	u32 depthMask[1], depthFunction[1], frontFace[1], blend[5], alpha[3], pixelMask[1];
+};
+
 struct PspGxState {
+	GuRasterState raster;
 	GXPrimitive primitive;
 	PspGxVertex* vertices;
 	u32 expectedVertices;
@@ -115,11 +121,66 @@ struct FrameTimings {
 	u32 start, frames;
 	u64 presentWait, listWait, copyTime, draws, vertices, copies, splits;
 	u64 cachedDrawKicks, deferredCachedDraws;
+	u64 rasterChanges, rasterReuses;
 	u64 decodedVertices, skinnedVertices, fallbackLists, textureMisses, meshCacheHits, cachedVertices, meshCacheValidation, arrayValidation;
 	u64 meshMissAbsent, meshMissState, meshMissSource, meshStoreFailures, meshEvictions;
 	bool wroteHeader;
 };
 FrameTimings sTimings;
+
+// Track actual GU state, including temporary movie state. GE state survives
+// direct-list restarts; clears conservatively invalidate this shadow.
+void setGuEnabled(int state, bool enabled)
+{
+	u32 mask = 1U << state;
+	auto& raster = sState.raster;
+	// The bootstrap also has an independent renderer that edits GU state.
+	if (sState.guInitialised && (raster.knownEnables & mask) && bool(raster.enables & mask) == enabled) {
+		++sTimings.rasterReuses;
+		return;
+	}
+	raster.knownEnables |= mask;
+	if (enabled) { raster.enables |= mask; sceGuEnable(state); }
+	else { raster.enables &= ~mask; sceGuDisable(state); }
+	++sTimings.rasterChanges;
+}
+
+template <u32 N> bool guValuesChanged(u32 (&saved)[N], const u32 (&values)[N], u32 mask)
+{
+	bool changed = !sState.guInitialised || !(sState.raster.knownValues & mask);
+	for (u32 i = 0; i < N; ++i) if (saved[i] != values[i]) changed = true;
+	if (!changed) { ++sTimings.rasterReuses; return false; }
+	for (u32 i = 0; i < N; ++i) saved[i] = values[i];
+	sState.raster.knownValues |= mask;
+	++sTimings.rasterChanges;
+	return true;
+}
+
+void setGuDepthMask(int value) {
+	const u32 values[] = {u32(value)};
+	if (guValuesChanged(sState.raster.depthMask, values, 1)) sceGuDepthMask(value);
+}
+void setGuDepthFunction(int value) {
+	const u32 values[] = {u32(value)};
+	if (guValuesChanged(sState.raster.depthFunction, values, 2)) sceGuDepthFunc(value);
+}
+void setGuFrontFace(int value) {
+	const u32 values[] = {u32(value)};
+	if (guValuesChanged(sState.raster.frontFace, values, 4)) sceGuFrontFace(value);
+}
+void setGuBlend(int op, int source, int destination, u32 sourceFix, u32 destinationFix) {
+	const u32 values[] = {u32(op), u32(source), u32(destination), sourceFix, destinationFix};
+	if (guValuesChanged(sState.raster.blend, values, 8)) sceGuBlendFunc(op, source, destination, sourceFix, destinationFix);
+}
+void setGuAlpha(int function, int reference, int mask) {
+	const u32 values[] = {u32(function), u32(reference), u32(mask)};
+	if (guValuesChanged(sState.raster.alpha, values, 16)) sceGuAlphaFunc(function, reference, mask);
+}
+void setGuPixelMask(u32 value) {
+	const u32 values[] = {value};
+	if (guValuesChanged(sState.raster.pixelMask, values, 32)) sceGuPixelMask(value);
+}
+
 u32 sPreviousMetrics[PikminPsp::PerformanceMetricCount];
 u32 sPreviousMainCpu, sPreviousAudioCpu;
 
@@ -171,6 +232,12 @@ void recordFrameTimings()
 			        metrics[PikminPsp::PerformanceAudioMovie] / 120000.0);
 			fprintf(file, "  gpu_cached_kicks=%.1f gpu_deferred_draws=%.1f\n",
 			        sTimings.cachedDrawKicks / 120.0, sTimings.deferredCachedDraws / 120.0);
+			fprintf(file, "  gpu_state_changes=%.1f gpu_state_reuses=%.1f\n",
+			        sTimings.rasterChanges / 120.0, sTimings.rasterReuses / 120.0);
+			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
+			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
+			        metrics[PikminPsp::PerformanceMovieConvert] / 120000.0,
+			        metrics[PikminPsp::PerformanceMoviePublish] / 120000.0);
 			fprintf(file, "  mesh_miss_absent=%.1f mesh_miss_state=%.1f mesh_miss_source=%.1f mesh_store_failures=%.1f mesh_evictions=%.1f\n",
 			        sTimings.meshMissAbsent / 120.0, sTimings.meshMissState / 120.0, sTimings.meshMissSource / 120.0,
 			        sTimings.meshStoreFailures / 120.0, sTimings.meshEvictions / 120.0);
@@ -675,7 +742,7 @@ void submitVertices(const void* vertices, u32 count, int primitive, const u16* i
 	++sDebugDrawCalls;
 	sDebugVertexCount += count;
 	if (sState.textureEnabled) ++sDebugTexturedDrawCalls;
-	if (sState.textureEnabled) sceGuEnable(GU_TEXTURE_2D); else sceGuDisable(GU_TEXTURE_2D);
+	if (sState.textureEnabled) setGuEnabled(GU_TEXTURE_2D, true); else setGuEnabled(GU_TEXTURE_2D, false);
 	const int format = GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF
 	                 | (indices ? GU_INDEX_16BIT : 0)
 	                 | (skinned ? GU_WEIGHT_32BITF | GU_WEIGHTS(8) : 0)
@@ -1271,11 +1338,11 @@ void drawMovieFrame(const u16* pixels, u32 width, u32 height, u32 stride)
 {
 	if (!sState.listOpen || !pixels) return;
 	reserveDisplayListMemory(512);
-	sceGuDisable(GU_DEPTH_TEST); sceGuDepthMask(GU_TRUE);
-	sceGuDisable(GU_BLEND); sceGuDisable(GU_ALPHA_TEST); sceGuDisable(GU_CULL_FACE);
-	sceGuDisable(GU_FOG); sceGuDisable(GU_LIGHTING);
-	sceGuPixelMask(0); sceGuScissor(0, 0, kScreenWidth, kScreenHeight);
-	sceGuEnable(GU_TEXTURE_2D);
+	setGuEnabled(GU_DEPTH_TEST, false); setGuDepthMask(GU_TRUE);
+	setGuEnabled(GU_BLEND, false); setGuEnabled(GU_ALPHA_TEST, false); setGuEnabled(GU_CULL_FACE, false);
+	setGuEnabled(GU_FOG, false); setGuEnabled(GU_LIGHTING, false);
+	setGuPixelMask(0); sceGuScissor(0, 0, kScreenWidth, kScreenHeight);
+	setGuEnabled(GU_TEXTURE_2D, true);
 	sceGuTexMode(GU_PSM_5650, 0, 0, GU_FALSE);
 	sceGuTexImage(0, 512, 512, stride, pixels);
 	sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
@@ -1431,6 +1498,7 @@ GXFifoObj* GXInit(void*, u32)
 	sState.clearColour = 0xff000000;
 	sState.clearDepth = 0;
 	sceGuInit();
+	sState.raster = {};
 	sceDisplaySetMode(0, kScreenWidth, kScreenHeight);
 	sceGuStart(GU_DIRECT, sGxDisplayList);
 	sceGuDrawBuffer(GU_PSM_8888, (void*)0, kBufferWidth);
@@ -1440,10 +1508,10 @@ GXFifoObj* GXInit(void*, u32)
 	sceGuViewport(2048, 2048, kScreenWidth, kScreenHeight);
 	sceGuDepthRange(65535, 0);
 	sceGuScissor(0, 0, kScreenWidth, kScreenHeight);
-	sceGuEnable(GU_SCISSOR_TEST);
-	sceGuEnable(GU_CLIP_PLANES);
+	setGuEnabled(GU_SCISSOR_TEST, true);
+	setGuEnabled(GU_CLIP_PLANES, true);
 	sceGuShadeModel(GU_SMOOTH);
-	sceGuFrontFace(GU_CW);
+	setGuFrontFace(GU_CW);
 	// Match the working OOT PSP renderer: sceGuDrawArray consumes GE matrix
 	// state directly, so initialise it with sceGuSetMatrix rather than GUM's
 	// deferred software stacks.
@@ -1524,30 +1592,30 @@ void GXSetScissor(u32 left, u32 top, u32 width, u32 height)
 void GXSetCullMode(GXCullMode mode)
 {
 	if (mode == GX_CULL_NONE) {
-		sceGuDisable(GU_CULL_FACE);
+		setGuEnabled(GU_CULL_FACE, false);
 	} else {
-		sceGuEnable(GU_CULL_FACE);
-		sceGuFrontFace(mode == GX_CULL_FRONT ? GU_CCW : GU_CW);
+		setGuEnabled(GU_CULL_FACE, true);
+		setGuFrontFace(mode == GX_CULL_FRONT ? GU_CCW : GU_CW);
 	}
 }
 
 void GXSetZMode(GXBool compareEnable, GXCompare function, GXBool updateEnable)
 {
-	if (compareEnable) sceGuEnable(GU_DEPTH_TEST); else sceGuDisable(GU_DEPTH_TEST);
-	sceGuDepthFunc(guDepthCompare(function));
-	sceGuDepthMask(updateEnable ? GU_FALSE : GU_TRUE);
+	if (compareEnable) setGuEnabled(GU_DEPTH_TEST, true); else setGuEnabled(GU_DEPTH_TEST, false);
+	setGuDepthFunction(guDepthCompare(function));
+	setGuDepthMask(updateEnable ? GU_FALSE : GU_TRUE);
 }
 
 void GXSetBlendMode(GXBlendMode mode, GXBlendFactor source, GXBlendFactor destination, GXLogicOp)
 {
 	if (mode == GX_BM_NONE) {
-		sceGuDisable(GU_BLEND);
+		setGuEnabled(GU_BLEND, false);
 		return;
 	}
-	sceGuEnable(GU_BLEND);
+	setGuEnabled(GU_BLEND, true);
 	u32 sourceFix = source == GX_BL_ONE ? 0xffffffff : 0;
 	u32 destinationFix = destination == GX_BL_ONE ? 0xffffffff : 0;
-	sceGuBlendFunc(mode == GX_BM_SUBTRACT ? GU_REVERSE_SUBTRACT : GU_ADD, guBlendFactor(source), guBlendFactor(destination), sourceFix,
+	setGuBlend(mode == GX_BM_SUBTRACT ? GU_REVERSE_SUBTRACT : GU_ADD, guBlendFactor(source), guBlendFactor(destination), sourceFix,
 	               destinationFix);
 }
 
@@ -1638,6 +1706,7 @@ void GXCopyDisp(void*, GXBool clear)
 		sceGuClearColor(sState.clearColour);
 		sceGuClearDepth((u16)sState.clearDepth);
 		sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+		sState.raster = {};
 	}
 	recordFrameTimings();
 	sDebugDrawCalls = 0;
@@ -1696,33 +1765,34 @@ void GXCopyTex(void* destination, GXBool clear) {
 	if (clear) {
 		sceGuClearColor(sState.clearColour); sceGuClearDepth(sState.clearDepth);
 		sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+		sState.raster = {};
 	}
 	sTimings.copyTime += (u32)(sceKernelGetSystemTimeLow() - copyStart);
 	++sTimings.copies;
 }
 
-void GXSetColorUpdate(GXBool enabled) { sceGuPixelMask(enabled ? 0 : 0xffffffff); }
+void GXSetColorUpdate(GXBool enabled) { setGuPixelMask(enabled ? 0 : 0xffffffff); }
 void GXSetAlphaUpdate(GXBool) { }
 void GXSetZCompLoc(GXBool) { }
 void GXSetPixelFmt(GXPixelFmt, GXZFmt16) { }
-void GXSetDither(GXBool enabled) { if (enabled) sceGuEnable(GU_DITHER); else sceGuDisable(GU_DITHER); }
+void GXSetDither(GXBool enabled) { if (enabled) setGuEnabled(GU_DITHER, true); else setGuEnabled(GU_DITHER, false); }
 void GXSetCoPlanar(GXBool) { }
 void GXSetScissorBoxOffset(s32, s32) { }
 void GXSetAlphaCompare(GXCompare compare0, u8 reference0, GXAlphaOp, GXCompare, u8)
 {
 	if (compare0 == GX_ALWAYS) {
-		sceGuDisable(GU_ALPHA_TEST);
+		setGuEnabled(GU_ALPHA_TEST, false);
 	} else {
-		sceGuEnable(GU_ALPHA_TEST);
-		sceGuAlphaFunc(guCompare(compare0), reference0, 0xff);
+		setGuEnabled(GU_ALPHA_TEST, true);
+		setGuAlpha(guCompare(compare0), reference0, 0xff);
 	}
 }
 void GXSetFog(GXFogType type, f32 start, f32 end, f32, f32, GXColor colour)
 {
 	if (type == GX_FOG_NONE) {
-		sceGuDisable(GU_FOG);
+		setGuEnabled(GU_FOG, false);
 	} else {
-		sceGuEnable(GU_FOG);
+		setGuEnabled(GU_FOG, true);
 		sceGuFog(start, end, GU_RGBA(colour.r, colour.g, colour.b, colour.a));
 	}
 }

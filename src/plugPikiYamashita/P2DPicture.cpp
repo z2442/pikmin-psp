@@ -347,6 +347,15 @@ void P2DPicture::drawOut(const PUTRect&, const PUTRect&)
 void P2DPicture::drawTexCoord(int x, int y, int width, int height, f32 uBL, f32 vBL, f32 uBR, f32 vBR, f32 uTL, f32 vTL, f32 uTR, f32 vTR,
                               immut Matrix4f* mtx)
 {
+#if defined(PLATFORM_PSP)
+	// P2D applies picture opacity in a later TEV stage. The PSP's single
+	// texture stage instead modulates by vertex alpha. Title menu backgrounds
+	// deliberately have alpha zero so the cinematic remains visible.
+	if (mAlpha == 0) return;
+	const u32 vertexColour = 0x00ffffffU | (u32(mAlpha) << 24);
+#else
+	const u32 vertexColour = 0xffffffff;
+#endif
 	for (int i = 0; i < mTextureCount; i++) {
 		load(i);
 	}
@@ -375,22 +384,22 @@ void P2DPicture::drawTexCoord(int x, int y, int width, int height, f32 uBL, f32 
 
 	// bottom left
 	GXPosition3s16(x, y, 0);
-	GXColor1u32(0xFFFFFFFF);
+	GXColor1u32(vertexColour);
 	GXTexCoord2f32(uBL, vBL);
 
 	// bottom right
 	GXPosition3s16(xEnd, y, 0);
-	GXColor1u32(0xFFFFFFFF);
+	GXColor1u32(vertexColour);
 	GXTexCoord2f32(uBR, vBR);
 
 	// top right
 	GXPosition3s16(xEnd, yEnd, 0);
-	GXColor1u32(0xFFFFFFFF);
+	GXColor1u32(vertexColour);
 	GXTexCoord2f32(uTR, vTR);
 
 	// top left
 	GXPosition3s16(x, yEnd, 0);
-	GXColor1u32(0xFFFFFFFF);
+	GXColor1u32(vertexColour);
 	GXTexCoord2f32(uTL, vTL);
 
 	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_POS_XYZ, GX_U16, 15);

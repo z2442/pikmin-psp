@@ -1,5 +1,6 @@
 #include "port/psp/PspMovie.h"
 #include "port/psp/PspAudio.h"
+#include "port/psp/PspPerformance.h"
 #include "jaudio/app_inter.h"
 #include <pspkernel.h>
 #include <assert.h>
@@ -11,8 +12,11 @@ const char* filePath;
 bool locked, ready = true;
 u64 clockValue;
 u32 draws;
+u32 publishedBytes;
+u32 metrics[PikminPsp::PerformanceMetricCount];
 }
 namespace PikminPsp {
+void performanceAdd(PerformanceMetric metric, u32 microseconds) { metrics[metric] += microseconds; }
 bool audioReady() { return ready; }
 void audioLock() { assert(!locked); locked = true; }
 void audioUnlock() { assert(locked); locked = false; }
@@ -28,7 +32,8 @@ void drawMovieFrame(const u16* rgb, u32 width, u32 height, u32 stride)
 	assert(rgb && width == 360 && height == 270 && stride == 512); ++draws;
 }
 }
-void sceKernelDcacheWritebackRange(const void*, unsigned int) {}
+unsigned int sceKernelGetSystemTimeLow(void) { static u32 time; return ++time; }
+void sceKernelDcacheWritebackRange(const void*, unsigned int bytes) { publishedBytes += bytes; }
 
 int main(int argc, char** argv)
 {
@@ -38,8 +43,10 @@ int main(int argc, char** argv)
 	int width, height;
 	// The fixture contains two real frames, so EOF and restart are quick.
 	for (int run = 0; run < 3; ++run) {
+		publishedBytes = 0;
 		clockValue = 0;
 		Jac_StreamMovieInit("../MovieData/test.h4m", nullptr, 0);
+		assert(publishedBytes == 512 * (512 + 270) * sizeof(u16));
 		assert(Jac_StreamMovieGetPicture(&picture, &width, &height) == 1);
 		assert(picture && width == 640 && height == 480);
 		PikminPsp::movieDraw();
@@ -49,6 +56,7 @@ int main(int argc, char** argv)
 		assert(Jac_StreamMovieGetPicture(&picture, &width, &height) == 0);
 		clockValue = 33367;
 		assert(Jac_StreamMovieGetPicture(&picture, &width, &height) == 2 && picture);
+		assert(publishedBytes == 512 * (512 + 270 * 2) * sizeof(u16));
 		PikminPsp::movieDraw();
 		clockValue = 66734;
 		assert(Jac_StreamMovieGetPicture(&picture, &width, &height) == -1 && !picture);
@@ -57,6 +65,9 @@ int main(int argc, char** argv)
 		assert(draws == u32(run * 2 + 2));
 		assert(Jac_StreamMovieGetPicture(&picture, &width, &height) == -1);
 	}
+	assert(metrics[PikminPsp::PerformanceMovieDecode] == 9);
+	assert(metrics[PikminPsp::PerformanceMovieConvert] == 6);
+	assert(metrics[PikminPsp::PerformanceMoviePublish] == 6);
 	Jac_StreamMovieInit("test.h4m", nullptr, 0);
 	Jac_StreamMovieStop(); // User skip must release both the movie and audio.
 	Jac_StreamMovieStop();

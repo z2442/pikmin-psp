@@ -12,11 +12,13 @@ with tempfile.TemporaryDirectory(prefix="pikmin-gx-") as directory:
     binary = str(Path(directory) / "check")
     subprocess.run([
         os.environ.get("CXX", "g++"), "-std=c++17", "-O1", "-g", "-w", "-fpermissive",
-        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+        "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-rtti",
         "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
         "-DPLATFORM_PSP=1", "-DVERSION_GPIE01_01", "-DDTK_CONFIG_NONMATCHING=1",
         "-I", str(root / "include"), "-I", str(Path(sdk) / "include"),
-        str(root / "tests/psp_gx_mesh.cpp"), "-o", binary,
+        str(root / "tests/psp_gx_mesh.cpp"),
+        str(root / "src/plugPikiYamashita/PUTRect.cpp"),
+        str(root / "src/plugPikiYamashita/PSUList.cpp"), "-o", binary,
     ], check=True)
     environment = os.environ.copy()
     environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")

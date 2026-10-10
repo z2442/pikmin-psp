@@ -1,6 +1,8 @@
 // Native GU command recorder: verify the backend against the old per-vertex
 // transform, including the retail title lists when extracted data is present.
 #include "../src/port/psp/PspGxBackend.cpp"
+namespace std { using ::sqrtf; }
+#include "../src/plugPikiYamashita/P2DPicture.cpp"
 
 #include <array>
 #include <cassert>
@@ -20,6 +22,10 @@ u32 used;
 u32 drawCalls;
 u32 modelMatrixUploads;
 u32 deferredDrawCalls;
+u32 rasterCalls;
+bool guEnabled[32];
+int guDepthMask, guDepthFunction, guFrontFace;
+u32 guBlend[5], guAlpha[3], guPixelMask;
 bool recordGeometry = true;
 ScePspFMatrix4 modelMatrix;
 ScePspFMatrix4 bones[8];
@@ -28,6 +34,7 @@ struct MovieVertex { u16 u, v; s16 x, y, z; };
 std::vector<MovieVertex> sprites;
 const void* moviePixels;
 int movieFormat, movieStride, movieWrapU, movieWrapV;
+u32 pictureResidentCalls;
 
 void transform(PspGxVertex& vertex, const ScePspFMatrix4& matrix)
 {
@@ -51,6 +58,7 @@ void resetDraws()
 void resetState()
 {
 	memset(&sState, 0, sizeof(sState));
+	sState.guInitialised = true;
 	sState.transform3D = true;
 	sState.currentColour = GU_RGBA(51, 102, 204, 170);
 	for (u32 i = 0; i < 10; ++i) {
@@ -576,15 +584,28 @@ int sceGuCheckList() { return used; }
 int sceGuFinish() { return 0; }
 int sceGuSync(int, int) { return 0; }
 int sceGuStart(int, void*) { used = 0; return 0; }
-void sceGuEnable(int) {}
-void sceGuDisable(int) {}
-void sceGuDepthMask(int) {}
-void sceGuPixelMask(unsigned int) {}
+void sceGuEnable(int state) { guEnabled[state] = true; ++rasterCalls; }
+void sceGuDisable(int state) { guEnabled[state] = false; ++rasterCalls; }
+void sceGuDepthMask(int mask) { guDepthMask = mask; ++rasterCalls; }
+void sceGuDepthFunc(int function) { guDepthFunction = function; ++rasterCalls; }
+void sceGuFrontFace(int face) { guFrontFace = face; ++rasterCalls; }
+void sceGuBlendFunc(int op, int source, int destination, unsigned int sourceFix, unsigned int destinationFix)
+{
+	guBlend[0] = op; guBlend[1] = source; guBlend[2] = destination;
+	guBlend[3] = sourceFix; guBlend[4] = destinationFix; ++rasterCalls;
+}
+void sceGuAlphaFunc(int function, int reference, int mask)
+{
+	guAlpha[0] = function; guAlpha[1] = reference; guAlpha[2] = mask; ++rasterCalls;
+}
+void sceGuPixelMask(unsigned int mask) { guPixelMask = mask; ++rasterCalls; }
 void sceGuScissor(int, int, int, int) {}
 void sceGuTexMode(int mode, int, int, int) { movieFormat = mode; }
 void sceGuTexImage(int level, int width, int height, int stride, const void* pixels)
 {
-	assert(level == 0 && width == 512 && height == 512);
+	assert(level == 0);
+	if (movieFormat == GU_PSM_5650) assert(width == 512 && height == 512);
+	else assert(movieFormat == GU_PSM_4444 && width <= 512 && height <= 512);
 	movieStride = stride; moviePixels = pixels;
 }
 void sceGuTexFunc(int, int) {}
@@ -665,6 +686,76 @@ extern "C" void sceGuSendCommandi(int command, int argument)
 	}
 	default: assert(false);
 	}
+}
+
+// Minimal pane/resource scaffolding lets the real P2DPicture code render
+// through the GU recorder without loading the rest of the game's UI system.
+P2DPane::P2DPane() : mPaneTree(this) { mWorldMtx.makeIdentity(); }
+P2DPane::~P2DPane() {}
+void P2DPane::drawSelf(int, int, const Matrix4f*) {}
+P2DPane* P2DPane::search(u32, bool) { return nullptr; }
+void P2DPane::makeMatrix(int, int) {}
+void Matrix4f::makeIdentity() {
+	memset(mMtx, 0, sizeof(mMtx));
+	for (int i = 0; i < 4; ++i) mMtx[i][i] = 1;
+}
+void Matrix4f::multiplyTo(const Matrix4f& other, Matrix4f& result) const {
+	for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+		result.mMtx[i][j] = 0;
+		for (int k = 0; k < 4; ++k) result.mMtx[i][j] += mMtx[i][k] * other.mMtx[k][j];
+	}
+}
+Texture::Texture() { mTexObj = nullptr; }
+void Texture::attach() {}
+void Texture::detach() {}
+namespace zen { Texture* loadTexExp(const char*, bool, bool) { return nullptr; } }
+
+void titleMenuPictureAlpha()
+{
+	struct ResidentTexture : Texture {
+		void makeResident() override { ++pictureResidentCalls; }
+	};
+	struct MenuPicture : P2DPicture {
+		MenuPicture(Texture* texture) : P2DPicture(texture) {}
+		void render() {
+			Matrix4f identity; identity.makeIdentity();
+			drawTexCoord(0, 0, 640, 480, 0, 0, 1, 0, 0, 1, 1, 1, &identity);
+		}
+	};
+	resetState(); resetDraws();
+	ResidentTexture texture;
+	texture.mWidth = texture.mHeight = 8;
+	u8 pixels[64]; memset(pixels, 255, sizeof(pixels));
+	// The private layout contains a native pointer and grows on a 64-bit host.
+	// Allocate that layout while exercising the public GX API.
+	GXTexObjPriv object = {};
+	texture.mTexObj = reinterpret_cast<GXTexObj*>(&object);
+	GXInitTexObj(texture.mTexObj, pixels, 8, 8, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	// GX's image address is 32 bits. Warm conversion with the valid host
+	// pointer, then use its encoded address for the actual picture cache hit.
+	PspGxTexture* converted = convertTexture(pixels, 8, 8, GX_TF_I8);
+	assert(converted);
+	converted->source = reinterpret_cast<void*>(uintptr_t(object.image3));
+	MenuPicture background(&texture);
+	background.setAlpha(0); // Same setup as ogScrTitleMgr's 'back' panes.
+	pictureResidentCalls = 0;
+	background.render();
+	assert(pictureResidentCalls == 0 && drawCalls == 0 && triangles.empty());
+	// Exercise the actual P2D TEV configuration and FIFO path at every alpha.
+	for (u32 alpha = 1; alpha <= 255; ++alpha) {
+		resetDraws(); background.setAlpha(alpha); background.render();
+		assert(drawCalls == 1 && triangles.size() == 6);
+		assert(guEnabled[GU_BLEND]);
+		for (const auto& vertex : triangles) assert(vertex.colour == GU_RGBA(255,255,255,alpha));
+		assert(triangles[0].x == 0 && triangles[0].y == 0);
+		assert(triangles[2].x == 640 && triangles[2].y == 480);
+		assert(triangles[2].u == 1 && triangles[2].v == 1);
+	}
+	assert(pictureResidentCalls == 255);
+	resetDraws(); background.setAlpha(0); background.render();
+	assert(pictureResidentCalls == 255 && drawCalls == 0);
+	releaseTexture(*converted);
+	puts("Title menu picture transparency, all fade levels and opaque restoration checks passed");
 }
 
 void particleColours()
@@ -922,8 +1013,69 @@ void swizzledTextures()
 	}
 }
 
+void rasterStateReuse()
+{
+	resetState();
+	rasterCalls = 0;
+	u64 reuseStart = sTimings.rasterReuses;
+	auto material = []() {
+		GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+		GXSetCullMode(GX_CULL_BACK);
+		GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_COPY);
+		GXSetAlphaCompare(GX_GEQUAL, 128, GX_AOP_AND, GX_LEQUAL, 255);
+		GXSetColorUpdate(GX_TRUE);
+		setGuEnabled(GU_TEXTURE_2D, true);
+	};
+	material();
+	const u32 firstCalls = rasterCalls;
+	assert(firstCalls == 11);
+	for (u32 i = 1; i < 606; ++i) material();
+	assert(rasterCalls == firstCalls);
+	assert(sTimings.rasterReuses - reuseStart == 605 * firstCalls);
+	assert(guEnabled[GU_DEPTH_TEST] && guEnabled[GU_CULL_FACE] && guEnabled[GU_BLEND]);
+	assert(guEnabled[GU_ALPHA_TEST] && guEnabled[GU_TEXTURE_2D]);
+	assert(guDepthFunction == guDepthCompare(GX_LEQUAL) && guDepthMask == GU_FALSE);
+	assert(guFrontFace == GU_CW && guPixelMask == 0);
+	assert(guAlpha[0] == u32(guCompare(GX_GEQUAL)) && guAlpha[1] == 128 && guAlpha[2] == 255);
+	assert(guBlend[0] == GU_ADD && guBlend[1] == GU_SRC_ALPHA && guBlend[2] == GU_ONE_MINUS_SRC_ALPHA);
+	assert(guBlend[3] == 0 && guBlend[4] == 0);
+	// Changing each live parameter must still reach GU, including fixed blend
+	// colours and re-enabling tests after disabled material/overlay draws.
+	GXSetZMode(GX_FALSE, GX_GREATER, GX_FALSE);
+	assert(!guEnabled[GU_DEPTH_TEST] && guDepthMask == GU_TRUE && guDepthFunction == guDepthCompare(GX_GREATER));
+	GXSetCullMode(GX_CULL_FRONT); assert(guFrontFace == GU_CCW);
+	GXSetCullMode(GX_CULL_NONE); assert(!guEnabled[GU_CULL_FACE]);
+	GXSetBlendMode(GX_BM_SUBTRACT, GX_BL_ONE, GX_BL_ONE, GX_LO_COPY);
+	assert(guBlend[0] == GU_REVERSE_SUBTRACT && guBlend[3] == 0xffffffff && guBlend[4] == 0xffffffff);
+	GXSetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_COPY); assert(!guEnabled[GU_BLEND]);
+	GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0); assert(!guEnabled[GU_ALPHA_TEST]);
+	GXSetColorUpdate(GX_FALSE); assert(guPixelMask == 0xffffffff);
+	material();
+	// A movie overlay changes actual raster state. The next material must
+	// restore it even when its requested GX settings match an earlier draw.
+	std::vector<u16> movie(512 * 512);
+	sState.listOpen = true;
+	PikminPsp::drawMovieFrame(movie.data(), 360, 270, 512);
+	assert(!guEnabled[GU_DEPTH_TEST] && !guEnabled[GU_BLEND] && !guEnabled[GU_CULL_FACE] && !guEnabled[GU_ALPHA_TEST]);
+	material();
+	assert(guEnabled[GU_DEPTH_TEST] && guEnabled[GU_BLEND] && guEnabled[GU_CULL_FACE] && guEnabled[GU_ALPHA_TEST]);
+	assert(guDepthMask == GU_FALSE);
+	// Direct-list splits preserve GE state; invalidation after a clear must
+	// conservatively re-emit every parameter. External bootstrap edits bypass
+	// reuse altogether because GX does not own that renderer's GU context.
+	sceGuStart(GU_DIRECT, memory);
+	u32 before = rasterCalls; material(); assert(rasterCalls == before);
+	sState.raster = {};
+	material(); assert(rasterCalls == before + firstCalls);
+	sState.guInitialised = false;
+	before = rasterCalls; material(); material(); assert(rasterCalls == before + 2 * firstCalls);
+	printf("Repeated material state: %u GU updates -> %u across 606 draws\n", firstCalls * 606, firstCalls);
+}
+
 int main(int argc, char** argv)
 {
+	titleMenuPictureAlpha();
+	rasterStateReuse();
 	matrixReuse();
 	swizzledTextures();
 	resetState();

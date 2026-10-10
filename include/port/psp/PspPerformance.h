@@ -18,6 +18,9 @@ enum PerformanceMetric {
 	PerformanceAudioMix,
 	PerformanceAudioMeWait,
 	PerformanceAudioMovie,
+	PerformanceMovieDecode,
+	PerformanceMovieConvert,
+	PerformanceMoviePublish,
 	PerformanceMetricCount
 };
 

@@ -217,6 +217,26 @@ on the PSP screen. Compressed AFC movie audio is buffered and mixed into the
 Circle skips tutorial movies; endings keep the original unskippable behavior.
 Playback speed and audio/video timing still need validation on PSP hardware.
 
+Movie RGB565 conversion now precomputes horizontal sample positions and uses
+5 KiB of constant integer YUV coefficient tables. The 360 by 270 playback path
+performs 360 horizontal scaling divisions per converted frame instead of
+97,200; nearest-neighbour sampling, clipping, rounding and pixel packing remain
+identical. The column map uses a bounded 2.5 KiB stack buffer, with a generic
+fallback for output widths above 640. Native reference checks compare all chroma
+pairs at ten luma values, up/downscaling, row padding and decoded movie frames.
+A native 640 by 480 to 360 by 270 conversion benchmark measured approximately
+0.67 ms before and 0.31 ms after; this is not a PSP frame-rate measurement.
+
+The RGB allocation is fully written back once at initialization. Subsequent
+frames publish only the 270 displayed rows, reducing that cache range from
+524,288 to 276,480 bytes while retaining the initialized texture padding.
+`performance.log` now reports `movie_decode_ms` (container reads, video decoding
+and audio queuing), `movie_convert_ms` (YUV scaling/color conversion) and
+`movie_publish_ms` (RGB cache writeback). These are averages per presented frame,
+including frames without new movie video; they are separate from
+`audio_movie_ms`, which measures audio mixing. Compare the same movie on PSP
+to establish the actual gain and locate the remaining playback bottleneck.
+
 The title renderer batches indexed triangle strips by model display list and
 keeps positions in model space. The PSP GE applies rigid model matrices (or
 bone matrices for batches using up to eight different GX matrices) and performs
@@ -244,6 +264,18 @@ approximation remains active. Native checks cover shadow coordinates,
 framebuffer-copy tiling/endian conversion, and opening/title geometry.
 Full GX lighting, multi-stage TEV, and feedback blur remain incomplete;
 gameplay appearance and capture performance still need PSP hardware testing.
+
+Title/options menu pictures now preserve their P2D opacity on PSP. The original
+menus deliberately set their full-screen `back` pictures to alpha zero so the
+title cinematic stays visible. P2D normally applies that opacity in a later
+TEV stage; ignoring it made those pictures cover the scene after pressing
+Start. PSP picture draws now carry the picture alpha in their white vertex
+colors, which the GU modulates with the texture alpha. Fully transparent
+pictures return before texture loading or drawing. The GameCube TEV path keeps
+its original opacity behavior. Native GX checks run the real P2DPicture drawing
+code, checking no submission for the hidden background, all 255 visible alpha
+levels, UVs, geometry and restoring an opaque picture. Confirm title/options
+backgrounds and transitions on hardware with the rebuilt EBOOT.
 
 The opening ship's reflection maps now generate texture coordinates from
 model-space normals using the game's texture matrices, including their
@@ -375,3 +407,37 @@ These are not total GPU syscall counts: transient draws and allocations can
 also publish commands. Native tests decode the emitted command words, resolve
 both addresses against pinned cache entries, and compare triangles and winding
 through batch boundaries. Hardware testing must establish the FPS effect.
+
+### Reusing raster state on PSP
+
+A real-PSP title capture with 606 mesh hits and no vertex conversions still
+reported approximately 12 FPS, 51 ms of main-thread CPU and 29 ms of audio-thread
+CPU per presented frame. Rendering's roughly 79 ms wall time overlaps the audio
+thread. Final GPU waits were below 0.5 ms in the steady title windows, and movie
+timers were zero. This points the next pass at CPU rendering/submission and
+audio work; increasing the mesh cache or optimizing movie conversion does not
+address this particular capture.
+
+The GX backend now reuses identical GU enables and blend, depth, alpha-test,
+culling-direction and pixel-mask parameters. It tracks actual GU state during
+movie overlays too, preserves it across direct-list restarts and conservatively
+invalidates it after framebuffer clears. The independently owned bootstrap
+renderer bypasses reuse. Animated material colors and matrices remain live.
+`gpu_state_changes` counts these emitted SDK state updates per frame;
+`gpu_state_reuses` counts identical updates skipped. These counters do not count
+all GE command words or state categories.
+
+The native recorder verifies state transitions, fixed blend colors, overlay
+restoration, list restarts and invalidation. A synthetic sequence of 606
+identical material setups drops from 6,666 SDK state updates to 11. That is a
+repeated-state check, not the actual title's update count or a PSP FPS result.
+Repeat the same title capture with the rebuilt EBOOT and compare `frame_ms`,
+`main_cpu_ms`, `render_ms`, `mesh_ms`, and the new state counters. Audio CPU time
+is per rendered frame, so compare `audio_cpu_ms * fps / 1000` for its CPU-time
+share if the frame rate changes.
+
+The follow-up hardware title log reports 3,891 skipped state updates per frame
+and approximately 47 ms of main-thread CPU, versus 51 ms before reuse. Steady
+FPS remains around 12; pacing waits increased from roughly 4 ms to 8–10 ms.
+This confirms lower CPU cost but only a small observed frame-rate improvement
+in those captures. Audio CPU remains approximately 28–30 ms per title frame.
