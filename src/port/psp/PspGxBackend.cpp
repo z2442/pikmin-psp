@@ -47,7 +47,12 @@ struct PspGxAttribute {
 struct GuRasterState {
 	u32 knownEnables, enables, knownValues;
 	u32 depthMask[1], depthFunction[1], frontFace[1], blend[5], alpha[3], pixelMask[1];
+	u32 textureFunction[2], textureEnvironment[1];
 };
+
+struct MaterialStage { u8 colour[4], op, bias, scale, output, texCoord, texMap, channel; bool ordered; };
+struct MaterialTexGen { GXTexGenType type; GXTexGenSrc source; u32 matrix; };
+struct MaterialTexture { GXTexObjPriv object; bool valid; };
 
 struct PspGxState {
 	GuRasterState raster;
@@ -68,6 +73,24 @@ struct PspGxState {
 	GXTevBias tevColourBias;
 	GXTevScale tevColourScale;
 	bool particleColourEnabled;
+	bool paletteColourBlend, paletteFinalColour;
+	bool paletteFinalAlphaOp;
+	u8 tevStageCount;
+	u16 registerAlphaStages;
+	GXColor konstColours[4];
+	u8 konstAlphaSelectors[16];
+	MaterialStage stages[16];
+	MaterialTexGen texGens[8];
+	MaterialTexture textures[8];
+	u8 materialPass;
+	u8 materialTexCoord;
+	u32 materialPassColour;
+	bool normalTextureByPosition;
+	bool specularEnabled, specularLightLoaded;
+	GXLightObjPriv specularLight;
+	GXColor specularMaterial;
+	Mtx normalMatrices[10];
+	bool normalMatrixValid[10];
 	u32 clearColour;
 	u32 clearDepth;
 	bool guInitialised;
@@ -140,6 +163,7 @@ struct FrameTimings {
 	u64 weldedVerticesSaved;
 	u64 textureFailures, textureMemoryEvictions, textureSyncs;
 	u64 compressedTextureUploads, textureDecodedPixels;
+	u64 secondaryTextureDraws, specularDraws;
 	u64 meshMissAbsent, meshMissState, meshMissSource, meshStoreFailures, meshEvictions;
 	u64 texCoordRefreshes, texCoordRefreshVertices;
 	u64 meshKeyBuilds;
@@ -202,6 +226,133 @@ void setGuAlpha(int function, int reference, int mask) {
 void setGuPixelMask(u32 value) {
 	const u32 values[] = {value};
 	if (guValuesChanged(sState.raster.pixelMask, values, 32)) sceGuPixelMask(value);
+}
+
+void setGuTextureFunction(int function, int components) {
+	const u32 values[] = {u32(function), u32(components)};
+	if (guValuesChanged(sState.raster.textureFunction, values, 64)) sceGuTexFunc(function, components);
+}
+void setGuTextureEnvironment(u32 colour) {
+	const u32 values[] = {colour};
+	if (guValuesChanged(sState.raster.textureEnvironment, values, 128)) sceGuTexEnvColor(colour);
+}
+
+bool paletteMaterial()
+{
+	// Pellet/Posy base color is C0*(1-TEXC)+TEXC; the last stage
+	// sources alpha from A0*KONST, independently of texture intensity.
+	return sState.paletteColourBlend && sState.paletteFinalColour && sState.paletteFinalAlphaOp && sState.tevStageCount == 4
+	    && (sState.registerAlphaStages & (1U << 3))
+	    && sState.tevColourOp == GX_TEV_ADD && sState.tevColourBias == GX_TB_ZERO
+	    && sState.tevColourScale == GX_CS_SCALE_1;
+}
+
+u32 palettePrimaryColour()
+{
+	const auto& colour = sState.tevColour0;
+	u32 selector = sState.konstAlphaSelectors[3];
+	u32 konstAlpha = 255;
+	if (selector <= GX_TEV_KASEL_1_8) konstAlpha = MIN(255U, (8 - selector) * 32);
+	else if (selector >= GX_TEV_KASEL_K0_R && selector <= GX_TEV_KASEL_K3_A) {
+		const auto& konst = sState.konstColours[selector & 3];
+		const u8 channels[] = {konst.r, konst.g, konst.b, konst.a};
+		konstAlpha = channels[(selector - GX_TEV_KASEL_K0_R) / 4];
+	}
+	u32 alpha = MAX(0, MIN(255, colour.a * s32(konstAlpha) / 255));
+	return GU_RGBA(MAX(0, MIN(255, colour.r)), MAX(0, MIN(255, colour.g)), MAX(0, MIN(255, colour.b)), alpha);
+}
+
+bool materialColourOverride() { return sState.materialPass || paletteMaterial(); }
+u32 materialPrimaryColour() { return sState.materialPass ? sState.materialPassColour : palettePrimaryColour(); }
+
+GXAttr meshUvAttribute() {
+	return sState.texSource >= GX_TG_TEX0 && sState.texSource <= GX_TG_TEX7
+	    ? GXAttr(GX_VA_TEX0 + sState.texSource - GX_TG_TEX0) : GX_VA_TEX0;
+}
+GXAttr meshUvMatrixAttribute() { return GXAttr(GX_VA_TEX0MTXIDX + sState.materialTexCoord); }
+bool generatedMeshUv() {
+	return sState.texSource == GX_TG_POS || sState.texSource == GX_TG_NRM
+	    || (sState.texSource >= GX_TG_TEX0 && sState.texSource <= GX_TG_TEX7
+	        && sState.texMatrix >= GX_TEXMTX0 && sState.texMatrix < GX_IDENTITY);
+}
+
+enum { MaterialAlpha = 1, MaterialAdd = 2, MaterialMultiply = 3, MaterialWhiten = 4 };
+
+bool stageColour(const MaterialStage& stage, u8 a, u8 b, u8 c, u8 d)
+{
+	return stage.colour[0] == a && stage.colour[1] == b && stage.colour[2] == c && stage.colour[3] == d;
+}
+
+u8 secondaryTexturePass(const MaterialStage& stage)
+{
+	if (!stage.ordered || stage.texCoord >= 8 || stage.texMap >= 8 || !sState.textures[stage.texMap].valid
+	    || stage.op != GX_TEV_ADD || stage.bias != GX_TB_ZERO || stage.scale != GX_CS_SCALE_1
+	    || stage.output != GX_TEVPREV) return 0;
+	if (stageColour(stage, GX_CC_CPREV, GX_CC_TEXC, GX_CC_TEXA, GX_CC_ZERO)) return MaterialAlpha;
+	if (stageColour(stage, GX_CC_CPREV, GX_CC_ONE, GX_CC_TEXC, GX_CC_ZERO)) {
+		const auto format = sState.textures[stage.texMap].object.format;
+		// A grayscale intensity map can supply the interpolation factor to GU.
+		if (format == GX_TF_I4 || format == GX_TF_I8) return MaterialWhiten;
+	}
+	if (stageColour(stage, GX_CC_ZERO, GX_CC_ONE, GX_CC_CPREV, GX_CC_TEXC)
+	    || stageColour(stage, GX_CC_ZERO, GX_CC_RASC, GX_CC_CPREV, GX_CC_TEXC)
+	    || stageColour(stage, GX_CC_ZERO, GX_CC_TEXC, GX_CC_ONE, GX_CC_CPREV)) return MaterialAdd;
+	if (stageColour(stage, GX_CC_ZERO, GX_CC_TEXC, GX_CC_CPREV, GX_CC_ZERO)
+	    || stageColour(stage, GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO)) return MaterialMultiply;
+	return 0;
+}
+
+bool specularStage(const MaterialStage& stage)
+{
+	return sState.specularEnabled && sState.specularLightLoaded && stage.ordered
+	    && (stage.channel == GX_COLOR1 || stage.channel == GX_COLOR1A1)
+	    && stage.texMap == GX_TEXMAP_NULL && stage.op == GX_TEV_ADD && stage.bias == GX_TB_ZERO
+	    && stage.scale == GX_CS_SCALE_1 && stage.output == GX_TEVPREV
+	    && stageColour(stage, GX_CC_ZERO, GX_CC_CPREV, GX_CC_ONE, GX_CC_RASC);
+}
+
+// Small immutable lookup textures move the GX specular attenuation curve to
+// the GE. Animated model/view normals only refresh UVs, not texture pixels.
+struct SpecularLookup {
+	alignas(16) u16 pixels[256 * 8];
+	f32 attenuation[6];
+	u64 gpuEpoch;
+	bool valid;
+};
+SpecularLookup sSpecularLookups[8];
+
+void bindMaterialTexture(const MaterialTexture& texture)
+{
+	GXTexObjPriv object = texture.object;
+	GXLoadTexObj(reinterpret_cast<GXTexObj*>(&object), GX_TEXMAP0);
+}
+
+void restoreMaterialRaster(const GuRasterState& saved)
+{
+	for (u32 state = 0; state < 32; ++state)
+		if (saved.knownEnables & (1U << state)) setGuEnabled(state, saved.enables & (1U << state));
+	if (saved.knownValues & 1) setGuDepthMask(saved.depthMask[0]);
+	if (saved.knownValues & 2) setGuDepthFunction(saved.depthFunction[0]);
+	if (saved.knownValues & 8) setGuBlend(saved.blend[0], saved.blend[1], saved.blend[2], saved.blend[3], saved.blend[4]);
+	if (saved.knownValues & 16) setGuAlpha(saved.alpha[0], saved.alpha[1], saved.alpha[2]);
+	if (saved.knownValues & 32) setGuPixelMask(saved.pixelMask[0]);
+	if (saved.knownValues & 64) setGuTextureFunction(saved.textureFunction[0], saved.textureFunction[1]);
+	if (saved.knownValues & 128) setGuTextureEnvironment(saved.textureEnvironment[0]);
+}
+
+void prepareMaterialOverlay(const GuRasterState& base, u8 pass)
+{
+	setGuDepthMask(GU_TRUE);
+	if ((base.enables & (1U << GU_DEPTH_TEST)) && !base.depthMask[0]) setGuDepthFunction(GU_EQUAL);
+	setGuEnabled(GU_BLEND, true);
+	setGuEnabled(GU_ALPHA_TEST, false);
+	setGuEnabled(GU_FOG, false);
+	// An overlay contributes color, while the original material owns opacity.
+	setGuPixelMask(base.pixelMask[0] | 0xff000000);
+	if (pass == MaterialMultiply) setGuBlend(GU_ADD, GU_DST_COLOR, GU_FIX, 0, 0);
+	else setGuBlend(GU_ADD, GU_SRC_ALPHA, pass == MaterialAdd ? GU_FIX : GU_ONE_MINUS_SRC_ALPHA, 0, 0xffffffff);
+	sState.particleColourEnabled = sState.multiplyTevColour0 = false;
+	sState.materialPass = pass;
 }
 
 u32 sPreviousMetrics[PikminPsp::PerformanceMetricCount];
@@ -286,6 +437,8 @@ void recordFrameTimings()
 			        sTimings.textureSyncs / 120.0, sTextureCacheBytes, residentTextures);
 			fprintf(file, "  texture_compressed_uploads=%.1f texture_decoded_pixels=%.1f\n",
 			        sTimings.compressedTextureUploads / 120.0, sTimings.textureDecodedPixels / 120.0);
+			fprintf(file, "  secondary_texture_draws=%.1f specular_draws=%.1f\n",
+			        sTimings.secondaryTextureDraws / 120.0, sTimings.specularDraws / 120.0);
 			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
 			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
 			        metrics[PikminPsp::PerformanceMovieConvert] / 120000.0,
@@ -765,12 +918,13 @@ void decodeMeshVertex(const u8*& input)
 		if (state.source == GX_DIRECT) {
 			u8 value = *input++;
 			if (attribute == GX_VA_PNMTXIDX) matrixIndex = value;
-			if (attribute == GX_VA_TEX0MTXIDX) textureMatrix = value;
+			if (attribute == (u32)meshUvMatrixAttribute()) textureMatrix = value;
 		} else if (state.source != GX_NONE) {
 			u32 ignored = 0;
 			consumeIndex(input, state.source, ignored);
 		}
 	}
+	if (sState.normalTextureByPosition) textureMatrix = sState.texMatrix + matrixIndex/3*3;
 
 	PspGxAttribute& position = sState.attributes[GX_VA_POS];
 	u32 positionIndex = 0;
@@ -812,13 +966,17 @@ void decodeMeshVertex(const u8*& input)
 		if (texture.source == GX_NONE) continue;
 		u32 textureIndex = 0;
 		consumeIndex(input, texture.source, textureIndex);
-		if (attribute == GX_VA_TEX0 && texture.array) {
+		if (attribute == (u32)meshUvAttribute() && texture.array) {
 			const f32* uv = reinterpret_cast<const f32*>(texture.array + textureIndex * texture.stride);
 			PspGXTexCoord2f32(uv[0], texture.count == GX_TEX_S ? 0.0f : uv[1]);
 		}
 	}
 	PspGxVertex* out = currentVertex();
-	if (out) generateTexCoord(*out, modelX, modelY, modelZ, GX_TG_POS, textureMatrix);
+	if (out) {
+		generateTexCoord(*out, modelX, modelY, modelZ, GX_TG_POS, textureMatrix);
+		if (sState.texSource >= GX_TG_TEX0 && sState.texSource <= GX_TG_TEX7)
+			generateTexCoord(*out, out->u, out->v, 0, sState.texSource, textureMatrix);
+	}
 }
 
 int guBlendFactor(GXBlendFactor factor)
@@ -899,6 +1057,12 @@ void submitVertices(const void* vertices, u32 count, int primitive, const u16* i
 	if (sState.textureEnabled) ++sDebugTexturedDrawCalls;
 	if (sState.textureEnabled && sBoundTexture) sBoundTexture->gpuEpoch = sMeshCacheEpoch;
 	if (sState.textureEnabled) setGuEnabled(GU_TEXTURE_2D, true); else setGuEnabled(GU_TEXTURE_2D, false);
+	if (sState.textureEnabled) {
+		bool palette = !sState.materialPass && paletteMaterial();
+		setGuTextureFunction(palette ? GU_TFX_BLEND : GU_TFX_MODULATE,
+		                     palette || sState.materialPass == MaterialAdd || sState.materialPass == MaterialMultiply ? GU_TCC_RGB : GU_TCC_RGBA);
+		if (palette) setGuTextureEnvironment(0x00ffffff);
+	}
 	const int format = GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF
 	                 | (indices ? GU_INDEX_16BIT : 0)
 	                 | (skinned ? GU_WEIGHT_8BIT | GU_WEIGHTS(8) : 0)
@@ -1001,7 +1165,7 @@ bool meshLayout(MeshLayout& layout)
 	}
 	const PspGxAttribute& pos = sState.attributes[GX_VA_POS];
 	const PspGxAttribute& col = sState.attributes[GX_VA_CLR0];
-	const PspGxAttribute& uv = sState.attributes[GX_VA_TEX0];
+	const PspGxAttribute& uv = sState.attributes[meshUvAttribute()];
 	return layout.offset[GX_VA_POS] >= 0 && pos.array && pos.componentType == GX_F32
 	    && (col.source == GX_NONE || (col.array && col.componentType == GX_RGBA8))
 	    && (uv.source == GX_NONE || (uv.array && uv.componentType == GX_F32));
@@ -1045,22 +1209,27 @@ struct MeshCacheKey {
 	u8 sources[GX_VA_MAX_ATTR];
 	MeshAttributeKey attributes[5];
 	u32 currentColour, currentMatrix;
+	u32 uvAttribute;
+	u32 uvMatrixAttribute;
 	GXColorS10 tint;
 	GXTevOp tintOp;
 	GXTevBias tintBias;
 	GXTevScale tintScale;
 	bool tintEnabled;
+	bool paletteEnabled;
+	u32 paletteColour;
 	GXTexGenSrc texSource;
 	GXTexGenType texType;
 	u32 texMatrix;
 	bool generatedTexCoords;
+	bool normalTextureByPosition;
 	Mtx textureMatrices[10];
 };
 
 u32 meshCacheKeyBytes(const MeshCacheKey& key)
 {
 	return offsetof(MeshCacheKey, textureMatrices) + (!key.generatedTexCoords ? 0
-	    : key.sources[GX_VA_TEX0MTXIDX] != GX_NONE ? sizeof(key.textureMatrices) : sizeof(Mtx));
+	    : key.sources[key.uvMatrixAttribute] != GX_NONE || key.normalTextureByPosition ? sizeof(key.textureMatrices) : sizeof(Mtx));
 }
 
 // Equality only: unlike memcmp, no byte ordering result is needed. PSP libc
@@ -1277,7 +1446,7 @@ void refreshMeshTexCoords(u8* output, const u8* stored, const MeshTexCoordInput*
 
 void refreshMeshVertices(u8* output, const u8* stored, const MeshTexCoordInput* inputs, u32 count, bool skinned)
 {
-	const bool selected = sState.attributes[GX_VA_TEX0MTXIDX].source != GX_NONE;
+	const bool selected = sState.attributes[meshUvMatrixAttribute()].source != GX_NONE || sState.normalTextureByPosition;
 	if (skinned) {
 		if (selected) refreshMeshTexCoords<true, true>(output, stored, inputs, count);
 		else refreshMeshTexCoords<true, false>(output, stored, inputs, count);
@@ -1345,7 +1514,7 @@ void meshCacheKey(MeshCacheKey& key)
 	memset(&key, 0, offsetof(MeshCacheKey, textureMatrices));
 	key.modelRevision = sMeshValidationScope ? sMeshValidationScope->modelRevision : 0;
 	memcpy(key.sources, sState.attributeSources, sizeof(key.sources));
-	const GXAttr consumed[] = { GX_VA_POS, GX_VA_CLR0, GX_VA_TEX0, GX_VA_NRM, GX_VA_NBT };
+	const GXAttr consumed[] = { GX_VA_POS, GX_VA_CLR0, meshUvAttribute(), GX_VA_NRM, GX_VA_NBT };
 	for (u32 i = 0; i < ARRAY_SIZE(consumed); ++i) {
 		if (i >= 3 && sState.texSource != GX_TG_NRM) continue;
 		const auto& source = sState.attributes[consumed[i]];
@@ -1360,16 +1529,21 @@ void meshCacheKey(MeshCacheKey& key)
 	}
 	key.currentColour = sState.attributes[GX_VA_CLR0].source == GX_NONE ? sState.currentColour : 0;
 	key.currentMatrix = sState.attributes[GX_VA_PNMTXIDX].source == GX_NONE ? sState.currentPositionMatrix : 0;
+	key.uvAttribute = meshUvAttribute();
+	key.uvMatrixAttribute = meshUvMatrixAttribute();
+	key.paletteEnabled = materialColourOverride();
+	if (key.paletteEnabled) key.paletteColour = materialPrimaryColour();
 	key.tintEnabled = sState.multiplyTevColour0 && sState.tevColourOp == GX_TEV_ADD && sState.tevColourBias == GX_TB_ZERO;
 	if (key.tintEnabled) {
 		key.tint = sState.tevColour0;
 		key.tintOp = sState.tevColourOp; key.tintBias = sState.tevColourBias; key.tintScale = sState.tevColourScale;
 	}
 	// Ordinary UVs do not depend on texture-matrix animation elsewhere.
-	if (sState.texSource == GX_TG_POS || sState.texSource == GX_TG_NRM) {
+	if (generatedMeshUv()) {
 		key.generatedTexCoords = true;
+		key.normalTextureByPosition = sState.normalTextureByPosition;
 		key.texSource = sState.texSource; key.texType = sState.texType; key.texMatrix = sState.texMatrix;
-		if (sState.attributes[GX_VA_TEX0MTXIDX].source != GX_NONE) {
+		if (sState.attributes[meshUvMatrixAttribute()].source != GX_NONE || sState.normalTextureByPosition) {
 			memcpy(key.textureMatrices, sState.textureMatrices, sizeof(key.textureMatrices));
 		} else {
 			// No per-vertex matrix selector: compare just the selected matrix,
@@ -1385,7 +1559,7 @@ void meshCacheKey(MeshCacheKey& key)
 bool meshTextureMatricesMatch(const MeshCacheKey& saved)
 {
 	if (!saved.generatedTexCoords) return true;
-	if (saved.sources[GX_VA_TEX0MTXIDX] != GX_NONE)
+	if (saved.sources[saved.uvMatrixAttribute] != GX_NONE || saved.normalTextureByPosition)
 		return meshBytesEqual(saved.textureMatrices, sState.textureMatrices, sizeof(saved.textureMatrices));
 	if (saved.texMatrix >= GX_TEXMTX0 && saved.texMatrix < GX_IDENTITY)
 		return meshBytesEqual(saved.textureMatrices[0], sState.textureMatrices[(saved.texMatrix - GX_TEXMTX0) / 3], sizeof(Mtx));
@@ -1400,7 +1574,8 @@ bool meshCacheStateMatches(const MeshCacheKey& saved, bool allowTexCoordRefresh)
 {
 	if (saved.modelRevision != (sMeshValidationScope ? sMeshValidationScope->modelRevision : 0)
 	    || !meshBytesEqual(saved.sources, sState.attributeSources, sizeof(saved.sources))) return false;
-	const GXAttr consumed[] = { GX_VA_POS, GX_VA_CLR0, GX_VA_TEX0, GX_VA_NRM, GX_VA_NBT };
+	if (saved.uvAttribute != (u32)meshUvAttribute() || saved.uvMatrixAttribute != (u32)meshUvMatrixAttribute()) return false;
+	const GXAttr consumed[] = { GX_VA_POS, GX_VA_CLR0, meshUvAttribute(), GX_VA_NRM, GX_VA_NBT };
 	for (u32 i = 0; i < ARRAY_SIZE(consumed); ++i) {
 		if (i >= 3 && sState.texSource != GX_TG_NRM) continue;
 		const auto& source = sState.attributes[consumed[i]];
@@ -1411,12 +1586,15 @@ bool meshCacheStateMatches(const MeshCacheKey& saved, bool allowTexCoordRefresh)
 	}
 	if (sState.attributes[GX_VA_CLR0].source == GX_NONE && saved.currentColour != sState.currentColour) return false;
 	if (sState.attributes[GX_VA_PNMTXIDX].source == GX_NONE && saved.currentMatrix != sState.currentPositionMatrix) return false;
+	const bool palette = materialColourOverride();
+	if (saved.paletteEnabled != palette || (palette && saved.paletteColour != materialPrimaryColour())) return false;
 	const bool tinted = sState.multiplyTevColour0 && sState.tevColourOp == GX_TEV_ADD && sState.tevColourBias == GX_TB_ZERO;
 	if (saved.tintEnabled != tinted) return false;
 	if (tinted && (!meshBytesEqual(&saved.tint, &sState.tevColour0, sizeof(saved.tint))
 	    || saved.tintOp != sState.tevColourOp || saved.tintBias != sState.tevColourBias || saved.tintScale != sState.tevColourScale)) return false;
-	const bool generated = sState.texSource == GX_TG_POS || sState.texSource == GX_TG_NRM;
+	const bool generated = generatedMeshUv();
 	if (saved.generatedTexCoords != generated) return false;
+	if (generated && saved.normalTextureByPosition != sState.normalTextureByPosition) return false;
 	if (generated && (saved.texSource != sState.texSource || saved.texType != sState.texType || saved.texMatrix != sState.texMatrix)) return false;
 	return allowTexCoordRefresh || meshTextureMatricesMatch(saved);
 }
@@ -1642,9 +1820,11 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 	u32 base = 0, index = 0, uniqueCount = 0, primitiveNumber = 0;
 	beginMeshVertexWeld();
 	const bool tintVertices = prepareMaterialTint();
+	const bool paletteVertices = materialColourOverride();
+	const u32 paletteColour = paletteVertices ? materialPrimaryColour() : 0;
 	const PspGxAttribute& pos = sState.attributes[GX_VA_POS];
 	const PspGxAttribute& col = sState.attributes[GX_VA_CLR0];
-	const PspGxAttribute& uv = sState.attributes[GX_VA_TEX0];
+	const PspGxAttribute& uv = sState.attributes[meshUvAttribute()];
 	while (input < end) {
 		u8 command = *input++;
 		if (command == GX_CMD_NOP) continue;
@@ -1672,18 +1852,24 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 				memcpy(&out.colour, colour, 4);
 				if (cacheable) inputs[1].include(colour, 4);
 			}
-			if (tintVertices) out.colour = materialTint(out.colour);
+			if (paletteVertices) out.colour = paletteColour;
+			else if (tintVertices) out.colour = materialTint(out.colour);
 			out.u = out.v = 0.0f;
 			if (uv.source != GX_NONE) {
-				const f32* st = reinterpret_cast<const f32*>(uv.array + meshIndex(input, layout, GX_VA_TEX0) * uv.stride);
+				const f32* st = reinterpret_cast<const f32*>(uv.array + meshIndex(input, layout, meshUvAttribute()) * uv.stride);
 				out.u = st[0]; out.v = uv.count == GX_TEX_S ? 0.0f : st[1];
 				if (cacheable) inputs[2].include(st, uv.count == GX_TEX_S ? 4 : 8);
 			}
-			u32 textureMatrix = layout.offset[GX_VA_TEX0MTXIDX] >= 0
-			    ? meshIndex(input, layout, GX_VA_TEX0MTXIDX) : sState.texMatrix;
+			u32 textureMatrix = layout.offset[meshUvMatrixAttribute()] >= 0
+			    ? meshIndex(input, layout, meshUvMatrixAttribute()) : sState.texMatrix;
+			if (sState.normalTextureByPosition) textureMatrix = sState.texMatrix + meshMatrixIndex(input, layout) * 3;
 			if (texCoordInputs) texCoordInputs[mapped] = {out.x, out.y, out.z,
 			    sState.texSource == GX_TG_POS ? textureMatrix : (u32)GX_IDENTITY};
 			generateTexCoord(out, out.x, out.y, out.z, GX_TG_POS, textureMatrix);
+			if (sState.texSource >= GX_TG_TEX0 && sState.texSource <= GX_TG_TEX7) {
+				if (texCoordInputs) texCoordInputs[mapped] = {out.u,out.v,0,textureMatrix};
+				generateTexCoord(out,out.u,out.v,0,sState.texSource,textureMatrix);
+			}
 			if (sState.texSource == GX_TG_NRM) {
 				GXAttr normalAttr = layout.offset[GX_VA_NBT] >= 0 ? GX_VA_NBT : GX_VA_NRM;
 				const PspGxAttribute& normal = sState.attributes[normalAttr];
@@ -1751,6 +1937,59 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 	return true;
 }
 
+bool bindSpecularLookup()
+{
+	f32 attenuation[6];
+	memcpy(attenuation, sState.specularLight.a, sizeof(f32)*3);
+	memcpy(attenuation+3, sState.specularLight.k, sizeof(f32)*3);
+	SpecularLookup* lookup = nullptr;
+	for (auto& candidate : sSpecularLookups)
+		if (candidate.valid && !memcmp(candidate.attenuation, attenuation, sizeof(attenuation))) { lookup = &candidate; break; }
+	if (!lookup) {
+		for (auto& candidate : sSpecularLookups)
+			if (!candidate.valid || candidate.gpuEpoch != sMeshCacheEpoch) { lookup = &candidate; break; }
+		// Never overwrite a curve referenced by an outstanding GE draw.
+		if (!lookup) return false;
+		for (u32 x = 0; x < 256; ++x) {
+			f32 dot = MAX(0.0f, (x+0.5f)/128.0f-1.0f);
+			f32 numerator = attenuation[0]+attenuation[1]*dot+attenuation[2]*dot*dot;
+			f32 denominator = attenuation[3]+attenuation[4]*dot+attenuation[5]*dot*dot;
+			f32 value = dot > 0 && denominator > 1e-8f ? MAX(0.0f, MIN(1.0f, numerator/denominator)) : 0;
+			u32 intensity = u32(value*255+0.5f);
+			for (u32 y = 0; y < 8; ++y) lookup->pixels[texturePixelOffset(x,y,256,8)] = rgbaTo4444(intensity,intensity,intensity,255);
+		}
+		memcpy(lookup->attenuation, attenuation, sizeof(attenuation));
+		lookup->valid = true;
+		sceKernelDcacheWritebackRange(lookup->pixels, sizeof(lookup->pixels));
+	}
+	lookup->gpuEpoch = sMeshCacheEpoch;
+	sBoundTexture = nullptr; // Static lookup buffers have their own GPU lifetime.
+	sceGuTexMode(GU_PSM_4444, 0, 0, GU_TRUE);
+	sceGuTexImage(0,256,8,256,lookup->pixels);
+	sceGuTexFilter(GU_LINEAR,GU_LINEAR);
+	sceGuTexWrap(GU_CLAMP,GU_CLAMP);
+	sceGuTexScale(1,1); sceGuTexOffset(0,0);
+	sState.textureEnabled = true;
+	sState.texSource = GX_TG_NRM;
+	sState.texType = GX_TG_MTX2X4;
+	sState.texMatrix = GX_TEXMTX0;
+	sState.materialTexCoord = 0;
+	sState.normalTextureByPosition = true;
+	for (u32 i = 0; i < 10; ++i) {
+		const Mtx& normal = sState.normalMatrixValid[i] ? sState.normalMatrices[i] : sState.positionMatrices[i];
+		Mtx& texture = sState.textureMatrices[i];
+		memset(texture,0,sizeof(Mtx));
+		// DGX's matrices are rigid/uniformly scaled. Remove scale before the
+		// half-vector dot product so growth animation does not brighten shine.
+		f32 length = sqrtf(normal[0][0]*normal[0][0]+normal[1][0]*normal[1][0]+normal[2][0]*normal[2][0]);
+		f32 scale = length > 1e-8f ? 0.5f/length : 0;
+		for (u32 column = 0; column < 3; ++column)
+			for (u32 row = 0; row < 3; ++row) texture[0][column] += scale*sState.specularLight.ldir[row]*normal[row][column];
+		texture[0][3] = texture[1][3] = 0.5f; texture[2][3] = 1;
+	}
+	return true;
+}
+
 } // namespace
 
 namespace PikminPsp {
@@ -1789,7 +2028,7 @@ void drawMovieFrame(const u16* pixels, u32 width, u32 height, u32 stride)
 	setGuEnabled(GU_TEXTURE_2D, true);
 	sceGuTexMode(GU_PSM_5650, 0, 0, GU_FALSE);
 	sceGuTexImage(0, 512, 512, stride, pixels);
-	sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+	setGuTextureFunction(GU_TFX_REPLACE, GU_TCC_RGB);
 	sceGuTexFilter(GU_LINEAR, GU_LINEAR); sceGuTexWrap(GU_CLAMP, GU_CLAMP);
 	sceGuTexScale(1.0f, 1.0f); sceGuTexOffset(0.0f, 0.0f); sceGuTexFlush();
 	struct Vertex { u16 u, v; s16 x, y, z; };
@@ -1862,6 +2101,8 @@ void PspGXTexCoord2f32(f32 u, f32 v)
 	if (vertex && sState.texSource != GX_TG_NRM) {
 		vertex->u = u;
 		vertex->v = v;
+		if (!sState.verticesPretransformed && sState.texSource >= GX_TG_TEX0 && sState.texSource <= GX_TG_TEX7)
+			generateTexCoord(*vertex,u,v,0,sState.texSource);
 	}
 }
 
@@ -1897,7 +2138,10 @@ void PspGXWriteF32(f32) { }
 void PspGXEnd(void)
 {
 	if (!sState.inPrimitive) return;
-	if (prepareMaterialTint()) {
+	if (materialColourOverride()) {
+		u32 colour = materialPrimaryColour();
+		for (u32 i = 0; i < sState.vertexCount; ++i) sState.vertices[i].colour = colour;
+	} else if (prepareMaterialTint()) {
 		for (u32 i = 0; i < sState.vertexCount; ++i) sState.vertices[i].colour = materialTint(sState.vertices[i].colour);
 	}
 	if (!sState.verticesPretransformed) for (u32 i = 0; i < sState.vertexCount; ++i) {
@@ -1940,6 +2184,7 @@ GXFifoObj* GXInit(void*, u32)
 	memset(&sState, 0, sizeof(sState));
 	sMeshTimingSequence = 0;
 	sState.currentColour = 0xffffffff;
+	sState.specularMaterial = (GXColor){255,255,255,255};
 	sBoundTexture = nullptr;
 	sState.clearColour = 0xff000000;
 	sState.clearDepth = 0;
@@ -1961,6 +2206,10 @@ GXFifoObj* GXInit(void*, u32)
 	setGuEnabled(GU_CLIP_PLANES, true);
 	sceGuShadeModel(GU_SMOOTH);
 	setGuFrontFace(GU_CW);
+	setGuDepthMask(GU_FALSE); setGuDepthFunction(GU_GEQUAL);
+	setGuEnabled(GU_DEPTH_TEST, false); setGuEnabled(GU_BLEND, false);
+	setGuEnabled(GU_ALPHA_TEST, false); setGuEnabled(GU_FOG, false);
+	setGuPixelMask(0);
 	// Match the working OOT PSP renderer: sceGuDrawArray consumes GE matrix
 	// state directly, so initialise it with sceGuSetMatrix rather than GUM's
 	// deferred software stacks.
@@ -2009,7 +2258,9 @@ void GXLoadPosMtxImm(const Mtx matrix, u32 id)
 	// mesh can select another slot and skinning uses identity plus GE bones.
 }
 
-void GXLoadNrmMtxImm(const Mtx, u32) { }
+void GXLoadNrmMtxImm(const Mtx matrix, u32 id) {
+	u32 index = MIN(id/3, 9U); memcpy(sState.normalMatrices[index], matrix, sizeof(Mtx)); sState.normalMatrixValid[index] = true;
+}
 void GXLoadTexMtxImm(const Mtx matrix, u32 id, GXTexMtxType type) {
 	if (id >= GX_TEXMTX0 && id < GX_IDENTITY) {
 	Mtx& out = sState.textureMatrices[(id - GX_TEXMTX0) / 3];
@@ -2258,20 +2509,49 @@ void GXSetFog(GXFogType type, f32 start, f32 end, f32, f32, GXColor colour)
 void GXSetFogRangeAdj(GXBool, u16, GXFogAdjTable*) { }
 
 void GXSetTexCoordGen2(GXTexCoordID id, GXTexGenType type, GXTexGenSrc source, u32 matrix, GXBool, u32) {
+	if ((u32)id < 8) sState.texGens[id] = {type, source, matrix};
 	if (id == GX_TEXCOORD0) { sState.texSource = source; sState.texType = type; sState.texMatrix = matrix; }
 }
-void GXSetNumTevStages(u8) { }
-void GXSetTevOp(GXTevStageID stage, GXTevMode)
+void GXSetNumTevStages(u8 count) { sState.tevStageCount = count; }
+void GXSetTevOp(GXTevStageID stage, GXTevMode mode)
 {
+	// The convenience API must replace stale combiner recipes as well.
+	GXTevColorArg colour = stage == GX_TEVSTAGE0 ? GX_CC_RASC : GX_CC_CPREV;
+	GXTevAlphaArg alpha = stage == GX_TEVSTAGE0 ? GX_CA_RASA : GX_CA_APREV;
+	switch (mode) {
+	case GX_DECAL:
+		GXSetTevColorIn(stage, colour, GX_CC_TEXC, GX_CC_TEXA, GX_CC_ZERO);
+		GXSetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, alpha); break;
+	case GX_BLEND:
+		GXSetTevColorIn(stage, colour, GX_CC_ONE, GX_CC_TEXC, GX_CC_ZERO);
+		GXSetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_TEXA, alpha, GX_CA_ZERO); break;
+	case GX_REPLACE:
+		GXSetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC);
+		GXSetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_TEXA); break;
+	case GX_PASSCLR:
+		GXSetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, colour);
+		GXSetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, alpha); break;
+	default:
+		GXSetTevColorIn(stage, GX_CC_ZERO, GX_CC_TEXC, colour, GX_CC_ZERO);
+		GXSetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_TEXA, alpha, GX_CA_ZERO); break;
+	}
+	GXSetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GXSetTevAlphaOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 	if (stage == GX_TEVSTAGE0) {
 		sState.particleColourEnabled = false;
 		sState.multiplyTevColour0 = false;
+		sState.paletteColourBlend = false;
 	}
 }
 void GXSetTevColorIn(GXTevStageID stage, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d)
 {
-	if (stage == GX_TEVSTAGE0) sState.multiplyTevColour0 = a == GX_CC_ZERO && d == GX_CC_ZERO
-	    && ((b == GX_CC_C0 && c == GX_CC_RASC) || (b == GX_CC_RASC && c == GX_CC_C0));
+	if ((u32)stage < 16) { auto& info = sState.stages[stage]; info.colour[0]=a; info.colour[1]=b; info.colour[2]=c; info.colour[3]=d; }
+	if (stage == GX_TEVSTAGE0) {
+		sState.multiplyTevColour0 = a == GX_CC_ZERO && d == GX_CC_ZERO
+		    && ((b == GX_CC_C0 && c == GX_CC_RASC) || (b == GX_CC_RASC && c == GX_CC_C0));
+		sState.paletteColourBlend = a == GX_CC_C0 && b == GX_CC_ZERO && c == GX_CC_TEXC && d == GX_CC_TEXC;
+	}
+	if (stage == GX_TEVSTAGE3) sState.paletteFinalColour = a == GX_CC_ZERO && b == GX_CC_RASC && c == GX_CC_CPREV && d == GX_CC_ZERO;
 }
 void GXSetTevAlphaIn(GXTevStageID stage, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d)
 {
@@ -2281,12 +2561,22 @@ void GXSetTevAlphaIn(GXTevStageID stage, GXTevAlphaArg a, GXTevAlphaArg b, GXTev
 	// the RGB TEV presets), preserving the particle's animated alpha.
 	if (stage == GX_TEVSTAGE0)
 		sState.particleColourEnabled = a == GX_CA_ZERO && b == GX_CA_TEXA && c == GX_CA_A0 && d == GX_CA_ZERO;
+	if ((u32)stage < 16) {
+		u16 mask = 1U << stage;
+		if (a == GX_CA_ZERO && b == GX_CA_A0 && c == GX_CA_KONST && d == GX_CA_ZERO) sState.registerAlphaStages |= mask;
+		else sState.registerAlphaStages &= ~mask;
+	}
 }
-void GXSetTevColorOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool, GXTevRegID)
+void GXSetTevColorOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool, GXTevRegID output)
 {
+	if ((u32)stage < 16) { auto& info = sState.stages[stage]; info.op=op; info.bias=bias; info.scale=scale; info.output=output; }
 	if (stage == GX_TEVSTAGE0) { sState.tevColourOp = op; sState.tevColourBias = bias; sState.tevColourScale = scale; }
 }
-void GXSetTevAlphaOp(GXTevStageID, GXTevOp, GXTevBias, GXTevScale, GXBool, GXTevRegID) { }
+void GXSetTevAlphaOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool, GXTevRegID out)
+{
+	if (stage == GX_TEVSTAGE3) sState.paletteFinalAlphaOp = op == GX_TEV_ADD && bias == GX_TB_ZERO
+	    && scale == GX_CS_SCALE_1 && out == GX_TEVPREV;
+}
 void GXSetTevColor(GXTevRegID reg, GXColor colour)
 {
 	// TEV registers and raster material color are independent GX state.
@@ -2300,12 +2590,14 @@ void GXSetTevColorS10(GXTevRegID reg, GXColorS10 colour)
 {
 	if (reg == GX_TEVREG0) sState.tevColour0 = colour;
 }
-void GXSetTevKColor(GXTevKColorID, GXColor) { }
+void GXSetTevKColor(GXTevKColorID id, GXColor colour) { if ((u32)id < 4) sState.konstColours[id] = colour; }
 void GXSetTevKColorSel(GXTevStageID, GXTevKColorSel) { }
-void GXSetTevKAlphaSel(GXTevStageID, GXTevKAlphaSel) { }
+void GXSetTevKAlphaSel(GXTevStageID stage, GXTevKAlphaSel selector) { if ((u32)stage < 16) sState.konstAlphaSelectors[stage] = selector; }
 void GXSetTevSwapMode(GXTevStageID, GXTevSwapSel, GXTevSwapSel) { }
 void GXSetTevSwapModeTable(GXTevSwapSel, GXTevColorChan, GXTevColorChan, GXTevColorChan, GXTevColorChan) { }
-void GXSetTevOrder(GXTevStageID, GXTexCoordID, GXTexMapID, GXChannelID) { }
+void GXSetTevOrder(GXTevStageID stage, GXTexCoordID coord, GXTexMapID map, GXChannelID channel) {
+	if ((u32)stage < 16) { auto& info=sState.stages[stage]; info.texCoord=coord; info.texMap=map; info.channel=channel; info.ordered=true; }
+}
 
 void GXInitTexObj(GXTexObj* object, void* image, u16 width, u16 height, GXTexFmt format, GXTexWrapMode sWrap,
 	              GXTexWrapMode tWrap, GXBool mipmap)
@@ -2328,9 +2620,10 @@ void GXInitTexObjLOD(GXTexObj* object, GXTexFilter minFilter, GXTexFilter magFil
 }
 void GXLoadTexObj(GXTexObj* object, GXTexMapID id)
 {
-	// The first TEV texture is the closest useful approximation on the PSP's
-	// fixed-function single-texture stage.  Extra TEV maps are ignored for now.
-	if (!object || id != GX_TEXMAP0) return;
+	if (!object || (u32)id >= 8) return;
+	sState.textures[id] = {*reinterpret_cast<GXTexObjPriv*>(object), true};
+	// Convert additional samplers only when a supported material pass uses them.
+	if (id != GX_TEXMAP0) return;
 	PikminPsp::PerformanceScope timing(PikminPsp::PerformanceTexture);
 	GXTexObjPriv* source = reinterpret_cast<GXTexObjPriv*>(object);
 	u16 width = source->image0 >> 16;
@@ -2351,7 +2644,7 @@ void GXLoadTexObj(GXTexObj* object, GXTexMapID id)
 	sceGuTexMode(texture->nativeFormat, 0, 0,
 	             texture->nativeFormat == GU_PSM_4444 && textureSwizzled(texture->storageWidth, texture->storageHeight) ? GU_TRUE : GU_FALSE);
 	sceGuTexImage(0, texture->storageWidth, texture->storageHeight, texture->storageWidth, texture->pixels);
-	sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
+	setGuTextureFunction(GU_TFX_MODULATE, GU_TCC_RGBA);
 	int filter = source->mode1 ? GU_LINEAR : GU_NEAREST;
 	sceGuTexFilter(filter, filter);
 	u32 sWrap = (source->mode0 >> 16) & 0xffff;
@@ -2382,20 +2675,34 @@ void GXInitLightDir(GXLightObj* object, f32 x, f32 y, f32 z)
 	GXLightObjPriv* light = reinterpret_cast<GXLightObjPriv*>(object);
 	light->ldir[0] = x; light->ldir[1] = y; light->ldir[2] = z;
 }
-void GXInitSpecularDir(GXLightObj* object, f32 x, f32 y, f32 z) { GXInitLightDir(object, x, y, z); }
+void GXInitSpecularDir(GXLightObj* object, f32 x, f32 y, f32 z) {
+	if (!object) return;
+	auto* light=reinterpret_cast<GXLightObjPriv*>(object);
+	f32 hx=-x, hy=-y, hz=1-z, length=sqrtf(hx*hx+hy*hy+hz*hz);
+	light->ldir[0]=length>1e-8f?hx/length:0; light->ldir[1]=length>1e-8f?hy/length:0; light->ldir[2]=length>1e-8f?hz/length:1;
+	light->lpos[0]=-x*1048576.0f; light->lpos[1]=-y*1048576.0f; light->lpos[2]=-z*1048576.0f;
+}
 void GXInitLightColor(GXLightObj* object, GXColor colour)
 {
 	if (object) reinterpret_cast<GXLightObjPriv*>(object)->color = colour;
 }
-void GXLoadLightObjImm(GXLightObj*, GXLightID) { }
+void GXLoadLightObjImm(GXLightObj* object, GXLightID id) {
+	if (object && (u32(id)&GX_LIGHT7)) { sState.specularLight=*reinterpret_cast<GXLightObjPriv*>(object); sState.specularLightLoaded=true; }
+}
 void GXSetChanAmbColor(GXChannelID, GXColor colour) { sceGuAmbient(GU_RGBA(colour.r, colour.g, colour.b, colour.a)); }
-void GXSetChanMatColor(GXChannelID, GXColor colour) { sState.currentColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a); }
+void GXSetChanMatColor(GXChannelID channel, GXColor colour) {
+	if (channel==GX_COLOR1 || channel==GX_COLOR1A1) sState.specularMaterial=colour;
+	else if (channel==GX_ALPHA1) sState.specularMaterial.a=colour.a;
+	else sState.currentColour=GU_RGBA(colour.r,colour.g,colour.b,colour.a);
+}
 void GXSetNumChans(u8) { }
-void GXSetChanCtrl(GXChannelID, GXBool, GXColorSrc, GXColorSrc, u32, GXDiffuseFn, GXAttnFn) { }
+void GXSetChanCtrl(GXChannelID channel, GXBool enabled, GXColorSrc, GXColorSrc, u32 lights, GXDiffuseFn, GXAttnFn attenuation) {
+	if (channel==GX_COLOR1 || channel==GX_COLOR1A1) sState.specularEnabled=enabled && (lights&GX_LIGHT7) && attenuation==GX_AF_SPEC;
+}
 
 void GXBeginDisplayList(void*, u32) { }
 u32 GXEndDisplayList(void) { return 0; }
-void GXCallDisplayList(void* displayList, u32 byteCount)
+static void drawMaterialList(void* displayList, u32 byteCount)
 {
 	if (!displayList || byteCount == 0) return;
 	const u32 timingWeight = (sMeshTimingSequence++ % kMeshTimingInterval) == 0 ? kMeshTimingInterval : 0;
@@ -2446,6 +2753,66 @@ void GXCallDisplayList(void* displayList, u32 byteCount)
 			return;
 		}
 	}
+}
+
+void GXCallDisplayList(void* displayList, u32 byteCount)
+{
+	if (!displayList || !byteCount) return;
+	bool extraPass = false;
+	for (u32 i = 1; i < MIN(sState.tevStageCount, 16); ++i)
+		if (secondaryTexturePass(sState.stages[i]) || specularStage(sState.stages[i])) extraPass = true;
+	if (!extraPass) { drawMaterialList(displayList, byteCount); return; }
+
+	// Like the OOT PSP two-texture path, each pass has its own UV/color
+	// stream. Persistent geometry remains immutable while the GE consumes it.
+	const PspGxState saved = sState;
+	drawMaterialList(displayList, byteCount);
+	const GuRasterState baseRaster = sState.raster;
+	const u32 opacity = paletteMaterial() ? palettePrimaryColour() >> 24 : sState.currentColour >> 24;
+	for (u32 i = 1; i < MIN(saved.tevStageCount, 16); ++i) {
+		const auto& stage = saved.stages[i];
+		u8 pass = secondaryTexturePass(stage);
+		bool specular = specularStage(stage);
+		if (!pass && !specular) continue;
+		if (pass == MaterialMultiply && opacity != 255) continue;
+		if (specular) {
+			const auto& normal = sState.attributes[GX_VA_NRM];
+			const auto& nbt = sState.attributes[GX_VA_NBT];
+			if ((normal.source == GX_NONE || !normal.array || normal.componentType != GX_F32)
+			    && (nbt.source == GX_NONE || !nbt.array || nbt.componentType != GX_F32)) continue;
+			if (!bindSpecularLookup()) continue;
+			pass = MaterialAdd;
+			const GXColor& light = saved.specularLight.color;
+			const GXColor& material = saved.specularMaterial;
+			sState.materialPassColour = GU_RGBA(light.r*material.r/255, light.g*material.g/255, light.b*material.b/255, opacity);
+		} else {
+			memcpy(sState.textureMatrices, saved.textureMatrices, sizeof(saved.textureMatrices));
+			bindMaterialTexture(saved.textures[stage.texMap]);
+			if (sState.textureLoadFailed) continue;
+			const auto& gen = saved.texGens[stage.texCoord];
+			sState.texSource = gen.source; sState.texType = gen.type; sState.texMatrix = gen.matrix;
+			sState.materialTexCoord = stage.texCoord;
+			sState.normalTextureByPosition = gen.source == GX_TG_NRM && gen.matrix >= GX_TEXMTX0 && gen.matrix < GX_IDENTITY
+			    && sState.attributes[meshUvMatrixAttribute()].source == GX_NONE;
+			sState.materialPassColour = GU_RGBA(255,255,255,pass == MaterialMultiply ? 255 : opacity);
+		}
+		prepareMaterialOverlay(baseRaster, pass);
+		u32 draws = sDebugDrawCalls;
+		drawMaterialList(displayList, byteCount);
+		if (specular) sTimings.specularDraws += sDebugDrawCalls-draws;
+		else sTimings.secondaryTextureDraws += sDebugDrawCalls-draws;
+	}
+	// DGX can omit rebinding unchanged textures/materials on its next draw.
+	// Restore actual GE state as well as the GX shadow, including failed binds.
+	if (saved.textures[0].valid) bindMaterialTexture(saved.textures[0]);
+	else sBoundTexture = nullptr;
+	bool restoreFailed = saved.textureEnabled && saved.textures[0].valid && sState.textureLoadFailed;
+	restoreMaterialRaster(baseRaster);
+	GuRasterState actualRaster = sState.raster;
+	sState = saved;
+	sState.raster = actualRaster;
+	sState.guPositionMatrixValid = false;
+	if (restoreFailed) { sState.textureLoadFailed = true; sState.textureEnabled = false; }
 }
 
 } // extern "C"

@@ -49,6 +49,16 @@ struct MovieVertex { u16 u, v; s16 x, y, z; };
 std::vector<MovieVertex> sprites;
 const void* moviePixels;
 int movieFormat, movieStride, movieWrapU, movieWrapV, textureSwizzleMode;
+int textureFunction, textureComponents;
+u32 textureEnvironment;
+bool recordMaterials;
+struct MaterialDraw {
+	u8 pass;
+	GuRasterState raster;
+	const void* pixels;
+	int function, components;
+};
+std::vector<MaterialDraw> materialDraws;
 u32 pictureResidentCalls;
 u32 meshClockReads;
 bool recordingPresentation;
@@ -86,6 +96,7 @@ void resetDraws()
 	sState.guPositionMatrixValid = false;
 	triangles.clear();
 	sprites.clear();
+	materialDraws.clear();
 	modelMatrix = positionMatrix(sState.positionMatrices[sState.currentPositionMatrix]);
 }
 
@@ -848,6 +859,35 @@ void modelTest(const char* path)
 			GXAttr attr = (GXAttr)(GX_VA_TEX0 + chunk - 0x18);
 			GXSetArray(attr, coords.data(), 8);
 			GXSetVtxAttrFmt(GX_VTXFMT0, attr, GX_TEX_ST, GX_F32, 0);
+		} else if (chunk == 0x30 && strstr(path, "/objects/pellets/")) {
+			r.read32(); assert(r.read32() == 1); r.align();
+			// Replay the authored TEV register values and stage recipes rather
+			// than assuming an ordinary modulate material for pellet geometry.
+			for (u32 reg = 0; reg < 3; ++reg) {
+				GXColorS10 colour;
+				colour.r = r.read16(); colour.g = r.read16(); colour.b = r.read16(); colour.a = r.read16();
+				GXSetTevColorS10(GXTevRegID(GX_TEVREG0 + reg), colour);
+				r.read32(); r.read32();
+				u32 keys = r.read32(); r.pos += keys * 40;
+				keys = r.read32(); r.pos += keys * 16;
+			}
+			for (u32 konst = 0; konst < 4; ++konst) {
+				GXColor colour = {r.data[r.pos],r.data[r.pos+1],r.data[r.pos+2],r.data[r.pos+3]}; r.pos += 4;
+				GXSetTevKColor(GXTevKColorID(konst), colour);
+			}
+			u32 stages = r.read32(); assert(stages == 4);
+			for (u32 stage = 0; stage < stages; ++stage) {
+				const u8* values = r.data.data()+r.pos; assert(r.pos+32 <= next); r.pos += 32;
+				GXSetTevColorIn(GXTevStageID(stage),GXTevColorArg(values[8]),GXTevColorArg(values[9]),GXTevColorArg(values[10]),GXTevColorArg(values[11]));
+				GXSetTevColorOp(GXTevStageID(stage),GXTevOp(values[12]),GXTevBias(values[13]),GXTevScale(values[14]),GXBool(values[15]),GXTevRegID(values[16]));
+				GXSetTevAlphaIn(GXTevStageID(stage),GXTevAlphaArg(values[20]),GXTevAlphaArg(values[21]),GXTevAlphaArg(values[22]),GXTevAlphaArg(values[23]));
+				GXSetTevAlphaOp(GXTevStageID(stage),GXTevOp(values[24]),GXTevBias(values[25]),GXTevScale(values[26]),GXBool(values[27]),GXTevRegID(values[28]));
+				GXSetTevKAlphaSel(GXTevStageID(stage),GXTevKAlphaSel(values[5]));
+			}
+			GXSetNumTevStages(stages); assert(paletteMaterial());
+			GXSetTexCoordGen2(GX_TEXCOORD0,GX_TG_MTX3X4,GX_TG_TEX0,GX_IDENTITY,GX_FALSE,GX_PTIDENTITY);
+			sState.textureEnabled = true;
+			assert(palettePrimaryColour() == GU_RGBA(0,51,255,200));
 		} else if (chunk == 0x50) {
 			u32 meshes = r.read32(); r.align();
 			for (u32 m = 0; m < meshes; ++m) {
@@ -968,18 +1008,21 @@ void sceGuTexImage(int level, int width, int height, int stride, const void* pix
 	else assert((movieFormat == GU_PSM_4444 || movieFormat == GU_PSM_DXT1) && width <= 512 && height <= 512);
 	movieStride = stride; moviePixels = pixels;
 }
-void sceGuTexFunc(int, int) {}
+void sceGuTexFunc(int function, int components) { textureFunction = function; textureComponents = components; }
+void sceGuTexEnvColor(unsigned int colour) { textureEnvironment = colour; }
 void sceGuTexFilter(int, int) {}
 void sceGuTexWrap(int u, int v) { movieWrapU = u; movieWrapV = v; }
 void sceGuTexScale(float, float) {}
 void sceGuTexOffset(float, float) {}
 void sceGuTexFlush() {}
+void sceGuFog(float, float, unsigned int) {}
 void OSReport(const char*, ...) {}
 void sceGuSetMatrix(int type, const ScePspFMatrix4* matrix) { if (type == GU_MODEL) { modelMatrix = *matrix; ++modelMatrixUploads; } }
 void sceGuBoneMatrix(unsigned int index, const ScePspFMatrix4* matrix) { assert(index < 8); bones[index] = *matrix; }
 void sceGuDrawArray(int primitive, int format, int count, const void* indexData, const void* vertexData)
 {
 	++drawCalls;
+	if (recordMaterials) materialDraws.push_back({sState.materialPass,sState.raster,moviePixels,textureFunction,textureComponents});
 	if (recordingTextureReads && sState.textureEnabled && sBoundTexture) {
 		const auto* begin = reinterpret_cast<const u8*>(sBoundTexture->pixels);
 		queuedTextureReads.push_back({begin, std::vector<u8>(begin, begin + sBoundTexture->byteCount)});
@@ -1136,6 +1179,337 @@ void titleMenuPictureAlpha()
 	assert(pictureResidentCalls == 255 && drawCalls == 0);
 	releaseTexture(*converted);
 	puts("Title menu picture transparency, all fade levels and opaque restoration checks passed");
+}
+
+void pelletPaletteMaterial()
+{
+	clearMeshCache(); resetState(); resetDraws();
+	// Exact stage recipes extracted from all four numbered pellet models.
+	GXSetNumTevStages(4);
+	GXSetTevColorIn(GX_TEVSTAGE0, GX_CC_C0, GX_CC_ZERO, GX_CC_TEXC, GX_CC_TEXC);
+	GXSetTevColorIn(GX_TEVSTAGE1, GX_CC_CPREV, GX_CC_TEXC, GX_CC_TEXA, GX_CC_ZERO);
+	GXSetTevColorIn(GX_TEVSTAGE2, GX_CC_ZERO, GX_CC_RASC, GX_CC_CPREV, GX_CC_TEXC);
+	GXSetTevColorIn(GX_TEVSTAGE3, GX_CC_ZERO, GX_CC_RASC, GX_CC_CPREV, GX_CC_ZERO);
+	for (GXTevStageID stage : {GX_TEVSTAGE0,GX_TEVSTAGE1,GX_TEVSTAGE2})
+		GXSetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO);
+	GXSetTevAlphaIn(GX_TEVSTAGE3, GX_CA_ZERO, GX_CA_A0, GX_CA_KONST, GX_CA_ZERO);
+	GXSetTevAlphaOp(GX_TEVSTAGE3, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_FALSE, GX_TEVPREV);
+	GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GXSetTevKColor(GX_KCOLOR0, (GXColor){255,255,255,255});
+	GXSetTevKAlphaSel(GX_TEVSTAGE3, GX_TEV_KASEL_K0_A);
+	GXSetChanMatColor(GX_COLOR0A0, (GXColor){255,255,255,19}); // Lighting alpha must not replace A0.
+	sState.textureEnabled = true;
+	f32 positions[][3] = {{0,0,0},{1,0,0},{1,1,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, 12);
+	u8 list[] = {GX_QUADS,0,4,0,1,2,3};
+	const GXColorS10 colours[] = {{255,51,0,200},{255,220,0,200},{0,51,255,200}};
+	u64 decoded = sTimings.decodedVertices;
+	for (u32 frame = 0; frame < 12; ++frame) for (const auto& colour : colours) {
+		meshCacheGpuIdle(); GXSetTevColorS10(GX_TEVREG0, colour);
+		compareList(list, sizeof(list));
+		assert(textureFunction == GU_TFX_BLEND && textureComponents == GU_TCC_RGB && textureEnvironment == 0x00ffffff);
+		for (const auto& vertex : triangles) assert(vertex.colour == GU_RGBA(colour.r,colour.g,colour.b,200));
+		// Native blend semantics: the full intensity ramp changes RGB, while
+		// even fully black/transparent mask texels retain register opacity.
+		for (u32 intensity = 0; intensity < 256; ++intensity) {
+			u32 mask = GU_RGBA(intensity,intensity,intensity,intensity);
+			u32 primary = triangles[0].colour;
+			u32 alpha = textureComponents == GU_TCC_RGB ? primary >> 24 : (primary>>24) * (mask>>24) / 255;
+			assert(alpha == 200);
+			const s16 channels[] = {colour.r,colour.g,colour.b};
+			for (u32 c = 0; c < 3; ++c) {
+				u32 value = ((primary>>(c*8))&255) * (255-((mask>>(c*8))&255));
+				value += ((textureEnvironment>>(c*8))&255) * ((mask>>(c*8))&255);
+				assert(value/255 == u32(channels[c]) + (255-channels[c])*intensity/255);
+			}
+		}
+	}
+	assert(sTimings.decodedVertices == decoded + 12); // Three cached color variants, no repeated conversion.
+	GXSetTevKColor(GX_KCOLOR0, (GXColor){255,255,255,128});
+	compareList(list, sizeof(list));
+	for (const auto& vertex : triangles) assert(vertex.colour >> 24 == 200*128/255);
+	GXSetTevKAlphaSel(GX_TEVSTAGE3, GX_TEV_KASEL_1_2);
+	compareList(list, sizeof(list));
+	for (const auto& vertex : triangles) assert(vertex.colour >> 24 == 200*128/255);
+	GXSetTevAlphaOp(GX_TEVSTAGE3, GX_TEV_SUB, GX_TB_ZERO, GX_CS_SCALE_1, GX_FALSE, GX_TEVPREV);
+	assert(!paletteMaterial()); // A different final alpha equation cannot use this approximation.
+	GXSetTevAlphaOp(GX_TEVSTAGE3, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_FALSE, GX_TEVPREV);
+	GXSetNumTevStages(3); assert(!paletteMaterial());
+	GXSetNumTevStages(4); assert(paletteMaterial());
+	// Switching to ordinary particles/HUD must restore texture alpha.
+	GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE); GXSetNumTevStages(1);
+	compareList(list, sizeof(list));
+	assert(!paletteMaterial() && textureFunction == GU_TFX_MODULATE && textureComponents == GU_TCC_RGBA);
+	clearMeshCache();
+	puts("Pellet palettes: red/yellow/blue RGB ramps retain register alpha; cached colors, konst alpha and particle/HUD restoration passed");
+}
+
+void nativeMaterialPasses()
+{
+	clearMeshCache(); resetState(); resetDraws();
+	meshCacheGpuIdle(); for (auto& texture : sTextureCache) releaseTexture(texture);
+	GXTexObjPriv objects[3] = {};
+	u8 pixels[3][64];
+	for (u32 i = 0; i < 3; ++i) {
+		memset(pixels[i], 85+i*68, 64);
+		GXInitTexObj(reinterpret_cast<GXTexObj*>(&objects[i]),pixels[i],8,8,GX_TF_I8,GX_CLAMP,GX_CLAMP,GX_FALSE);
+		auto* converted = convertTexture(pixels[i],8,8,GX_TF_I8); assert(converted);
+		converted->source = reinterpret_cast<void*>(uintptr_t(objects[i].image3));
+		GXLoadTexObj(reinterpret_cast<GXTexObj*>(&objects[i]),GXTexMapID(i));
+	}
+	GXSetNumTexGens(3); GXSetNumTevStages(3);
+	GXSetTevOp(GX_TEVSTAGE0,GX_MODULATE);
+	GXSetTevOrder(GX_TEVSTAGE0,GX_TEXCOORD0,GX_TEXMAP0,GX_COLOR0A0);
+	GXSetTevOp(GX_TEVSTAGE1,GX_DECAL);
+	GXSetTevOrder(GX_TEVSTAGE1,GX_TEXCOORD1,GX_TEXMAP1,GX_COLOR0A0);
+	GXSetTevColorIn(GX_TEVSTAGE2,GX_CC_ZERO,GX_CC_ONE,GX_CC_CPREV,GX_CC_TEXC);
+	GXSetTevColorOp(GX_TEVSTAGE2,GX_TEV_ADD,GX_TB_ZERO,GX_CS_SCALE_1,GX_TRUE,GX_TEVPREV);
+	GXSetTevOrder(GX_TEVSTAGE2,GX_TEXCOORD2,GX_TEXMAP2,GX_COLOR0A0);
+	GXSetTexCoordGen2(GX_TEXCOORD0,GX_TG_MTX2X4,GX_TG_TEX0,GX_TEXMTX0,GX_FALSE,GX_PTIDENTITY);
+	GXSetTexCoordGen2(GX_TEXCOORD1,GX_TG_MTX2X4,GX_TG_TEX1,GX_TEXMTX1,GX_FALSE,GX_PTIDENTITY);
+	GXSetTexCoordGen2(GX_TEXCOORD2,GX_TG_MTX2X4,GX_TG_NRM,GX_TEXMTX2,GX_FALSE,GX_PTIDENTITY);
+	Mtx uvMatrix = {{2,0,0,0.1f},{0,3,0,0.2f},{0,0,0,1}};
+	Mtx secondMatrix = {{0.5f,0,0,0.25f},{0,0.5f,0,0.1f},{0,0,0,1}};
+	Mtx normalMatrix = {{0.5f,0,0,0.5f},{0,0.5f,0,0.5f},{0,0,0,1}};
+	GXLoadTexMtxImm(uvMatrix,GX_TEXMTX0,GX_MTX2x4);
+	GXLoadTexMtxImm(secondMatrix,GX_TEXMTX1,GX_MTX2x4);
+	GXLoadTexMtxImm(normalMatrix,GX_TEXMTX2,GX_MTX2x4);
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	f32 normals[][3] = {{0,0,1},{1,0,0},{0,1,0}};
+	f32 uv0[][2] = {{0,0},{1,0},{0,1}}, uv1[][2] = {{0.4f,0.2f},{0.8f,0.2f},{0.4f,0.6f}};
+	GXSetVtxDesc(GX_VA_TEX1MTXIDX,GX_DIRECT);
+	for (GXAttr attr : {GX_VA_POS,GX_VA_NRM,GX_VA_TEX0,GX_VA_TEX1}) GXSetVtxDesc(attr,GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0,GX_VA_POS,GX_POS_XYZ,GX_F32,0);
+	GXSetVtxAttrFmt(GX_VTXFMT0,GX_VA_NRM,GX_NRM_XYZ,GX_F32,0);
+	GXSetVtxAttrFmt(GX_VTXFMT0,GX_VA_TEX0,GX_TEX_ST,GX_F32,0);
+	GXSetVtxAttrFmt(GX_VTXFMT0,GX_VA_TEX1,GX_TEX_ST,GX_F32,0);
+	GXSetArray(GX_VA_POS,positions,12); GXSetArray(GX_VA_NRM,normals,12);
+	GXSetArray(GX_VA_TEX0,uv0,8); GXSetArray(GX_VA_TEX1,uv1,8);
+	u8 list[] = {GX_TRIANGLES,0,3, GX_TEXMTX1,0,0,0,0, GX_TEXMTX1,1,1,1,1, GX_TEXMTX1,2,2,2,2};
+	GXSetChanMatColor(GX_COLOR0A0,(GXColor){200,100,50,255});
+	GXSetZMode(GX_TRUE,GX_LEQUAL,GX_TRUE);
+	GXSetBlendMode(GX_BM_NONE,GX_BL_ONE,GX_BL_ZERO,GX_LO_COPY);
+	GXSetAlphaCompare(GX_GEQUAL,128,GX_AOP_AND,GX_LEQUAL,255);
+	GXSetFog(GX_FOG_LINEAR,0,100,1,1000,(GXColor){1,2,3,255});
+	GXSetColorUpdate(GX_TRUE);
+	auto* originalTexture = sBoundTexture;
+	recordMaterials = true; recordingTextureReads = true;
+	u64 decoded = sTimings.decodedVertices;
+	GXCallDisplayList(list,sizeof(list));
+	assert(drawCalls == 3 && triangles.size() == 9 && materialDraws.size() == 3);
+	assert(sTimings.decodedVertices == decoded+9);
+	assert(materialDraws[0].pixels == originalTexture->pixels);
+	assert(materialDraws[0].pass == 0 && materialDraws[1].pass == MaterialAlpha && materialDraws[2].pass == MaterialAdd);
+	assert(materialDraws[1].components == GU_TCC_RGBA && materialDraws[2].components == GU_TCC_RGB);
+	for (u32 i = 0; i < 3; ++i) {
+		assert(triangles[i].u == uv0[i][0]*2+0.1f && triangles[i].v == uv0[i][1]*3+0.2f);
+		assert(triangles[3+i].u == uv1[i][0]*0.5f+0.25f && triangles[3+i].v == uv1[i][1]*0.5f+0.1f);
+		assert(triangles[6+i].u == normals[i][0]*0.5f+0.5f && triangles[6+i].v == normals[i][1]*0.5f+0.5f);
+		for (u32 pass : {3U,6U}) {
+			assert(triangles[i].x == triangles[pass+i].x && triangles[i].y == triangles[pass+i].y && triangles[i].z == triangles[pass+i].z);
+		}
+	}
+	for (u32 pass : {1U,2U}) {
+		const auto& raster = materialDraws[pass].raster;
+		assert(raster.depthMask[0] == GU_TRUE && raster.depthFunction[0] == GU_EQUAL);
+		assert(!(raster.enables & ((1U<<GU_FOG)|(1U<<GU_ALPHA_TEST))));
+		assert(raster.pixelMask[0] == 0xff000000);
+	}
+	assert(sBoundTexture == originalTexture && sState.materialPass == 0 && sState.materialTexCoord == 0);
+	assert(sState.texSource == GX_TG_TEX0 && sState.texMatrix == GX_TEXMTX0);
+	assert(guDepthMask == GU_FALSE && guDepthFunction == guDepthCompare(GX_LEQUAL));
+	assert(!guEnabled[GU_BLEND] && guEnabled[GU_FOG] && guEnabled[GU_ALPHA_TEST] && guPixelMask == 0);
+	assert(textureFunction == GU_TFX_MODULATE && textureComponents == GU_TCC_RGBA);
+	// All three cached streams retain geometry; only animated UVs refresh.
+	decoded = sTimings.decodedVertices;
+	for (u32 frame = 0; frame < 8; ++frame) {
+		resetDraws(); secondMatrix[0][3] += 0.03125f;
+		GXLoadTexMtxImm(secondMatrix,GX_TEXMTX1,GX_MTX2x4);
+		GXCallDisplayList(list,sizeof(list));
+		assert(drawCalls == 3 && triangles[3].u == uv1[0][0]*0.5f+secondMatrix[0][3]);
+		assert(sTimings.decodedVertices == decoded);
+	}
+	recordingTextureReads = false; sceGuSync(GU_SYNC_FINISH,GU_SYNC_WHAT_DONE);
+	// Transparent geometry must retain its comparison and disable depth writes.
+	GXSetZMode(GX_TRUE,GX_LEQUAL,GX_FALSE);
+	GXSetChanMatColor(GX_COLOR0A0,(GXColor){200,100,50,128});
+	resetDraws(); GXCallDisplayList(list,sizeof(list));
+	assert(materialDraws[1].raster.depthFunction[0] == u32(guDepthCompare(GX_LEQUAL)));
+	assert(triangles[3].colour >> 24 == 128 && triangles[6].colour >> 24 == 128);
+	// Unsupported operators and output registers cannot trigger extra draws.
+	GXSetTevColorOp(GX_TEVSTAGE1,GX_TEV_SUB,GX_TB_ZERO,GX_CS_SCALE_1,GX_TRUE,GX_TEVPREV);
+	GXSetTevColorOp(GX_TEVSTAGE2,GX_TEV_ADD,GX_TB_ZERO,GX_CS_SCALE_1,GX_TRUE,GX_TEVREG1);
+	resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 1);
+	GXSetTevOp(GX_TEVSTAGE1,GX_BLEND);
+	GXSetNumTevStages(2); assert(secondaryTexturePass(sState.stages[1]) == MaterialWhiten);
+	resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 2);
+	GXSetNumTevStages(1); resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 1);
+	recordMaterials = false; clearMeshCache();
+	meshCacheGpuIdle(); for (auto& texture : sTextureCache) releaseTexture(texture);
+	puts("Native material passes: independent UV/matrix/normal streams, alpha/add/whiten blends, cached animation, queued texture lifetime and render-state restoration passed");
+}
+
+void nativeSpecularPass()
+{
+	clearMeshCache(); resetState(); resetDraws();
+	memset(sSpecularLookups,0,sizeof(sSpecularLookups));
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	f32 normals[][3] = {{0,0,1},{1,0,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_PNMTXIDX,GX_DIRECT);
+	GXSetVtxDesc(GX_VA_POS,GX_INDEX8); GXSetVtxDesc(GX_VA_NRM,GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0,GX_VA_POS,GX_POS_XYZ,GX_F32,0);
+	GXSetVtxAttrFmt(GX_VTXFMT0,GX_VA_NRM,GX_NRM_XYZ,GX_F32,0);
+	GXSetArray(GX_VA_POS,positions,12); GXSetArray(GX_VA_NRM,normals,12);
+	u8 list[] = {GX_TRIANGLES,0,3, 0,0,0, 3,1,1, 0,2,2};
+	Mtx identity = {{1,0,0,0},{0,1,0,0},{0,0,1,0}};
+	GXLoadNrmMtxImm(identity,GX_PNMTX0); GXLoadNrmMtxImm(identity,GX_PNMTX1);
+	GXSetNumTexGens(0); GXSetNumTevStages(2);
+	GXSetTevColorIn(GX_TEVSTAGE0,GX_CC_ZERO,GX_CC_C0,GX_CC_RASC,GX_CC_ZERO);
+	GXSetTevColorOp(GX_TEVSTAGE0,GX_TEV_ADD,GX_TB_ZERO,GX_CS_SCALE_1,GX_TRUE,GX_TEVPREV);
+	GXSetTevColorS10(GX_TEVREG0,(GXColorS10){50,100,200,255});
+	GXSetTevColorIn(GX_TEVSTAGE1,GX_CC_ZERO,GX_CC_CPREV,GX_CC_ONE,GX_CC_RASC);
+	GXSetTevColorOp(GX_TEVSTAGE1,GX_TEV_ADD,GX_TB_ZERO,GX_CS_SCALE_1,GX_TRUE,GX_TEVPREV);
+	GXSetTevOrder(GX_TEVSTAGE1,GX_TEXCOORD_NULL,GX_TEXMAP_NULL,GX_COLOR1A1);
+	GXSetChanCtrl(GX_COLOR1,GX_TRUE,GX_SRC_REG,GX_SRC_REG,GX_LIGHT7,GX_DF_NONE,GX_AF_SPEC);
+	GXSetChanMatColor(GX_COLOR1A1,(GXColor){128,255,255,255});
+	GXSetChanMatColor(GX_COLOR0A0,(GXColor){255,255,255,255});
+	GXLightObj light = {};
+	GXInitSpecularDir(&light,0,0,-1);
+	GXInitLightAttn(&light,0,0,1,0.25f,0,0.75f);
+	GXInitLightColor(&light,(GXColor){200,100,50,255}); GXLoadLightObjImm(&light,GX_LIGHT7);
+	GXSetZMode(GX_TRUE,GX_LEQUAL,GX_TRUE); GXSetBlendMode(GX_BM_NONE,GX_BL_ONE,GX_BL_ZERO,GX_LO_COPY);
+	GXSetAlphaCompare(GX_ALWAYS,0,GX_AOP_AND,GX_ALWAYS,0); GXSetFog(GX_FOG_NONE,0,0,0,0,(GXColor){}); GXSetColorUpdate(GX_TRUE);
+	recordMaterials = true;
+	GXCallDisplayList(list,sizeof(list));
+	assert(drawCalls == 2 && triangles.size() == 6);
+	assert(triangles[0].colour == GU_RGBA(50,100,200,255));
+	assert(triangles[3].colour == GU_RGBA(200*128/255,100,50,255));
+	assert(triangles[3].u == 1 && triangles[4].u == 0.5f && triangles[5].u == 0.5f);
+	assert(!sState.textureEnabled && !sState.normalTextureByPosition && !guEnabled[GU_TEXTURE_2D]);
+	const auto* lookup = static_cast<const u16*>(materialDraws[1].pixels);
+	assert(lookup[texturePixelOffset(0,0,256,8)] == 0xf000);
+	assert((lookup[texturePixelOffset(255,0,256,8)] & 0xfff) == 0xfff);
+	std::vector<u16> queued(lookup,lookup+256*8);
+	u64 decoded = sTimings.decodedVertices;
+	identity[0][0] = 0; identity[0][2] = 1; identity[2][0] = -1; identity[2][2] = 0;
+	GXLoadNrmMtxImm(identity,GX_PNMTX0);
+	resetDraws(); GXCallDisplayList(list,sizeof(list));
+	assert(drawCalls == 2 && sTimings.decodedVertices == decoded && triangles[3].u == 0.5f && triangles[5].u == 0.5f);
+	assert(!memcmp(lookup,queued.data(),sizeof(u16)*256*8));
+	GXSetChanCtrl(GX_COLOR1A1,GX_FALSE,GX_SRC_REG,GX_SRC_REG,0,GX_DF_NONE,GX_AF_NONE);
+	resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 1);
+	// Curve changes use new buffers while previous draws remain queued.
+	for (u32 i = 1; i < 8; ++i) { sState.specularLight.k[0] = i; assert(bindSpecularLookup()); }
+	sState.specularLight.k[0] = 20; assert(!bindSpecularLookup());
+	assert(!memcmp(lookup,queued.data(),sizeof(u16)*256*8));
+	meshCacheGpuIdle(); assert(bindSpecularLookup());
+	recordMaterials = false; clearMeshCache();
+	puts("Native specular: authored channel-1 addition, normal/bone animation, tint/opacity, cached UV refresh and pinned attenuation curves passed");
+}
+
+void pelletTextureLayers(const char* path)
+{
+	// Replay retail sampler bindings too: their order differs from the image
+	// chunk (sphere, number decal, then normal-generated reflection).
+	Reader r; std::ifstream file(path,std::ios::binary); assert(file.good());
+	r.data.assign(std::istreambuf_iterator<char>(file),std::istreambuf_iterator<char>());
+	struct Image { const u8* data; u16 width,height; GXTexFmt format; };
+	std::vector<Image> images;
+	std::vector<u16> attributes;
+	std::vector<MaterialStage> stages;
+	std::vector<MaterialTexGen> gens;
+	std::vector<u32> bindings;
+	const GXTexFmt formats[] = {GX_TF_RGB565,GX_TF_CMPR,GX_TF_RGB5A3,GX_TF_I4,GX_TF_I8,GX_TF_IA4,GX_TF_IA8,GX_TF_RGBA8};
+	while (r.pos+8 <= r.data.size()) {
+		u32 chunk = r.read32(), bytes = r.read32(), next = r.pos+bytes;
+		if (chunk == 0xffff) break;
+		if (chunk == 0x20) {
+			u32 count = r.read32(); r.align();
+			for (u32 i = 0; i < count; ++i) {
+				u16 width = r.read16(),height = r.read16(); u32 format = r.read32();
+				for (u32 j = 0; j < 5; ++j) r.read32();
+				u32 size = r.read32(); assert(format < ARRAY_SIZE(formats) && r.pos+size <= next);
+				images.push_back({r.data.data()+r.pos,width,height,formats[format]}); r.pos += size;
+			}
+		} else if (chunk == 0x22) {
+			u32 count = r.read32(); r.align();
+			for (u32 i = 0; i < count; ++i) { attributes.push_back(r.read16()); r.pos += 10; }
+		} else if (chunk == 0x30) {
+			r.read32(); assert(r.read32() == 1); r.align();
+			for (u32 reg = 0; reg < 3; ++reg) {
+				r.pos += 16; u32 keys = r.read32(); r.pos += keys*40; keys = r.read32(); r.pos += keys*16;
+			}
+			r.pos += 16; u32 count = r.read32(); assert(count == 4);
+			for (u32 i = 0; i < count; ++i) {
+				const u8* v = r.data.data()+r.pos; r.pos += 32;
+				MaterialStage stage = {};
+				memcpy(stage.colour,v+8,4); stage.op=v[12]; stage.bias=v[13]; stage.scale=v[14]; stage.output=v[16];
+				stage.texCoord=v[0]; stage.texMap=v[1]; stage.channel=v[2]; stage.ordered=true; stages.push_back(stage);
+			}
+			assert(r.read32() & MATFLAG_PVW); r.pos += 12; // Texture index, RGBA, TEV index.
+			r.pos += 12; u32 keys = r.read32(); r.pos += keys*40; keys = r.read32(); r.pos += keys*16;
+			r.pos += 24; // Lighting and PE state.
+			r.pos += 16; count = r.read32(); u32 matrix = GX_TEXMTX0;
+			for (u32 i = 0; i < count; ++i) {
+				const u8* v = r.data.data()+r.pos; r.pos += 4;
+				assert(v[0] == i); gens.push_back({GXTexGenType(v[1]),GXTexGenSrc(v[2]),v[3] == 10 ? u32(GX_IDENTITY) : matrix});
+				matrix += 3;
+			}
+			count = r.read32();
+			for (u32 i = 0; i < count; ++i) {
+				bindings.push_back(r.read32()); r.pos += 48;
+				for (u32 anim = 0; anim < 3; ++anim) { keys = r.read32(); r.pos += keys*16; }
+			}
+		}
+		r.pos = next;
+	}
+	assert(images.size() == 3 && bindings.size() == 3 && gens.size() == 3 && stages.size() == 4);
+	assert(attributes[bindings[0]] == 1 && attributes[bindings[1]] == 2 && attributes[bindings[2]] == 0);
+	const auto& draws = recordedModels.back().draws;
+	clearMeshCache(); meshCacheGpuIdle(); for (auto& texture : sTextureCache) releaseTexture(texture);
+	MaterialTexture samplers[3];
+	for (u32 i = 0; i < 3; ++i) {
+		const auto& image = images[attributes[bindings[i]]];
+		GXTexObjPriv object = {};
+		GXInitTexObj(reinterpret_cast<GXTexObj*>(&object),const_cast<u8*>(image.data),image.width,image.height,image.format,GX_REPEAT,GX_REPEAT,GX_FALSE);
+		GXInitTexObjLOD(reinterpret_cast<GXTexObj*>(&object),GX_LINEAR,GX_LINEAR,0,0,0,GX_FALSE,GX_FALSE,GX_ANISO_1);
+		auto* converted = convertTexture(image.data,image.width,image.height,image.format); assert(converted);
+		converted->source = reinterpret_cast<void*>(uintptr_t(object.image3));
+		samplers[i] = {object,true};
+	}
+	u64 decoded = 0, misses = sTimings.textureMisses;
+	const GXColorS10 colours[] = {{255,51,0,200},{255,220,0,200},{0,51,255,200}};
+	recordMaterials = true; recordingTextureReads = true;
+	for (u32 frame = 0; frame < 4; ++frame) {
+		meshCacheGpuIdle();
+		for (const auto& draw : draws) for (const auto& colour : colours) {
+			sState = draw.state;
+			for (u32 i = 0; i < 4; ++i) sState.stages[i] = stages[i];
+			for (u32 i = 0; i < 3; ++i) { sState.texGens[i] = gens[i]; sState.textures[i] = samplers[i]; }
+			sState.texSource=gens[0].source; sState.texType=gens[0].type; sState.texMatrix=gens[0].matrix;
+			Mtx identity = {{1,0,0,0},{0,1,0,0},{0,0,0,1}};
+			Mtx reflection = {{0.5f,0,0,0.5f},{0,0.5f,0,0.5f},{0,0,0,1}};
+			GXLoadTexMtxImm(identity,GX_TEXMTX0,GX_MTX2x4);
+			for (u32 i = 2; i < 10; ++i) GXLoadTexMtxImm(reflection,GX_TEXMTX0+i*3,GX_MTX2x4);
+			GXSetTevColorS10(GX_TEVREG0,colour);
+			GXSetChanMatColor(GX_COLOR0A0,(GXColor){255,255,255,255});
+			GXSetZMode(GX_TRUE,GX_LEQUAL,GX_FALSE); GXSetBlendMode(GX_BM_BLEND,GX_BL_SRCALPHA,GX_BL_INVSRCALPHA,GX_LO_COPY);
+			GXSetAlphaCompare(GX_ALWAYS,0,GX_AOP_AND,GX_ALWAYS,0); GXSetFog(GX_FOG_NONE,0,0,0,0,(GXColor){}); GXSetColorUpdate(GX_TRUE);
+			bindMaterialTexture(samplers[0]); resetDraws(); GXCallDisplayList(const_cast<u8*>(draw.list),draw.bytes);
+			assert(drawCalls == 3 && materialDraws.size() == 3);
+			assert(materialDraws[0].function == GU_TFX_BLEND && materialDraws[0].components == GU_TCC_RGB);
+			assert(materialDraws[1].pass == MaterialAlpha && materialDraws[2].pass == MaterialAdd);
+			assert(materialDraws[0].pixels != materialDraws[1].pixels && materialDraws[1].pixels != materialDraws[2].pixels);
+			assert(sState.materialPass == 0 && sState.texSource == gens[0].source);
+		}
+		if (!frame) decoded = sTimings.decodedVertices;
+		else assert(sTimings.decodedVertices == decoded && sTimings.textureMisses == misses);
+	}
+	sceGuSync(GU_SYNC_FINISH,GU_SYNC_WHAT_DONE); recordingTextureReads = recordMaterials = false;
+	printf("%s: authored sphere/decal/reflection samplers, all 3 colors; steady multipass frames have zero geometry rebuilds/texture misses\n",path);
+	clearMeshCache(); meshCacheGpuIdle(); for (auto& texture : sTextureCache) releaseTexture(texture);
 }
 
 void particleColours()
@@ -2046,13 +2420,19 @@ int main(int argc, char** argv)
 	animatedTexCoordMeshes();
 	movieFrame();
 	particleColours();
+	pelletPaletteMaterial();
+	nativeMaterialPasses();
+	nativeSpecularPass();
 	for (int i = 1; i < argc; ++i) {
 		if (strcmp(argv[i], "--texture-model") == 0) {
 			assert(i+1 < argc); textureModelReplay(argv[++i]); continue;
 		}
 		const char* extension = strrchr(argv[i], '.');
 		if (extension && strcmp(extension, ".bti") == 0) textureAssetTest(argv[i]);
-		else modelTest(argv[i]);
+		else {
+			modelTest(argv[i]);
+			if (strstr(argv[i],"/objects/pellets/")) pelletTextureLayers(argv[i]);
+		}
 	}
 	if (recordedModels.size() >= 2) {
 		std::vector<ModelDraw> combined = recordedModels[0].draws;

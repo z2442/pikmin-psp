@@ -924,3 +924,35 @@ To repeat the map test, add `--texture-model path/to/map.mod` to
 `python3 tools/check_psp_gx.py`; ordinary `.mod` and `.bti` arguments still
 exercise geometry and transparency. Verify the rebuilt EBOOT's wake-up fade
 on PSP with the new performance capture.
+
+### Pellet material color and opacity
+
+All four numbered pellet models use a four-stage material whose base RGB is
+`C0 * (1 - TEXC) + TEXC`. Its final alpha comes from `A0 * KONST`, independently
+of the grayscale mask's intensity. Applying the ordinary texture-modulate path
+instead displayed the mask's gray RGB and multiplied opacity by its intensity,
+making dark parts incorrectly transparent after the intensity-alpha fix.
+
+The PSP backend recognizes this recipe and uses `GU_TFX_BLEND` with a white
+texture environment and the animated REG0 color as the vertex color.
+`GU_TCC_RGB` keeps texture intensity out of alpha; vertex alpha carries the
+register/selected konst result. This mapping follows the native blend formula
+in [PPSSPP's fragment generator](https://github.com/hrydgard/ppsspp/blob/master/GPU/Common/FragmentShaderGenerator.cpp).
+The authored REG0 alpha is retained (200 in the initial pellet materials),
+including fades and konst changes. The remaining reflection/highlight stages
+continue to use the backend's existing single-texture approximation.
+
+Cached mesh keys include the effective palette color/alpha, preserving separate
+red, yellow and blue variants without rebuilding every frame. Texture function
+and environment changes use the GU state shadow; ordinary particles/HUD draws
+restore texture alpha. Texture storage, native compression and residency rules
+are unchanged by this material mapping. Pellet Posy materials with the same
+recipe also receive the matching color/alpha treatment.
+
+Renderer checks replay the authored register values and stage recipes from
+`white1.mod` through `white4.mod`, compare their immediate/cached geometry, and
+test the full grayscale ramp across all three pellet colors. They verify
+opacity at zero intensity, animated cached colors, konst alpha/fractions,
+unsupported final alpha equations and restoration of the ordinary texture path.
+Native/LTO sanitizer checks and the PSP game build pass; verify pellet color
+and opacity with the rebuilt EBOOT on hardware.
