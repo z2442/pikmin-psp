@@ -133,6 +133,7 @@ struct FrameTimings {
 	u64 meshTimingSamples;
 	u64 modelMatrixUploads;
 	u64 decodedVertices, skinnedVertices, fallbackLists, textureMisses, meshCacheHits, cachedVertices, meshCacheValidation, arrayValidation;
+	u64 weldedVerticesSaved;
 	u64 meshMissAbsent, meshMissState, meshMissSource, meshStoreFailures, meshEvictions;
 	u64 texCoordRefreshes, texCoordRefreshVertices;
 	u64 meshKeyBuilds;
@@ -234,6 +235,7 @@ void recordFrameTimings()
 				fputs("audio_sequence_ms, audio_channels_ms, audio_stream_ms, audio_mix_ms and audio_movie_ms are estimates: one rotating tick per eight is timed. Audio work/lock/ME-wait and thread CPU times remain exact.\n", file);
 				fputs("Presentation: triple-buffered 480x272 RGBA8888; GPU completion before pacing, no extra refresh wait for late frames. Animated UV refresh copies geometry and generates coordinates in one pass.\n", file);
 				fputs("Geometry: joined native GE triangle strips when cheaper than triangle expansion; exact unsigned-byte bone weights; idle mesh reclamation on heap pressure.\n", file);
+				fputs("Vertices: identical FIFO inputs shared across primitives; original primitive winding/degenerates and animated UV inputs preserved.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -269,6 +271,7 @@ void recordFrameTimings()
 			fprintf(file, "  mesh_strip_draws=%.1f mesh_strip_indices_saved=%.1f\n",
 			        sTimings.stripDraws / 120.0, sTimings.stripIndicesSaved / 120.0);
 			fprintf(file, "  mesh_memory_evictions=%.1f\n", sTimings.meshMemoryEvictions / 120.0);
+			fprintf(file, "  mesh_welded_vertices_saved=%.1f\n", sTimings.weldedVerticesSaved / 120.0);
 			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
 			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
 			        metrics[PikminPsp::PerformanceMovieConvert] / 120000.0,
@@ -1069,6 +1072,7 @@ struct MeshCacheEntry {
 	u8* storage;
 	u32 listBytes, nativeBytes, allocationBytes, indexCount, vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize;
 	u32 drawPrimitive, indicesSaved;
+	u32 verticesSaved;
 	u64 lastUse, gpuEpoch;
 	MeshInputRange inputs[4];
 	bool hasTexCoordInputs;
@@ -1077,6 +1081,44 @@ struct MeshCacheEntry {
 // Keep the inputs to generated UVs so animated reflection/projection matrices
 // can update UVs without decoding lists, rebuilding indices or replacing buffers.
 struct MeshTexCoordInput { f32 x, y, z; u32 matrix; };
+
+// Weld identical FIFO records across primitives, preserving every attribute
+// index and matrix selector (including inputs to future animated UVs). Each
+// original primitive still receives distinct indices, so its degenerates and
+// winding remain unchanged. Scratch storage never goes into a queued GE list.
+struct MeshVertexSlot { const u8* record; u32 epoch; u16 index, primitive; };
+MeshVertexSlot sMeshVertexSlots[1024];
+u16 sMeshVertexRemap[65536];
+u32 sMeshVertexEpoch;
+
+void beginMeshVertexWeld()
+{
+	if (++sMeshVertexEpoch == 0) {
+		memset(sMeshVertexSlots, 0, sizeof(sMeshVertexSlots));
+		++sMeshVertexEpoch;
+	}
+}
+
+u32 weldMeshVertex(const u8* record, u32 stride, u32 primitive, u32 nextIndex)
+{
+	u32 hash = 2166136261U;
+	for (u32 i = 0; i < stride; ++i) hash = (hash ^ record[i]) * 16777619U;
+	// Bounded probing keeps pathological/full lists cheap; a missed weld
+	// simply retains the original vertex. No allocation or cache-hit work.
+	for (u32 probe = 0; probe < 8; ++probe) {
+		auto& slot = sMeshVertexSlots[(hash + probe) & 1023];
+		if (slot.epoch != sMeshVertexEpoch) {
+			slot = {record, sMeshVertexEpoch, u16(nextIndex), u16(primitive)};
+			break;
+		}
+		if (memcmp(slot.record, record, stride) == 0) {
+			if (slot.primitive == primitive) break;
+			slot.primitive = primitive;
+			return slot.index;
+		}
+	}
+	return nextIndex;
+}
 
 struct MeshUvTransform {
 	const f32* matrix;
@@ -1320,7 +1362,7 @@ MeshCacheEntry* findCachedMesh(const u8* list, u32 bytes)
 
 void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const MeshInputRange (&inputs)[4],
                const void* vertices, u32 nativeBytes, u32 indexCount, u32 vertexCount, u32 primitives, u32 matrix,
-               u32 matrixMask, u32 vertexSize, bool hasTexCoordInputs, u32 drawPrimitive, u32 indicesSaved)
+               u32 matrixMask, u32 vertexSize, bool hasTexCoordInputs, u32 drawPrimitive, u32 indicesSaved, u32 verticesSaved)
 {
 	MeshInputRange savedInputs[4];
 	memcpy(savedInputs, inputs, sizeof(savedInputs));
@@ -1392,6 +1434,7 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 	slot->primitiveCount = primitives; slot->rigidMatrix = matrix; slot->lastUse = ++sMeshCacheUse;
 	slot->matrixMask = matrixMask; slot->vertexSize = vertexSize;
 	slot->drawPrimitive = drawPrimitive; slot->indicesSaved = indicesSaved;
+	slot->verticesSaved = verticesSaved;
 	slot->hasTexCoordInputs = hasTexCoordInputs;
 	memcpy(slot->inputs, savedInputs, sizeof(slot->inputs));
 	sMeshCacheBytes += total;
@@ -1436,6 +1479,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 			sDebugBatchedPrimitives += cached->primitiveCount;
 			++sTimings.meshCacheHits;
 			sTimings.cachedVertices += cached->vertexCount;
+			sTimings.weldedVerticesSaved += cached->verticesSaved;
 			return true;
 		}
 	}
@@ -1465,7 +1509,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 	}
 	if (!vertexCount) return true;
 	const bool joinedStrips = allStrips && stripIndexCount < indexCount;
-	const u32 indicesSaved = joinedStrips ? indexCount - stripIndexCount : 0;
+	const u32 expandedIndexCount = indexCount;
 	if (joinedStrips) indexCount = stripIndexCount;
 	if (indexCount > 65535) return false;
 	const u32 drawPrimitive = joinedStrips ? GU_TRIANGLE_STRIP : GU_TRIANGLES;
@@ -1489,11 +1533,10 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 	if (byteCount + 8 + kDisplayListCommandReserve > sizeof(sGxDisplayList)) return false;
 	reserveDisplayListMemory(byteCount);
 	u8* vertices = static_cast<u8*>(sceGuGetMemory(byteCount));
-	sTimings.decodedVertices += vertexCount;
-	if (skinned) sTimings.skinnedVertices += vertexCount;
 	u16* indices = reinterpret_cast<u16*>(vertices + vertexCount * vertexSize);
 	auto* texCoordInputs = saveTexCoords ? reinterpret_cast<MeshTexCoordInput*>(vertices + texCoordOffset) : nullptr;
-	u32 base = 0, index = 0;
+	u32 base = 0, index = 0, uniqueCount = 0, primitiveNumber = 0;
+	beginMeshVertexWeld();
 	const bool tintVertices = prepareMaterialTint();
 	const PspGxAttribute& pos = sState.attributes[GX_VA_POS];
 	const PspGxAttribute& col = sState.attributes[GX_VA_CLR0];
@@ -1504,7 +1547,11 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 		u8 primitive = command & GX_OPCODE_MASK;
 		u32 count = readBig16(input);
 		for (u32 i = 0; i < count; ++i, input += layout.stride) {
-			u8* destination = vertices + (base + i) * vertexSize;
+			u32 mapped = weldMeshVertex(input, layout.stride, primitiveNumber, uniqueCount);
+			sMeshVertexRemap[base + i] = mapped;
+			if (mapped != uniqueCount) continue;
+			++uniqueCount;
+			u8* destination = vertices + mapped * vertexSize;
 			if (skinned) {
 				PspGxSkinnedVertex* weighted = reinterpret_cast<PspGxSkinnedVertex*>(destination);
 				memset(weighted->weights, 0, sizeof(weighted->weights));
@@ -1530,7 +1577,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 			}
 			u32 textureMatrix = layout.offset[GX_VA_TEX0MTXIDX] >= 0
 			    ? meshIndex(input, layout, GX_VA_TEX0MTXIDX) : sState.texMatrix;
-			if (texCoordInputs) texCoordInputs[base + i] = {out.x, out.y, out.z,
+			if (texCoordInputs) texCoordInputs[mapped] = {out.x, out.y, out.z,
 			    sState.texSource == GX_TG_POS ? textureMatrix : (u32)GX_IDENTITY};
 			generateTexCoord(out, out.x, out.y, out.z, GX_TG_POS, textureMatrix);
 			if (sState.texSource == GX_TG_NRM) {
@@ -1539,38 +1586,60 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 				if (layout.offset[normalAttr] >= 0 && normal.array && normal.componentType == GX_F32) {
 					const f32* n = reinterpret_cast<const f32*>(normal.array + meshIndex(input, layout, normalAttr) * normal.stride);
 					generateTexCoord(out, n[0], n[1], n[2], GX_TG_NRM, textureMatrix);
-					if (texCoordInputs) texCoordInputs[base + i] = {n[0], n[1], n[2], textureMatrix};
+					if (texCoordInputs) texCoordInputs[mapped] = {n[0], n[1], n[2], textureMatrix};
 					if (cacheable) inputs[3].include(n, 12);
 				}
 			}
 		}
 		if (joinedStrips) {
-			if (index) {
+			// An even prefix ends with the next strip's correctly ordered edge.
+			// Continue it directly: no duplicated endpoints or connecting
+			// triangles are needed. Odd prefixes retain the parity-safe join.
+			const bool sharedEdge = index >= 2 && !(index & 1)
+			    && indices[index - 2] == sMeshVertexRemap[base]
+			    && indices[index - 1] == sMeshVertexRemap[base + 1];
+			if (index && !sharedEdge) {
 				u16 last = indices[index - 1];
 				bool oddPrefix = index & 1;
 				indices[index++] = last;
 				if (oddPrefix) indices[index++] = last;
-				indices[index++] = base;
+				indices[index++] = sMeshVertexRemap[base];
 			}
-			for (u32 i = 0; i < count; ++i) indices[index++] = base + i;
+			for (u32 i = sharedEdge ? 2 : 0; i < count; ++i) indices[index++] = sMeshVertexRemap[base + i];
 		} else if (primitive == GX_TRIANGLES) {
-			for (u32 i = 0; i < count; ++i) indices[index++] = base + i;
+			for (u32 i = 0; i < count; ++i) indices[index++] = sMeshVertexRemap[base + i];
 		} else if (primitive == GX_QUADS) {
 			for (u32 i = 0; i < count; i += 4) {
-				indices[index++] = base + i; indices[index++] = base + i + 1; indices[index++] = base + i + 2;
-				indices[index++] = base + i; indices[index++] = base + i + 2; indices[index++] = base + i + 3;
+				indices[index++] = sMeshVertexRemap[base + i]; indices[index++] = sMeshVertexRemap[base + i + 1]; indices[index++] = sMeshVertexRemap[base + i + 2];
+				indices[index++] = sMeshVertexRemap[base + i]; indices[index++] = sMeshVertexRemap[base + i + 2]; indices[index++] = sMeshVertexRemap[base + i + 3];
 			}
 		} else {
 			for (u32 i = 2; i < count; ++i) {
-				indices[index++] = base + (primitive == GX_TRIANGLEFAN ? 0 : i - 2 + (i & 1));
-				indices[index++] = base + (primitive == GX_TRIANGLEFAN ? i - 1 : i - 1 - (i & 1));
-				indices[index++] = base + i;
+				indices[index++] = sMeshVertexRemap[base + (primitive == GX_TRIANGLEFAN ? 0 : i - 2 + (i & 1))];
+				indices[index++] = sMeshVertexRemap[base + (primitive == GX_TRIANGLEFAN ? i - 1 : i - 1 - (i & 1))];
+				indices[index++] = sMeshVertexRemap[base + i];
 			}
 		}
 		base += count;
+		++primitiveNumber;
 	}
+	indexCount = index;
+	const u32 indicesSaved = joinedStrips ? expandedIndexCount - indexCount : 0;
+	const u32 verticesSaved = vertexCount - uniqueCount;
+	const u32 compactVertexBytes = uniqueCount * vertexSize;
+	memmove(vertices + compactVertexBytes, indices, indexCount * sizeof(u16));
+	indices = reinterpret_cast<u16*>(vertices + compactVertexBytes);
+	byteCount = compactVertexBytes + indexCount * sizeof(u16);
+	if (saveTexCoords) {
+		const u32 compactInputOffset = (byteCount + 3) & ~3U;
+		memmove(vertices + compactInputOffset, texCoordInputs, uniqueCount * sizeof(MeshTexCoordInput));
+		byteCount = compactInputOffset + uniqueCount * sizeof(MeshTexCoordInput);
+	}
+	sTimings.decodedVertices += uniqueCount;
+	if (skinned) sTimings.skinnedVertices += uniqueCount;
+	sTimings.weldedVerticesSaved += verticesSaved;
 	if (cacheable) cacheMesh(listStart, end - listStart, key, inputs, vertices, byteCount, indexCount,
-	                         vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize, saveTexCoords, drawPrimitive, indicesSaved);
+	                         uniqueCount, primitiveCount, rigidMatrix, matrixMask, vertexSize, saveTexCoords, drawPrimitive, indicesSaved, verticesSaved);
 	loadMeshMatrices(matrixMask, rigidMatrix);
 	submitVertices(vertices, indexCount, drawPrimitive, indices, skinned);
 	if (joinedStrips) { ++sTimings.stripDraws; sTimings.stripIndicesSaved += indicesSaved; }

@@ -211,7 +211,7 @@ void syntheticLists()
 void nativeStripParity()
 {
 	u32 cases = 0;
-	for (bool skinned : {false, true}) for (u32 a = 3; a <= 8; ++a)
+	for (bool skinned : {false, true}) for (bool shared : {false, true}) for (u32 a = 3; a <= 8; ++a)
 	for (u32 b = 3; b <= 8; ++b) for (u32 c = 3; c <= 8; ++c) {
 		clearMeshCache(); resetState();
 		sState.texSource = GX_TG_TEX0;
@@ -224,18 +224,28 @@ void nativeStripParity()
 		GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
 		GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
 		std::vector<u8> list;
-		u32 vertex = 0, expanded = 0, joined = 0;
+		u32 vertex = 0, expanded = 0, joined = 0, optimized = 0;
 		for (u32 count : {a,b,c}) {
 			list.insert(list.end(), {GX_TRIANGLESTRIP,0,u8(count)});
 			if (joined) joined += 2 + (joined & 1);
 			joined += count; expanded += (count - 2) * 3;
-			for (u32 i = 0; i < count; ++i, ++vertex) list.insert(list.end(), {u8(skinned ? (vertex % 3) * 12 : 6),u8(vertex)});
+			const u32 base = shared && vertex ? vertex - 2 : vertex;
+			if (shared && optimized && !(optimized & 1)) optimized += count - 2;
+			else {
+				if (optimized) optimized += 2 + (optimized & 1);
+				optimized += count;
+			}
+			for (u32 i = 0; i < count; ++i) {
+				u32 source = base + i;
+				list.insert(list.end(), {u8(skinned ? (source % 3) * 12 : 6),u8(source)});
+			}
+			vertex = base + count;
 		}
 		compareList(list.data(), list.size());
 		auto* entry = findCachedMesh(list.data(), list.size());
-		assert(entry && entry->indexCount == (joined < expanded ? joined : expanded));
+		assert(entry && entry->indexCount == (joined < expanded ? optimized : expanded));
 		assert(entry->drawPrimitive == (joined < expanded ? GU_TRIANGLE_STRIP : GU_TRIANGLES));
-		assert(entry->indicesSaved == (joined < expanded ? expanded - joined : 0));
+		assert(entry->indicesSaved == (joined < expanded ? expanded - optimized : 0));
 		assert(entry->vertexSize == (skinned ? 32 : sizeof(PspGxVertex)));
 		++cases;
 	}
@@ -255,6 +265,90 @@ void nativeStripParity()
 	assert(entry->indicesSaved == 59994);
 	clearMeshCache();
 	printf("Native PSP strips: %u rigid/skinned parity cases preserve triangle order and winding; 30,000-index strip stays batched\n", cases);
+}
+
+void sharedMeshVertices()
+{
+	// Inputs which initially produce identical UVs can diverge on later
+	// frames. Welding must retain normal/UV/color/matrix/bone seams.
+	for (bool skinned : {false, true}) for (u32 seam = 0; seam < 6; ++seam) {
+		clearMeshCache(); resetState();
+		f32 positions[9][3], normals[9][3], uv[9][2];
+		u32 colours[9];
+		for (u32 i = 0; i < 9; ++i) {
+			positions[i][0] = i % 2; positions[i][1] = i / 2; positions[i][2] = i * 0.125f;
+			normals[i][0] = i * 0.1f; normals[i][1] = 0.5f; normals[i][2] = 1;
+			uv[i][0] = i * 0.125f; uv[i][1] = 0.25f;
+			colours[i] = GU_RGBA(i * 17, 100, 200, 255);
+		}
+		GXSetVtxDesc(GX_VA_PNMTXIDX, GX_DIRECT);
+		GXSetVtxDesc(GX_VA_TEX0MTXIDX, GX_DIRECT);
+		for (GXAttr attr : {GX_VA_POS, GX_VA_NRM, GX_VA_CLR0, GX_VA_TEX0}) GXSetVtxDesc(attr, GX_INDEX8);
+		GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+		GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+		GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+		GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+		GXSetArray(GX_VA_POS, positions, 12); GXSetArray(GX_VA_NRM, normals, 12);
+		GXSetArray(GX_VA_CLR0, colours, 4); GXSetArray(GX_VA_TEX0, uv, 8);
+		Mtx matrix = {{0,0,0,0},{0,0,0,0},{0,0,0,1}};
+		GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
+		GXLoadTexMtxImm(matrix, GX_TEXMTX1, GX_MTX3x4);
+		GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_NRM, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+		std::vector<u8> list;
+		for (u32 strip = 0; strip < 3; ++strip) {
+			list.insert(list.end(), {GX_TRIANGLESTRIP,0,4});
+			for (u32 i = 0; i < 4; ++i) {
+				u8 v = strip * 2 + i;
+				u8 record[] = {u8(skinned ? (v % 2) * 12 : 6), GX_TEXMTX0, v,v,v,v};
+				if (strip == 1 && i == 0) {
+					if (seam == 1) record[3] = 8;
+					if (seam == 2) record[4] = 8;
+					if (seam == 3) record[5] = 8;
+					if (seam == 4) record[1] = GX_TEXMTX1;
+					if (seam == 5) record[0] = 27;
+				}
+				list.insert(list.end(), record, record + sizeof(record));
+			}
+		}
+		if (!skinned && seam == 0) sMeshVertexEpoch = ~0U; // Epoch wrap cannot reuse stale records.
+		compareList(list.data(), list.size());
+		auto* entry = findCachedMesh(list.data(), list.size());
+		assert(entry && entry->vertexCount == (seam ? 9 : 8));
+		assert(entry->verticesSaved == (seam ? 3 : 4));
+		assert(entry->indexCount == (seam ? 12 : 8));
+		const u64 decoded = sTimings.decodedVertices;
+		const u8* storage = entry->storage;
+		std::vector<u8> original(storage, storage + entry->allocationBytes);
+		for (u32 frame = 0; frame < 4; ++frame) {
+			meshCacheGpuIdle();
+			matrix[0][0] += 0.25f; matrix[1][1] += 0.125f;
+			GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
+			matrix[0][3] += 0.5f;
+			GXLoadTexMtxImm(matrix, GX_TEXMTX1, GX_MTX3x4);
+			sState.positionMatrices[4][0][3] += 1;
+			compareList(list.data(), list.size());
+			assert(sTimings.decodedVertices == decoded);
+			assert(entry->storage == storage && !memcmp(storage, original.data(), original.size()));
+		}
+		normals[2][0] += 0.25f;
+		compareList(list.data(), list.size());
+		assert(sTimings.decodedVertices > decoded);
+		assert(!memcmp(storage, original.data(), original.size()));
+	}
+	// Original repeated vertices within one primitive stay distinct, even
+	// after a preceding primitive has populated the weld table.
+	clearMeshCache(); resetState();
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, 12);
+	sState.texSource = GX_TG_TEX0;
+	u8 list[] = {GX_TRIANGLESTRIP,0,4,0,1,1,2, GX_TRIANGLESTRIP,0,4,0,1,1,2};
+	compareList(list, sizeof(list));
+	auto* entry = findCachedMesh(list, sizeof(list));
+	assert(entry && entry->vertexCount == 5 && entry->verticesSaved == 3);
+	clearMeshCache();
+	printf("Shared PSP vertices: exact triangles across UV/normal/color/matrix/bone seams, animation, source edits, epoch wrap and original degenerates\n");
 }
 
 void meshCacheInvalidation()
@@ -677,7 +771,7 @@ void benchmarkModels(const std::vector<ModelDraw>& modelDraws)
 	for (bool cached : {false, true}) {
 		clearMeshCache();
 		const u64 revision = PikminPsp::nextMeshRevision();
-		u64 beforeDecoded = 0, beforeHits = 0, beforeSaved = 0;
+		u64 beforeDecoded = 0, beforeHits = 0, beforeSaved = 0, beforeWelded = 0, beforeVertices = 0;
 		u32 beforeSubmitted = 0;
 		std::chrono::steady_clock::time_point start;
 		for (u32 frame = 0; frame < 13; ++frame) {
@@ -686,6 +780,7 @@ void benchmarkModels(const std::vector<ModelDraw>& modelDraws)
 				start = std::chrono::steady_clock::now();
 				beforeDecoded = sTimings.decodedVertices; beforeHits = sTimings.meshCacheHits;
 				beforeSaved = sTimings.stripIndicesSaved; beforeSubmitted = sDebugVertexCount;
+				beforeWelded = sTimings.weldedVerticesSaved; beforeVertices = sTimings.cachedVertices;
 			}
 			PikminPsp::MeshValidationScope validation;
 			PikminPsp::bindMeshRevision(revision);
@@ -700,6 +795,9 @@ void benchmarkModels(const std::vector<ModelDraw>& modelDraws)
 		       (sTimings.decodedVertices - beforeDecoded) / 12.0, (sTimings.meshCacheHits - beforeHits) / 12.0, sMeshCacheBytes);
 		printf("  mesh indices %.0f/frame, saved %.0f/frame through native strips\n",
 		       (u32)(sDebugVertexCount - beforeSubmitted) / 12.0, (sTimings.stripIndicesSaved - beforeSaved) / 12.0);
+		printf("  shared vertices saved %.0f/frame, stored vertices %.0f/frame\n",
+		       (sTimings.weldedVerticesSaved - beforeWelded) / 12.0,
+		       (cached ? sTimings.cachedVertices - beforeVertices : sTimings.decodedVertices - beforeDecoded) / 12.0);
 	}
 	printf("  native conversion ratio: %.2fx (not PSP FPS)\n", milliseconds[0] / milliseconds[1]);
 	recordGeometry = true;
@@ -1666,6 +1764,7 @@ int main(int argc, char** argv)
 	shadowCopies();
 	syntheticLists();
 	nativeStripParity();
+	sharedMeshVertices();
 	meshCacheInvalidation();
 	meshHeapPressure();
 	sharedMeshArrays();

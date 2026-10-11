@@ -807,3 +807,40 @@ failures to verify both idle reclamation and pinned-buffer protection. A native
 expansion. The large auxiliary-UV fallback fixture uses 45,000 vertices because
 the previous 30,000-vertex case now fits after weight packing. Build with the
 usual `make -f Makefile.psp psp-game -j8` and compare the same scenes on PSP.
+
+### Shared native vertices
+
+The next device capture shows steady title rendering at 16.37–16.48 FPS and
+intro windows at roughly 21–24 FPS. The title still spends 12–14 ms waiting for
+the GPU. Intro windows update approximately 18,000 animated UV vertices per
+frame and spend about 21 ms in mesh work, making duplicated vertex data a
+useful next target.
+
+Mesh conversion now shares identical FIFO records across primitives. The
+comparison includes all attribute indices and matrix selectors, retaining UV,
+normal, color and bone seams even when their initial converted values coincide.
+Vertices within each original primitive stay distinct, preserving its winding
+and geometric degenerates. Cached vertices, generated-UV inputs and indices
+are compacted together; animated UV refresh visits only the stored vertices.
+Matching strip edges continue directly when prefix parity permits; other joins
+retain the existing degenerate connectors. The four replayed retail models
+retain their previous index counts, so this pass's measured benefit is vertex
+storage and refresh work rather than an additional index reduction.
+
+The opening/logo replay stores 48,002 vertices instead of 71,010 (32.4% fewer)
+and uses 1,860,288 cache bytes instead of 2,428,416 in the native test. Olimar
+stores 1,811 instead of 3,558 vertices (49.1% fewer); the ship stores 11,582
+instead of 17,232 (32.8% fewer). These are model replay counts, not new PSP FPS
+measurements. Sharing is computed only on conversion, with bounded hash probes
+and about 140 KiB of fixed PSP scratch storage; collisions or a full table
+retain original vertices safely. Conversion adds hashing work during cache
+warmup. Cache hits need no hash probing or scratch-buffer allocation.
+
+`mesh_welded_vertices_saved` reports sharing per frame. `cached_vertices` and
+`mesh_uv_vertices` now count the compact stored buffers. Ordinary and LTO
+sanitizer checks compare every triangle against the original decoder on the
+four real models. They also cover 864 rigid/skinned strip parity combinations,
+shared edges, animated normal/UV/color/matrix/bone seams, source edits, epoch
+wrap, original degenerates and the existing GPU lifetime/heap pressure cases.
+The PSP game build passes; measure this EBOOT on hardware to establish the FPS
+gain and cache-warmup cost.
