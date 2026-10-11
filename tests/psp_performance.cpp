@@ -1,6 +1,7 @@
 #include "../src/port/psp/PspPlatform.cpp"
 #include <cassert>
 #include <cstdio>
+#include <initializer_list>
 
 static unsigned int mockTime;
 static unsigned int clockReads;
@@ -46,6 +47,27 @@ int main()
 		mockTime = 0x20;
 	}
 	assert(clockReads == 2 && performanceCounter(PerformanceMesh) == snapshot + 25 + 48 * 16);
+	// Every output buffer samples one tick, with equal coverage of all eight
+	// positions over eight buffers. Only enabled scopes read the kernel clock.
+	u32 positions[8] = {}, samples = 0;
+	clockReads = 0;
+	for (u32 tick = 0; tick < 400; ++tick) {
+		u32 weight = audioTimingWeight(tick);
+		if (weight) { ++samples; ++positions[tick % 8]; }
+		for (PerformanceMetric metric : {PerformanceAudioSequence, PerformanceAudioChannels, PerformanceAudioStream,
+		                                PerformanceAudioMix, PerformanceAudioMovie}) {
+			PerformanceScope timer(metric, weight);
+			mockTime += 10;
+		}
+	}
+	assert(samples == 50 && clockReads == 500); // Previously 4,000 clock reads.
+	for (u32 position = 0; position < 8; ++position) assert(positions[position] == (position < 2 ? 7 : 6));
+	assert(performanceCounter(PerformanceAudioSequence) == 4000);
+	for (u32 first : {0U, 0xfffffff8U}) {
+		u32 count = 0;
+		for (u32 tick = 0; tick < 8; ++tick) if (audioTimingWeight(first + tick)) ++count;
+		assert(count == 1);
+	}
 	sPerformanceMainThread = 7;
 	performanceSetAudioThread(8);
 	assert(performanceThreadMicroseconds(false) == 1234567);

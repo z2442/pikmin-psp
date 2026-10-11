@@ -130,6 +130,7 @@ u32 compareList(const u8* input, u32 size)
 	if (sTimings.meshCacheHits && !expected.empty()) {
 		u64 hits = sTimings.meshCacheHits;
 		u64 refreshes = sTimings.texCoordRefreshes;
+		u64 compiled = sTimings.compiledMeshCalls;
 		resetDraws();
 		for (u32 draw = 0; draw < 33; ++draw) {
 			triangles.clear();
@@ -137,8 +138,10 @@ u32 compareList(const u8* input, u32 size)
 			assert(triangles.size() == expected.size());
 			for (u32 i = 0; i < triangles.size(); ++i) equalVertex(triangles[i], expected[i]);
 		}
-		if (sTimings.meshCacheHits - hits == 33 && sTimings.texCoordRefreshes == refreshes)
+		if (sTimings.meshCacheHits - hits == 33 && sTimings.texCoordRefreshes == refreshes) {
 			assert(deferredDrawCalls == 30);
+			assert(sTimings.compiledMeshCalls - compiled == (sState.transform3D ? 30 : 0));
+		}
 	}
 	checkMeshCacheTags();
 	return oldDraws;
@@ -225,9 +228,7 @@ void meshCacheInvalidation()
 	GXSetArray(GX_VA_POS, replacement, sizeof(replacement[0])); compareList(list, sizeof(list));
 	meshCacheGpuIdle();
 	compareList(list, sizeof(list));
-	MeshCacheKey key;
-	meshCacheKey(key);
-	MeshCacheEntry* pinned = findCachedMesh(list, sizeof(list), key);
+	MeshCacheEntry* pinned = findCachedMesh(list, sizeof(list));
 	assert(pinned && pinned->gpuEpoch == sMeshCacheEpoch);
 	const u8* oldStorage = pinned->storage;
 	std::vector<u8> oldBytes(oldStorage, oldStorage + pinned->allocationBytes);
@@ -241,8 +242,7 @@ void meshCacheInvalidation()
 	}
 	meshCacheGpuIdle();
 	compareList(list, sizeof(list));
-	meshCacheKey(key);
-	assert(findCachedMesh(list, sizeof(list), key));
+	assert(findCachedMesh(list, sizeof(list)));
 	assert(sMeshCacheBytes > 0 && sMeshCacheBytes <= kMeshCacheLimit);
 	clearMeshCache();
 	assert(sMeshCacheBytes == 0);
@@ -262,8 +262,7 @@ void sharedMeshArrays()
 		PikminPsp::MeshValidationScope scope;
 		PikminPsp::validateMeshArray(GX_VA_POS, positions, sizeof(positions));
 		compareList(list, sizeof(list));
-		MeshCacheKey key; meshCacheKey(key);
-		auto* entry = findCachedMesh(list, sizeof(list), key);
+		auto* entry = findCachedMesh(list, sizeof(list));
 		assert(entry && entry->inputs[0].generation);
 		firstGeneration = entry->inputs[0].generation;
 		u64 decoded = sTimings.decodedVertices;
@@ -281,8 +280,7 @@ void sharedMeshArrays()
 		PikminPsp::MeshValidationScope scope;
 		PikminPsp::validateMeshArray(GX_VA_POS, positions, sizeof(positions));
 		compareList(list, sizeof(list));
-		MeshCacheKey key; meshCacheKey(key);
-		auto* entry = findCachedMesh(list, sizeof(list), key);
+		auto* entry = findCachedMesh(list, sizeof(list));
 		assert(entry && entry->inputs[0].generation != firstGeneration);
 	}
 	// Outside a validated model scope, direct writes still use byte snapshots.
@@ -315,9 +313,8 @@ void revisionedMeshes()
 		PikminPsp::MeshValidationScope scope;
 		PikminPsp::bindMeshRevision(revision);
 		compareList(list, sizeof(list));
-		MeshCacheKey key; meshCacheKey(key);
-		auto* entry = findCachedMesh(list, sizeof(list), key);
-		assert(entry && entry->allocationBytes == kMeshCacheDataOffset + meshCacheAlignedSize(entry->nativeBytes));
+		auto* entry = findCachedMesh(list, sizeof(list));
+		assert(entry && entry->allocationBytes == kMeshCacheDataOffset + meshCacheAlignedSize(entry->nativeBytes) + kMeshCacheCommandBytes);
 		assert(sMeshArrayBytes == 0); // No source snapshots allocated.
 		u64 decoded = sTimings.decodedVertices;
 		sState.positionMatrices[0][0][3] += 7;
@@ -464,9 +461,8 @@ void animatedTexCoordMeshes()
 		compareList(list.data(), list.size());
 		conversions += sTimings.decodedVertices - decoded;
 		assert(sTimings.decodedVertices == decoded + 3);
-		MeshCacheKey key; meshCacheKey(key);
-		auto* entry = findCachedMesh(list.data(), list.size(), key);
-		assert(entry && !findCachedMesh(list.data(), list.size() - 1, key));
+		auto* entry = findCachedMesh(list.data(), list.size());
+		assert(entry && !findCachedMesh(list.data(), list.size() - 1));
 		const u8* storage = entry->storage;
 		std::vector<u8> original(storage, storage + entry->allocationBytes);
 		for (u32 frame = 0; frame < 20; ++frame) {
@@ -478,7 +474,9 @@ void animatedTexCoordMeshes()
 			matrix[1][3] += 0.125f;
 			GXLoadTexMtxImm(matrix, GX_TEXMTX1, GX_MTX3x4);
 			sState.positionMatrices[9][0][3] += 1;
+			u64 compiled = sTimings.compiledMeshCalls;
 			compareList(list.data(), list.size());
+			assert(sTimings.compiledMeshCalls == compiled); // Refreshed vertices are transient.
 			assert(sTimings.decodedVertices == decoded + 3);
 			assert(entry->storage == storage && !memcmp(storage, original.data(), original.size()));
 			assert(entry->gpuEpoch == sMeshCacheEpoch); // Persistent indices remain GPU-pinned.
@@ -507,13 +505,11 @@ void animatedTexCoordMeshes()
 	GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
 	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX2X4, GX_TG_POS, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
 	assert(drawMeshList(large.data(), large.data() + large.size()));
-	MeshCacheKey key; meshCacheKey(key);
-	auto* entry = findCachedMesh(large.data(), large.size(), key);
+	auto* entry = findCachedMesh(large.data(), large.size());
 	assert(entry && !entry->hasTexCoordInputs && entry->vertexCount == 30000);
 	matrix[0][3] += 1;
 	GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
-	meshCacheKey(key);
-	assert(!findCachedMesh(large.data(), large.size(), key)); // Full validation remains for this path.
+	assert(!findCachedMesh(large.data(), large.size())); // Full validation remains for this path.
 	checkMeshCacheTags(); clearMeshCache();
 }
 
@@ -766,6 +762,25 @@ extern "C" void sceGuSendCommandi(int command, int argument)
 	case 0x10: base = (argument & 0xf0000) << 8; break;
 	case 0x01: vertexAddress = base | (argument & 0xffffff); break;
 	case 0x02: indexAddress = base | (argument & 0xffffff); break;
+	case 0x0a: {
+		const u32 address = base | (argument & 0xffffff);
+		const u32* commands = nullptr;
+		u64 latestUse = 0;
+		for (auto& set : sMeshCache) for (auto& entry : set) {
+			if (!entry.storage || (reinterpret_cast<uintptr_t>(meshCacheCommands(entry)) & 0xfffffff) != address
+			    || entry.lastUse <= latestUse) continue;
+			assert(entry.gpuEpoch == sMeshCacheEpoch);
+			commands = meshCacheCommands(entry); latestUse = entry.lastUse;
+		}
+		assert(commands && !(reinterpret_cast<uintptr_t>(commands) & 63));
+		assert(commands[6] == 0x0b000000); // RET, not END/FINISH: parent must resume.
+		const u8 opcodes[] = {0x12,0x10,0x02,0x10,0x01,0x04};
+		for (u32 i = 0; i < 6; ++i) {
+			assert((commands[i] >> 24) == opcodes[i]);
+			sceGuSendCommandi(commands[i] >> 24, commands[i] & 0xffffff);
+		}
+		break;
+	}
 	case 0x04: {
 		// Host pointers are wider than GE addresses. Resolve through the live
 		// cache, verifying that both encoded addresses select the same entry.
@@ -1248,13 +1263,14 @@ void sampledMeshTiming()
 	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
 	u8 list[] = {GX_TRIANGLES,0,3,0,1,2};
 	sMeshTimingSequence = 0;
-	u64 samples = sTimings.meshTimingSamples, hits = sTimings.meshCacheHits;
+	u64 samples = sTimings.meshTimingSamples, hits = sTimings.meshCacheHits, builds = sTimings.meshKeyBuilds;
 	meshClockReads = 0;
 	for (u32 i = 0; i < 33; ++i) GXCallDisplayList(list, sizeof(list));
 	assert(sTimings.meshTimingSamples - samples == 3);
 	assert(meshClockReads == 12); // Four reads only for calls 0, 16 and 32.
 	assert(drawCalls == 33 && triangles.size() == 33 * 3);
 	assert(sTimings.meshCacheHits - hits == 32);
+	assert(sTimings.meshKeyBuilds - builds == 1);
 	// Every draw position is selected exactly once over 16 rotated phases.
 	for (u32 phase = 0; phase < 16; ++phase) {
 		sMeshTimingSequence = phase;
@@ -1266,8 +1282,104 @@ void sampledMeshTiming()
 		}
 		assert(meshClockReads == 4);
 	}
+	assert(sTimings.meshKeyBuilds - builds == 1); // Hits never construct a key.
 	clearMeshCache();
 	puts("Sampled mesh timing clock count, phase rotation and unchanged submissions checks passed");
+}
+
+void compiledMeshModeChanges()
+{
+	clearMeshCache(); resetState(); resetDraws();
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	u8 list[] = {GX_TRIANGLES,0,3,0,1,2};
+	compareList(list, sizeof(list));
+	// Native positions can be reused in 2D, but the compiled 3D command list
+	// must not be called. Exercise the original dynamic-format command path.
+	sState.transform3D = false;
+	recordGeometry = false; resetDraws();
+	u64 compiled = sTimings.compiledMeshCalls, hits = sTimings.meshCacheHits;
+	for (u32 draw = 0; draw < 33; ++draw) assert(drawMeshList(list, list + sizeof(list)));
+	assert(sTimings.compiledMeshCalls == compiled && sTimings.meshCacheHits - hits == 33);
+	assert(drawCalls == 33 && deferredDrawCalls == 30);
+	recordGeometry = true;
+	sState.transform3D = true;
+	compareList(list, sizeof(list)); // Restoring 3D reuses the compiled list.
+	clearMeshCache();
+	puts("Compiled mesh CALL/RET, 2D mode changes, batch boundaries and transient UV submissions checks passed");
+}
+
+void liveMeshStateValidation()
+{
+	// Compare direct validation to the former canonical-key byte comparison.
+	// Change each dependency independently, including data intentionally ignored
+	// by ordinary UV/indexed-color meshes. No geometry decoding is involved.
+	u32 checks = 0;
+	PikminPsp::MeshValidationScope scope;
+	for (GXTexGenSrc texSource : {GX_TG_TEX0, GX_TG_POS, GX_TG_NRM})
+	for (bool selected : {false, true}) for (bool tinted : {false, true})
+	for (bool indexed : {false, true})
+	for (u32 selector : {u32(GX_TEXMTX2), u32(GX_IDENTITY), 0U}) {
+		resetState();
+		PikminPsp::bindMeshRevision(123);
+		for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) {
+			GXSetVtxDesc((GXAttr)i, (GXAttrType)(i % 4));
+			GXSetVtxAttrFmt(GX_VTXFMT0, (GXAttr)i, GX_POS_XYZ, GX_F32, 3);
+			GXSetArray((GXAttr)i, memory + i * 64, 12);
+		}
+		GXSetVtxDesc(GX_VA_CLR0, indexed ? GX_INDEX8 : GX_NONE);
+		GXSetVtxDesc(GX_VA_PNMTXIDX, indexed ? GX_DIRECT : GX_NONE);
+		GXSetVtxDesc(GX_VA_TEX0MTXIDX, selected ? GX_DIRECT : GX_NONE);
+		GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, texSource, selector, GX_FALSE, GX_PTIDENTITY);
+		sState.multiplyTevColour0 = tinted;
+		sState.tevColourOp = GX_TEV_ADD; sState.tevColourBias = GX_TB_ZERO; sState.tevColourScale = GX_CS_SCALE_2;
+		sState.tevColour0 = (GXColorS10){-50,100,255,200};
+		MeshCacheKey saved; meshCacheKey(saved);
+		const PspGxState baseline = sState;
+		auto check = [&]() {
+			MeshCacheKey current; meshCacheKey(current);
+			assert(meshCacheStateMatches(saved, false) == meshBytesEqual(&saved, &current, meshCacheKeyBytes(current)));
+			assert(meshCacheStateMatches(saved, true) == meshBytesEqual(&saved, &current, offsetof(MeshCacheKey, textureMatrices)));
+			++checks;
+			sState = baseline;
+		};
+		check();
+		for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) {
+			GXSetVtxDesc((GXAttr)i, (GXAttrType)((baseline.attributes[i].source + 1) % 4)); check();
+			sState.attributes[i].array += 4; check();
+			sState.attributes[i].stride += 4; check();
+			sState.attributes[i].fraction ^= 1; check();
+			sState.attributes[i].count = (GXCompCnt)(baseline.attributes[i].count ^ 1); check();
+			sState.attributes[i].componentType = (GXCompType)(baseline.attributes[i].componentType ^ 1); check();
+		}
+		sState.currentColour ^= 1; check();
+		sState.currentPositionMatrix ^= 1; check();
+		sState.multiplyTevColour0 = !tinted; check();
+		sState.tevColourOp = GX_TEV_SUB; check();
+		sState.tevColourBias = GX_TB_ADDHALF; check();
+		sState.tevColourScale = GX_CS_SCALE_4; check();
+		sState.tevColour0.r += 1; check();
+		sState.tevColour0.g += 1; check();
+		sState.tevColour0.b += 1; check();
+		sState.tevColour0.a += 1; check();
+		for (GXTexGenSrc source : {GX_TG_TEX1, GX_TG_POS, GX_TG_NRM}) { sState.texSource = source; check(); }
+		sState.texType = GX_TG_MTX2X4; check();
+		for (u32 matrix : {u32(GX_TEXMTX0), u32(GX_IDENTITY), 0U}) { sState.texMatrix = matrix; check(); }
+		for (u32 i = 0; i < 10; ++i) for (u32 row = 0; row < 3; ++row) for (u32 column = 0; column < 4; ++column) {
+			sState.textureMatrices[i][row][column] += 1; check();
+		}
+		PikminPsp::bindMeshRevision(124); check();
+		PikminPsp::bindMeshRevision(0); check();
+	}
+	// Clearing and list setters update the compact descriptor shadow as well.
+	GXClearVtxDesc();
+	for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) assert(sState.attributeSources[i] == GX_NONE && sState.attributes[i].source == GX_NONE);
+	GXVtxDescList descriptors[] = {{GX_VA_POS,GX_INDEX16},{GX_VA_TEX0,GX_INDEX8},{GX_VA_NULL,GX_NONE}};
+	GXSetVtxDescv(descriptors);
+	for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) assert(sState.attributeSources[i] == sState.attributes[i].source);
+	printf("Live mesh validation: %u state mutations match canonical key comparisons; cached draws build no keys\n", checks);
 }
 
 int main(int argc, char** argv)
@@ -1275,6 +1387,8 @@ int main(int argc, char** argv)
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	deferredModelMatrices();
 	sampledMeshTiming();
+	compiledMeshModeChanges();
+	liveMeshStateValidation();
 	titleMenuPictureAlpha();
 	rasterStateReuse();
 	matrixReuse();
@@ -1292,10 +1406,10 @@ int main(int argc, char** argv)
 	sState.attributes[GX_VA_TEX1].stride = 16;
 	meshCacheKey(changed);
 	assert(meshBytesEqual(&ordinary, &changed, meshCacheKeyBytes(ordinary)));
-	sState.attributes[GX_VA_TEX1].source = GX_INDEX16;
+	GXSetVtxDesc(GX_VA_TEX1, GX_INDEX16);
 	meshCacheKey(changed);
 	assert(!meshBytesEqual(&ordinary, &changed, meshCacheKeyBytes(ordinary)));
-	sState.attributes[GX_VA_TEX1].source = GX_NONE;
+	GXSetVtxDesc(GX_VA_TEX1, GX_NONE);
 	sState.texSource = GX_TG_POS;
 	sState.texMatrix = GX_TEXMTX0;
 	meshCacheKey(ordinary);

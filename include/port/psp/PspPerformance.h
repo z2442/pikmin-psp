@@ -31,6 +31,14 @@ u32 performanceCounter(PerformanceMetric metric);
 void performanceSetAudioThread(SceUID thread);
 u32 performanceThreadMicroseconds(bool audio);
 
+// One detailed audio sample per eight 80-sample ticks. Rotate its position
+// between output buffers so periodic sequencer work is not always skipped.
+const u32 kAudioTimingInterval = 8;
+inline u32 audioTimingWeight(u32 tick)
+{
+	return tick % kAudioTimingInterval == (tick / kAudioTimingInterval) % kAudioTimingInterval ? kAudioTimingInterval : 0;
+}
+
 class PerformanceScope {
 public:
 	// A zero weight disables clock/counter calls; a sampled scope scales its

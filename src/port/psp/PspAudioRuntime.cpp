@@ -82,6 +82,7 @@ int audioThread(SceSize, void*)
 		u32 workStart = sceKernelGetSystemTimeLow();
 		for (unsigned sub = 0; sub < 8 && sRunning; ++sub) {
 			u32 frame = sCounter + 1;
+			const u32 timingWeight = PikminPsp::audioTimingWeight(sCounter);
 			bool trace = frame >= 9 && frame <= 24;
 			if (trace) PikminPsp::audioLog("audio frame %u: lock begin", (unsigned)frame);
 			{
@@ -89,28 +90,28 @@ int audioThread(SceSize, void*)
 				++sCounter;
 				if (trace) PikminPsp::audioLog("audio frame %u: sequence begin", (unsigned)frame);
 				{
-					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioSequence);
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioSequence, timingWeight);
 					DspPlayerCallback();
 				}
 				if (trace) PikminPsp::audioLog("audio frame %u: channels begin", (unsigned)frame);
 				{
-					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioChannels);
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioChannels, timingWeight);
 					UpdateDSPchannelAll();
 				if (trace) PikminPsp::audioLog("audio frame %u: callbacks begin", (unsigned)frame);
 				PlayerCallback();
 				}
 				if (trace) PikminPsp::audioLog("audio frame %u: stream begin", (unsigned)frame);
 				{
-					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioStream);
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioStream, timingWeight);
 					PikminPsp::audioStreamUpdate();
 				}
 				if (trace) PikminPsp::audioLog("audio frame %u: mix begin", (unsigned)frame);
 				{
-					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioMix);
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioMix, timingWeight);
 					PikminPsp::audioMix(sOutput[buffer] + sub * 160, 80);
 				}
 				{
-					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioMovie);
+					PikminPsp::PerformanceScope scope(PikminPsp::PerformanceAudioMovie, timingWeight);
 					PikminPsp::movieMix(sOutput[buffer] + sub * 160, 80);
 				}
 				if (trace) PikminPsp::audioLog("audio frame %u: mix complete", (unsigned)frame);

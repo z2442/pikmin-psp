@@ -657,3 +657,66 @@ unchanged and pinned, and require source edits to invalidate geometry. They also
 check oversized meshes, tag consistency, eviction, menu opacity and both real
 title models. Repeat the same PSP scenes to establish the FPS improvement;
 native conversion measurements do not establish hardware frame rate.
+
+### Direct validation of cached mesh state
+
+The saved title capture reports 12.69 FPS, 38.65 ms of main-thread CPU and
+57.30 ms of render wall time, despite reusing all 606 lists and converting no
+vertices. Cache hits now compare their stored dependencies directly with live
+GX state. They no longer clear and populate a temporary mesh key or copy
+texture matrices before lookup. A 26-byte descriptor shadow, updated by the GX
+descriptor setters, retains every attribute's contribution to FIFO offsets.
+Keys are constructed only for conversion/cache insertion. Position-matrix
+equality checks also use the existing wordwise comparator instead of libc's
+byte-ordering comparison.
+
+Model revisions, consumed array bindings/formats, material tint, constant
+colors, matrix selectors and texture generation remain validated. Generic
+unversioned calls still compare source snapshots, and animated UV refreshes
+retain the existing GPU pinning rules. `mesh_key_builds` reports constructions
+per presented frame; it should fall to zero after title-cache warmup. The log
+header identifies live-state validation. `cache_validate_ms` now includes the
+direct field comparisons; previously key construction was outside that scope.
+Use FPS, `frame_ms`, `main_cpu_ms` and `render_ms` for hardware comparisons.
+
+Native sanitizer checks compare direct validation with canonical key equality
+across 21,312 state mutations, including ignored arrays, descriptor offsets,
+signed tints, revisions, all texture-matrix elements and identity selectors.
+Ordinary and LTO renderer checks preserve the extracted opening/logo triangles,
+animated reflections, skinned geometry, cache eviction protection and menu fades.
+These checks verify correctness and eliminated key construction; an FPS gain
+still requires the rebuilt EBOOT to be measured on PSP.
+
+### Reusing GE draw commands and sampling audio detail timers
+
+The follow-up capture identifies live-state validation and reports no title
+key builds after warmup. Its windows include transitions between scenes, so
+their FPS cannot be treated as a like-for-like steady-title comparison. They
+still show substantial main-thread rendering and audio CPU costs.
+
+Each cached mesh now stores its six immutable GE draw words and a RET in an
+aligned 64-byte block alongside its vertices/indices. Deferred 3D submissions
+emit BASE/CALL instead of regenerating all six words. The first and every
+sixteenth cached submission still use the SDK draw to publish pending work.
+Matrices and raster state are applied in the parent list before the call.
+The command block shares the geometry's lifetime, GPU pinning and 4 MiB budget;
+all 606 title entries add 38,784 bytes. 2D mode changes and transient animated
+UV vertices keep their dynamic-format submission paths.
+
+`gpu_compiled_mesh_calls` counts these calls per presented frame. Native GU
+checks resolve each called list against pinned storage, validate all six
+opcodes and the terminating RET, then compare the resulting triangles and
+winding. They cover batch boundaries, restored 3D state, source edits, eviction,
+skinning and reflection refreshes. The recorder does extra address-resolution
+work for these calls, so its native benchmark is unsuitable for comparing the
+submission cost to the preceding build.
+
+The audio worker samples its five detail timers once per eight 80-sample ticks,
+rotating the sampled tick between output buffers. This reduces those timers
+from 4,000 to 500 kernel clock reads per second at the existing 400 Hz cadence.
+Every sequencer/channel/stream/mixer/movie callback still runs on every tick.
+The log labels these five detailed times as estimates; audio work, lock/ME
+waits and thread CPU measurements remain exact. Native timing checks verify
+the clock-read reduction, weighted accounting, phase coverage and wraparound.
+Renderer and audio checks pass with LTO; actual FPS and audio playback still
+need a PSP capture using this EBOOT.
