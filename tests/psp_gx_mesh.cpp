@@ -2,8 +2,11 @@
 // transform, including the retail title lists when extracted data is present.
 #include <malloc.h>
 static unsigned int allocationFailures;
+static size_t textureAllocationBudget;
+static size_t (*textureResidentBytes)();
 static void* testMemalign(size_t alignment, size_t bytes) {
 	if (allocationFailures) { --allocationFailures; return nullptr; }
+	if (textureAllocationBudget && alignment == 16 && textureResidentBytes() + bytes > textureAllocationBudget) return nullptr;
 	return memalign(alignment, bytes);
 }
 #define memalign testMemalign
@@ -45,7 +48,7 @@ std::vector<PspGxVertex> triangles;
 struct MovieVertex { u16 u, v; s16 x, y, z; };
 std::vector<MovieVertex> sprites;
 const void* moviePixels;
-int movieFormat, movieStride, movieWrapU, movieWrapV;
+int movieFormat, movieStride, movieWrapU, movieWrapV, textureSwizzleMode;
 u32 pictureResidentCalls;
 u32 meshClockReads;
 bool recordingPresentation;
@@ -957,12 +960,12 @@ void sceGuAlphaFunc(int function, int reference, int mask)
 }
 void sceGuPixelMask(unsigned int mask) { guPixelMask = mask; ++rasterCalls; }
 void sceGuScissor(int, int, int, int) {}
-void sceGuTexMode(int mode, int, int, int) { movieFormat = mode; }
+void sceGuTexMode(int mode, int, int, int swizzle) { movieFormat = mode; textureSwizzleMode = swizzle; }
 void sceGuTexImage(int level, int width, int height, int stride, const void* pixels)
 {
 	assert(level == 0);
 	if (movieFormat == GU_PSM_5650) assert(width == 512 && height == 512);
-	else assert(movieFormat == GU_PSM_4444 && width <= 512 && height <= 512);
+	else assert((movieFormat == GU_PSM_4444 || movieFormat == GU_PSM_DXT1) && width <= 512 && height <= 512);
 	movieStride = stride; moviePixels = pixels;
 }
 void sceGuTexFunc(int, int) {}
@@ -1456,8 +1459,8 @@ void textureHeapPressure()
 	meshCacheGpuIdle();
 	for (auto& texture : sTextureCache) releaseTexture(texture);
 	resetState(); resetDraws();
-	u8 sources[100][32];
-	for (u32 i = 0; i < 100; ++i) memset(sources[i], i + 1, sizeof(sources[i]));
+	u8 sources[ARRAY_SIZE(sTextureCache) + 4][32];
+	for (u32 i = 0; i < ARRAY_SIZE(sources); ++i) memset(sources[i], i + 1, sizeof(sources[i]));
 	PspGxTexture* a = convertTexture(sources[0], 8, 4, GX_TF_I8);
 	PspGxTexture* b = convertTexture(sources[1], 8, 4, GX_TF_I8);
 	assert(a && b);
@@ -1486,7 +1489,7 @@ void textureHeapPressure()
 	}
 	assert(queuedTextureReads.size() == ARRAY_SIZE(sTextureCache));
 	u64 syncs = sTimings.textureSyncs;
-	assert(convertTexture(sources[96], 8, 4, GX_TF_I8));
+	assert(convertTexture(sources[ARRAY_SIZE(sTextureCache)], 8, 4, GX_TF_I8));
 	assert(sTimings.textureSyncs == syncs + 1 && queuedTextureReads.empty());
 	sState.listOpen = false; recordingTextureReads = false;
 	meshCacheGpuIdle();
@@ -1589,6 +1592,119 @@ void textureAssetTest(const char* path)
 	assert(transparent && visible);
 	printf("%s: %ux%u BTI matches independent pixel reference; %u transparent, %u visible pixels\n", path,width,height,transparent,visible);
 	releaseTexture(*texture);
+}
+
+u32 decodeNativeDxt(const PspGxTexture& texture, u32 x, u32 y)
+{
+	// Independent PSP layout/GE decode oracle: little-endian endpoints after
+	// four low-bit-first selector rows; linear rows of 4x4 blocks.
+	const u8* bytes = reinterpret_cast<const u8*>(texture.pixels);
+	const u8* block = bytes + (y/4 * (texture.storageWidth/4) + x/4) * 8;
+	u32 endpoint[2] = {u32(block[4] | block[5]<<8), u32(block[6] | block[7]<<8)};
+	u32 index = (block[y%4] >> (2*(x%4))) & 3;
+	if (endpoint[0] <= endpoint[1] && index == 3) return 0;
+	u32 channels[3];
+	for (u32 channel = 0; channel < 3; ++channel) {
+		u32 shift = channel == 0 ? 11 : channel == 1 ? 5 : 0;
+		u32 mask = channel == 1 ? 63 : 31, expand = channel == 1 ? 2 : 3;
+		u32 a = ((endpoint[0] >> shift) & mask) << expand;
+		u32 b = ((endpoint[1] >> shift) & mask) << expand;
+		channels[channel] = index == 0 ? a : index == 1 ? b : endpoint[0] <= endpoint[1] ? (a+b)/2
+		    : index == 2 ? (2*a+b)/3 : (a+2*b)/3;
+	}
+	return GU_RGBA(channels[0],channels[1],channels[2],255);
+}
+
+void compressedTextureFormats()
+{
+	u32 pixelsChecked = 0;
+	for (const auto& size : std::vector<std::array<u16,2>>{{8,8},{12,20},{16,8},{64,32},{512,512},{1024,64},{1024,1024},{2048,32},{4096,8},{7,13}}) {
+		u32 width = size[0], height = size[1];
+		std::vector<u8> input(((width+7)/8) * ((height+7)/8) * 32);
+		// Unique block colors, both endpoint orderings and selector patterns.
+		for (u32 i = 0; i < input.size(); ++i) input[i] = (i * 37 + i/23) & 255;
+		meshCacheGpuIdle();
+		auto* texture = convertTexture(input.data(), width, height, GX_TF_CMPR); assert(texture);
+		bool compressed = width >= 8 && height >= 8 && width <= 512 && height <= 512 && !(width&3) && !(height&3);
+		assert(texture->nativeFormat == (compressed ? GU_PSM_DXT1 : GU_PSM_4444));
+		assert(texture->byteCount == u32(texture->storageWidth)*texture->storageHeight * (compressed ? 1 : 4)/2);
+		u32 step = 1; while ((width+step-1)/step > 512 || (height+step-1)/step > 512) step *= 2;
+		for (u32 y = 0; y < texture->storageHeight; ++y) for (u32 x = 0; x < texture->storageWidth; ++x) {
+			u32 source = x < texture->activeWidth && y < texture->activeHeight
+			    ? decodeTexturePixel(input.data(), width, GX_TF_CMPR, x*step, y*step) : 0;
+			if (compressed) {
+				u32 actual = decodeNativeDxt(*texture,x,y);
+				assert((actual>>24) == (source>>24));
+				for (u32 channel = 0; channel < 3; ++channel)
+					assert(abs(int((actual>>(channel*8))&255)-int((source>>(channel*8))&255)) <= 7);
+			} else {
+				u16 expected = rgbaTo4444(source&255,(source>>8)&255,(source>>16)&255,source>>24);
+				assert(texture->pixels[texturePixelOffset(x,y,texture->storageWidth,texture->storageHeight)] == expected);
+			}
+			++pixelsChecked;
+		}
+		GXTexObjPriv object = {};
+		GXInitTexObj(reinterpret_cast<GXTexObj*>(&object), input.data(), width, height, GX_TF_CMPR, GX_REPEAT, GX_REPEAT, GX_FALSE);
+		texture->source = reinterpret_cast<void*>(uintptr_t(object.image3));
+		GXLoadTexObj(reinterpret_cast<GXTexObj*>(&object), GX_TEXMAP0);
+		assert(movieFormat == int(texture->nativeFormat));
+		assert(textureSwizzleMode == (compressed ? GU_FALSE : textureSwizzled(texture->storageWidth,texture->storageHeight)));
+		meshCacheGpuIdle(); releaseTexture(*texture);
+	}
+	printf("CMPR uploads: %u native/sampled texels preserve selectors, endpoint order, alpha, padding, dimensions and bindings\n", pixelsChecked);
+}
+
+void textureModelReplay(const char* path)
+{
+	std::ifstream file(path, std::ios::binary); assert(file.good());
+	Reader r; r.data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+	struct Image { const u8* data; u16 width,height; GXTexFmt format; };
+	std::vector<Image> images;
+	const GXTexFmt formats[] = {GX_TF_RGB565,GX_TF_CMPR,GX_TF_RGB5A3,GX_TF_I4,GX_TF_I8,GX_TF_IA4,GX_TF_IA8,GX_TF_RGBA8};
+	while (r.pos+8 <= r.data.size()) {
+		u32 chunk = r.read32(), bytes = r.read32(), next = r.pos+bytes;
+		if (chunk == 0xffff) break;
+		if (chunk == 0x20) {
+			u32 count = r.read32(); r.align();
+			for (u32 i = 0; i < count; ++i) {
+				u16 width = r.read16(), height = r.read16(); u32 format = r.read32();
+				for (u32 j = 0; j < 5; ++j) r.read32();
+				u32 size = r.read32(); assert(format < ARRAY_SIZE(formats) && r.pos+size <= r.data.size());
+				images.push_back({r.data.data()+r.pos,width,height,formats[format]}); r.pos += size;
+			}
+		}
+		r.pos = next; r.align();
+	}
+	assert(!images.empty());
+	meshCacheGpuIdle(); for (auto& texture : sTextureCache) releaseTexture(texture);
+	textureResidentBytes = []() -> size_t { return sTextureCacheBytes; };
+	textureAllocationBudget = 6 * 1024 * 1024; // Below observed PSP residency pressure.
+	u64 misses = 0, evictions = 0, syncs = 0; u32 oldBytes = 0;
+	for (u32 frame = 0; frame < 5; ++frame) {
+		meshCacheGpuIdle();
+		if (frame == 1) { misses = sTimings.textureMisses; evictions = sTimings.textureMemoryEvictions; syncs = sTimings.textureSyncs; }
+		for (const auto& image : images) {
+			auto* texture = convertTexture(image.data,image.width,image.height,image.format); assert(texture);
+			texture->gpuEpoch = sMeshCacheEpoch;
+			if (frame == 0) {
+				oldBytes += u32(texture->storageWidth)*texture->storageHeight*2;
+				if (texture->nativeFormat == GU_PSM_DXT1) {
+					for (u32 y = 0; y < image.height; ++y) for (u32 x = 0; x < image.width; ++x) {
+						u32 expected = decodeTexturePixel(image.data,image.width,image.format,x,y);
+						u32 actual = decodeNativeDxt(*texture,x,y);
+						assert((expected>>24) == (actual>>24));
+						for (u32 channel = 0; channel < 3; ++channel)
+							assert(abs(int((expected>>(channel*8))&255)-int((actual>>(channel*8))&255)) <= 7);
+					}
+				}
+			}
+		}
+	}
+	assert(sTimings.textureMisses == misses && sTimings.textureMemoryEvictions == evictions && sTimings.textureSyncs == syncs);
+	printf("%s: %zu textures, resident bytes %u -> %u; four steady frames have zero misses/evictions/syncs under 6 MiB texture heap cap\n",
+	       path,images.size(),oldBytes,sTextureCacheBytes);
+	textureAllocationBudget = 0;
+	meshCacheGpuIdle(); for (auto& texture : sTextureCache) releaseTexture(texture);
 }
 
 void rasterStateReuse()
@@ -1874,6 +1990,7 @@ int main(int argc, char** argv)
 	swizzledTextures();
 	textureTransparency();
 	textureHeapPressure();
+	compressedTextureFormats();
 	resetState();
 	sState.texSource = GX_TG_TEX0;
 	MeshCacheKey ordinary, changed;
@@ -1930,6 +2047,9 @@ int main(int argc, char** argv)
 	movieFrame();
 	particleColours();
 	for (int i = 1; i < argc; ++i) {
+		if (strcmp(argv[i], "--texture-model") == 0) {
+			assert(i+1 < argc); textureModelReplay(argv[++i]); continue;
+		}
 		const char* extension = strrchr(argv[i], '.');
 		if (extension && strcmp(extension, ".bti") == 0) textureAssetTest(argv[i]);
 		else modelTest(argv[i]);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check GPU mesh batching natively; optionally pass extracted .mod files."""
+"""Check the PSP renderer; pass .mod/.bti assets or --texture-model map.mod."""
 import os
 from pathlib import Path
 import subprocess

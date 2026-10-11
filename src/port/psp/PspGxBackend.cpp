@@ -102,6 +102,7 @@ struct PspGxTexture {
 	u16* pixels;
 	u32 byteCount;
 	u32 lastUse;
+	u32 nativeFormat;
 	u64 gpuEpoch;
 };
 
@@ -110,7 +111,7 @@ GXFifoObj sFifo;
 // Match the proven OOT PSP backend's 2 MiB direct-list budget.  Transient
 // vertices returned by sceGuGetMemory live inside this same buffer.
 u32 sGxDisplayList[262144 * 2] __attribute__((aligned(64)));
-PspGxTexture sTextureCache[96];
+PspGxTexture sTextureCache[256];
 PspGxTexture* sBoundTexture;
 u32 sTextureCacheBytes;
 u32 sTextureUseCounter;
@@ -138,6 +139,7 @@ struct FrameTimings {
 	u64 decodedVertices, skinnedVertices, fallbackLists, textureMisses, meshCacheHits, cachedVertices, meshCacheValidation, arrayValidation;
 	u64 weldedVerticesSaved;
 	u64 textureFailures, textureMemoryEvictions, textureSyncs;
+	u64 compressedTextureUploads, textureDecodedPixels;
 	u64 meshMissAbsent, meshMissState, meshMissSource, meshStoreFailures, meshEvictions;
 	u64 texCoordRefreshes, texCoordRefreshVertices;
 	u64 meshKeyBuilds;
@@ -240,6 +242,7 @@ void recordFrameTimings()
 				fputs("Presentation: triple-buffered 480x272 RGBA8888; GPU completion before pacing, no extra refresh wait for late frames. Animated UV refresh copies geometry and generates coordinates in one pass.\n", file);
 				fputs("Geometry: joined native GE triangle strips when cheaper than triangle expansion; exact unsigned-byte bone weights; idle mesh reclamation on heap pressure.\n", file);
 				fputs("Vertices: identical FIFO inputs shared across primitives; original primitive winding/degenerates and animated UV inputs preserved.\n", file);
+				fputs("Textures: 256 cache entries; eligible CMPR uploads use native GE DXT1, oversized CMPR retains sampled 4444 conversion with one palette decode per block.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -276,9 +279,13 @@ void recordFrameTimings()
 			        sTimings.stripDraws / 120.0, sTimings.stripIndicesSaved / 120.0);
 			fprintf(file, "  mesh_memory_evictions=%.1f\n", sTimings.meshMemoryEvictions / 120.0);
 			fprintf(file, "  mesh_welded_vertices_saved=%.1f\n", sTimings.weldedVerticesSaved / 120.0);
-			fprintf(file, "  texture_failures=%.1f texture_memory_evictions=%.1f texture_syncs=%.1f texture_cache_bytes=%u\n",
+			u32 residentTextures = 0;
+			for (const auto& texture : sTextureCache) if (texture.pixels) ++residentTextures;
+			fprintf(file, "  texture_failures=%.1f texture_memory_evictions=%.1f texture_syncs=%.1f texture_cache_bytes=%u texture_cache_entries=%u\n",
 			        sTimings.textureFailures / 120.0, sTimings.textureMemoryEvictions / 120.0,
-			        sTimings.textureSyncs / 120.0, sTextureCacheBytes);
+			        sTimings.textureSyncs / 120.0, sTextureCacheBytes, residentTextures);
+			fprintf(file, "  texture_compressed_uploads=%.1f texture_decoded_pixels=%.1f\n",
+			        sTimings.compressedTextureUploads / 120.0, sTimings.textureDecodedPixels / 120.0);
 			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
 			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
 			        metrics[PikminPsp::PerformanceMovieConvert] / 120000.0,
@@ -334,6 +341,22 @@ u32 decodeRgb565(u16 texel)
 	u8 green = expand6((texel >> 5) & 0x3f);
 	u8 blue = expand5(texel & 0x1f);
 	return GU_RGBA(red, green, blue, 255);
+}
+
+void decodeCmprPalette(const u8* compressed, u32 (&palette)[4])
+{
+	u16 colour0 = ((u16)compressed[0] << 8) | compressed[1];
+	u16 colour1 = ((u16)compressed[2] << 8) | compressed[3];
+	palette[0] = decodeRgb565(colour0); palette[1] = decodeRgb565(colour1);
+	u8 r0 = palette[0] & 0xff, g0 = (palette[0] >> 8) & 0xff, b0 = (palette[0] >> 16) & 0xff;
+	u8 r1 = palette[1] & 0xff, g1 = (palette[1] >> 8) & 0xff, b1 = (palette[1] >> 16) & 0xff;
+	if (colour0 > colour1) {
+		palette[2] = GU_RGBA((2*r0+r1)/3, (2*g0+g1)/3, (2*b0+b1)/3, 255);
+		palette[3] = GU_RGBA((r0+2*r1)/3, (g0+2*g1)/3, (b0+2*b1)/3, 255);
+	} else {
+		palette[2] = GU_RGBA((r0+r1)/2, (g0+g1)/2, (b0+b1)/2, 255);
+		palette[3] = 0;
+	}
 }
 
 u32 decodeTexturePixel(const u8* source, u32 width, GXTexFmt format, u32 x, u32 y)
@@ -402,24 +425,8 @@ u32 decodeTexturePixel(const u8* source, u32 width, GXTexFmt format, u32 x, u32 
 		u32 block = ((y / 8) * ((width + 7) / 8) + x / 8) * 32;
 		u32 subBlock = ((y & 7) / 4) * 2 + (x & 7) / 4;
 		const u8* compressed = source + block + subBlock * 8;
-		u16 colour0 = ((u16)compressed[0] << 8) | compressed[1];
-		u16 colour1 = ((u16)compressed[2] << 8) | compressed[3];
 		u32 palette[4];
-		palette[0] = decodeRgb565(colour0);
-		palette[1] = decodeRgb565(colour1);
-		u8 r0 = palette[0] & 0xff;
-		u8 g0 = (palette[0] >> 8) & 0xff;
-		u8 b0 = (palette[0] >> 16) & 0xff;
-		u8 r1 = palette[1] & 0xff;
-		u8 g1 = (palette[1] >> 8) & 0xff;
-		u8 b1 = (palette[1] >> 16) & 0xff;
-		if (colour0 > colour1) {
-			palette[2] = GU_RGBA((2 * r0 + r1) / 3, (2 * g0 + g1) / 3, (2 * b0 + b1) / 3, 255);
-			palette[3] = GU_RGBA((r0 + 2 * r1) / 3, (g0 + 2 * g1) / 3, (b0 + 2 * b1) / 3, 255);
-		} else {
-			palette[2] = GU_RGBA((r0 + r1) / 2, (g0 + g1) / 2, (b0 + b1) / 2, 255);
-			palette[3] = 0;
-		}
+		decodeCmprPalette(compressed, palette);
 		u8 selectors = compressed[4 + (y & 3)];
 		return palette[(selectors >> (6 - (x & 3) * 2)) & 3];
 	}
@@ -493,6 +500,54 @@ u32 texturePixelOffset(u32 x, u32 y, u32 width, u32 height)
 	return (y >> 3) * width * 8 + (x >> 3) * 64 + (y & 7) * 8 + (x & 7);
 }
 
+// GX CMPR and GE DXT1 contain the same RGB565 endpoints and two-bit
+// selectors. Rearrange blocks/bytes without expanding texels on the CPU.
+// PSP stores selectors first, low bits first, then little-endian endpoints.
+// Oversized images still use the existing sampled conversion below.
+void convertCmprBlocks(u8* output, const u8* input, u32 width, u32 height, u32 storageWidth, u32 storageHeight)
+{
+	for (u32 y = 0; y < storageHeight; y += 4) for (u32 x = 0; x < storageWidth; x += 4) {
+		u8* block = output + (y/4 * (storageWidth/4) + x/4) * 8;
+		if (x >= width || y >= height) {
+			memset(block, 0xff, 4); memset(block + 4, 0, 4); // Transparent padding.
+			continue;
+		}
+		const u8* source = input + (y/8 * ((width+7)/8) + x/8) * 32
+		    + ((y%8)/4 * 2 + (x%8)/4) * 8;
+		for (u32 row = 0; row < 4; ++row) {
+			u32 selectors = source[4 + row];
+			block[row] = ((selectors & 0xc0) >> 6) | ((selectors & 0x30) >> 2)
+			    | ((selectors & 0x0c) << 2) | ((selectors & 0x03) << 6);
+		}
+		block[4] = source[1]; block[5] = source[0];
+		block[6] = source[3]; block[7] = source[2];
+	}
+}
+
+void convertSampledCmpr(u16* output, const u8* input, u32 width, u32 activeWidth, u32 activeHeight,
+                        u32 storageWidth, u32 storageHeight, u32 step)
+{
+	// Decode endpoints once per source block, instead of once per sampled
+	// texel. Keep the existing nearest sampling and 4444 rounding exactly.
+	u32 blockPixels = 4 / step;
+	for (u32 y = 0; y < activeHeight; y += blockPixels) for (u32 x = 0; x < activeWidth; x += blockPixels) {
+		u32 sx = x * step, sy = y * step;
+		const u8* source = input + (sy/8 * ((width+7)/8) + sx/8) * 32
+		    + ((sy%8)/4 * 2 + (sx%8)/4) * 8;
+		u32 palette[4]; decodeCmprPalette(source, palette);
+		u16 packed[4];
+		for (u32 i = 0; i < 4; ++i) {
+			u32 c = palette[i]; packed[i] = rgbaTo4444(c & 255, (c >> 8) & 255, (c >> 16) & 255, c >> 24);
+		}
+		for (u32 row = 0; row < blockPixels && y + row < activeHeight; ++row) {
+			u32 selectors = source[4 + row * step];
+			for (u32 column = 0; column < blockPixels && x + column < activeWidth; ++column)
+				output[texturePixelOffset(x+column, y+row, storageWidth, storageHeight)]
+				    = packed[(selectors >> (6-column*step*2)) & 3];
+		}
+	}
+}
+
 PspGxTexture* convertTexture(const void* source, u16 width, u16 height, GXTexFmt format)
 {
 	if (!source || !width || !height) return nullptr;
@@ -512,7 +567,9 @@ PspGxTexture* convertTexture(const void* source, u16 width, u16 height, GXTexFmt
 	u16 activeHeight = (height + sampleStep - 1) / sampleStep;
 	u16 storageWidth = nextPowerOfTwo(activeWidth);
 	u16 storageHeight = nextPowerOfTwo(activeHeight);
-	u32 byteCount = (u32)storageWidth * storageHeight * sizeof(u16);
+	const bool compressed = format == GX_TF_CMPR && sampleStep == 1
+	    && width >= 8 && height >= 8 && !(width & 3) && !(height & 3);
+	u32 byteCount = (u32)storageWidth * storageHeight * (compressed ? 1 : 4) / 2;
 	if (byteCount > kTextureCacheLimit) return nullptr;
 	while (sTextureCacheBytes + byteCount > kTextureCacheLimit) {
 		PspGxTexture* victim = oldestResidentTexture();
@@ -538,12 +595,21 @@ PspGxTexture* convertTexture(const void* source, u16 width, u16 height, GXTexFmt
 	if (!pixels) return nullptr;
 	memset(pixels, 0, byteCount);
 	const u8* input = static_cast<const u8*>(source);
-	for (u32 y = 0; y < activeHeight; ++y) {
-		for (u32 x = 0; x < activeWidth; ++x) {
-			u32 colour = decodeTexturePixel(input, width, format, MIN(x * sampleStep, (u32)width - 1),
-			                                MIN(y * sampleStep, (u32)height - 1));
-			pixels[texturePixelOffset(x, y, storageWidth, storageHeight)] = rgbaTo4444(colour & 0xff, (colour >> 8) & 0xff, (colour >> 16) & 0xff,
-			                                                 colour >> 24);
+	if (compressed) {
+		convertCmprBlocks(reinterpret_cast<u8*>(pixels), input, width, height, storageWidth, storageHeight);
+		++sTimings.compressedTextureUploads;
+	} else if (format == GX_TF_CMPR && sampleStep <= 4) {
+		convertSampledCmpr(pixels, input, width, activeWidth, activeHeight, storageWidth, storageHeight, sampleStep);
+		sTimings.textureDecodedPixels += (u32)activeWidth * activeHeight;
+	} else {
+		sTimings.textureDecodedPixels += (u32)activeWidth * activeHeight;
+		for (u32 y = 0; y < activeHeight; ++y) {
+			for (u32 x = 0; x < activeWidth; ++x) {
+				u32 colour = decodeTexturePixel(input, width, format, MIN(x * sampleStep, (u32)width - 1),
+				                                MIN(y * sampleStep, (u32)height - 1));
+				pixels[texturePixelOffset(x, y, storageWidth, storageHeight)] = rgbaTo4444(colour & 0xff, (colour >> 8) & 0xff, (colour >> 16) & 0xff,
+				                                                 colour >> 24);
+			}
 		}
 	}
 	sceKernelDcacheWritebackRange(pixels, byteCount);
@@ -555,6 +621,7 @@ PspGxTexture* convertTexture(const void* source, u16 width, u16 height, GXTexFmt
 	texture->storageWidth = storageWidth;
 	texture->storageHeight = storageHeight;
 	texture->format = format;
+	texture->nativeFormat = compressed ? GU_PSM_DXT1 : GU_PSM_4444;
 	texture->pixels = pixels;
 	texture->byteCount = byteCount;
 	texture->lastUse = ++sTextureUseCounter;
@@ -2140,7 +2207,7 @@ void GXCopyTex(void* destination, GXBool clear) {
 	// GXLoadTexObj when this same render target is sampled again.
 	for (u32 i = 0; i < ARRAY_SIZE(sTextureCache); ++i) {
 		PspGxTexture& texture = sTextureCache[i];
-		if (texture.source != destination || !texture.pixels) continue;
+		if (texture.source != destination || !texture.pixels || texture.format != sState.copyFormat) continue;
 		for (u32 y = 0; y < texture.activeHeight; ++y) {
 			for (u32 x = 0; x < texture.activeWidth; ++x) {
 				u32 colour = decodeTexturePixel(static_cast<const u8*>(destination), texture.sourceWidth, texture.format,
@@ -2281,7 +2348,8 @@ void GXLoadTexObj(GXTexObj* object, GXTexMapID id)
 	sBoundTexture = texture;
 	texture->gpuEpoch = sMeshCacheEpoch;
 	sState.textureLoadFailed = false;
-	sceGuTexMode(GU_PSM_4444, 0, 0, textureSwizzled(texture->storageWidth, texture->storageHeight) ? GU_TRUE : GU_FALSE);
+	sceGuTexMode(texture->nativeFormat, 0, 0,
+	             texture->nativeFormat == GU_PSM_4444 && textureSwizzled(texture->storageWidth, texture->storageHeight) ? GU_TRUE : GU_FALSE);
 	sceGuTexImage(0, texture->storageWidth, texture->storageHeight, texture->storageWidth, texture->pixels);
 	sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
 	int filter = source->mode1 ? GU_LINEAR : GU_NEAREST;

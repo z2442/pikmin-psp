@@ -878,3 +878,49 @@ color across black TEV register writes. Model checks include the Pellet Posy
 alongside the opening/logo, Olimar and ship. Hardware verification of the
 reported flower/portrait artifacts and performance remains necessary; the
 backend still approximates multistage TEV materials with one texture stage.
+
+### Wake-up fade texture-cache regression
+
+The capture after residency fixes reaches 1.45 FPS over the gameplay-entry
+window: 691.68 ms/frame, 634.77 ms texture work and only 1.48 ms list waits.
+About 10 textures are decoded and evicted per frame, with 6,514,688 resident
+bytes. Making previously missing textures load correctly exposed a working
+set larger than the available heap. Increasing the 8 MiB byte limit alone
+cannot resolve allocation pressure which already occurs below that limit.
+
+The cache now holds 256 entries instead of 96. Eligible CMPR textures (at most
+512x512, full 4x4 blocks) are uploaded as native GE DXT1. Conversion rearranges
+GX's 8x8 tile/subblock order, reverses each row's two-bit selector order and
+writes the two RGB565 endpoints little-endian after the selector rows. It
+does not decode or recompress texels. This uses one quarter of the previous
+4444 storage at the same dimensions, retaining source endpoints, selectors
+and one-bit transparency. Padding blocks are transparent; DXT1 uses linear
+block rows rather than the 4444 swizzle. The layout and decoding are verified
+against [PPSSPP's DXT1 definition](https://github.com/hrydgard/ppsspp/blob/master/GPU/Common/TextureDecoder.h)
+and [decoder](https://github.com/hrydgard/ppsspp/blob/master/GPU/Common/TextureDecoder.cpp).
+
+Oversized textures retain the prior nearest-sampled dimensions and 4444
+output. Their converter now calculates the four-color palette once per source
+block, instead of repeating it for each sampled texel. Unsupported small or
+partial-block images also retain the sampled path. Native endpoint expansion
+uses the GE's RGB565 precision; tests permit at most seven channel levels
+against the CPU's expanded endpoints and require identical alpha. The previous
+4444 conversion had its own four-bit RGB quantization. GPU DXT sampling cost
+must still be measured on PSP.
+
+Actual practice-map texture storage falls from 7,593,984 to 4,700,160 bytes
+(38.1% fewer); forest storage falls from 6,129,664 to 2,295,808 (62.5% fewer).
+Replaying all 24 practice and 36 forest textures for four steady frames under
+an injected 6 MiB texture allocation cap produces no misses, evictions or
+synchronizations. These are residency tests, not hardware FPS measurements.
+Native/LTO sanitizer checks cover 548,160 synthetic texels, real map blocks,
+transparent padding, endpoint orders, selectors, native GU bindings, and exact
+sampled fallback pixels. Smoke/dust/portrait asset checks and queued-read
+lifetime protection remain in place, including exhaustion of all 256 slots.
+
+`texture_compressed_uploads`, `texture_decoded_pixels` and
+`texture_cache_entries` now identify the selected path and cache occupancy.
+To repeat the map test, add `--texture-model path/to/map.mod` to
+`python3 tools/check_psp_gx.py`; ordinary `.mod` and `.bti` arguments still
+exercise geometry and transparency. Verify the rebuilt EBOOT's wake-up fade
+on PSP with the new performance capture.
