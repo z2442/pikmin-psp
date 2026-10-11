@@ -58,6 +58,7 @@ struct PspGxState {
 	bool inPrimitive;
 	bool transform3D;
 	bool textureEnabled;
+	bool textureLoadFailed;
 	bool verticesPretransformed;
 	u32 currentColour;
 	u32 particleColour;
@@ -101,6 +102,7 @@ struct PspGxTexture {
 	u16* pixels;
 	u32 byteCount;
 	u32 lastUse;
+	u64 gpuEpoch;
 };
 
 PspGxState sState;
@@ -109,6 +111,7 @@ GXFifoObj sFifo;
 // vertices returned by sceGuGetMemory live inside this same buffer.
 u32 sGxDisplayList[262144 * 2] __attribute__((aligned(64)));
 PspGxTexture sTextureCache[96];
+PspGxTexture* sBoundTexture;
 u32 sTextureCacheBytes;
 u32 sTextureUseCounter;
 u32 sDebugFrameCount;
@@ -134,6 +137,7 @@ struct FrameTimings {
 	u64 modelMatrixUploads;
 	u64 decodedVertices, skinnedVertices, fallbackLists, textureMisses, meshCacheHits, cachedVertices, meshCacheValidation, arrayValidation;
 	u64 weldedVerticesSaved;
+	u64 textureFailures, textureMemoryEvictions, textureSyncs;
 	u64 meshMissAbsent, meshMissState, meshMissSource, meshStoreFailures, meshEvictions;
 	u64 texCoordRefreshes, texCoordRefreshVertices;
 	u64 meshKeyBuilds;
@@ -272,6 +276,9 @@ void recordFrameTimings()
 			        sTimings.stripDraws / 120.0, sTimings.stripIndicesSaved / 120.0);
 			fprintf(file, "  mesh_memory_evictions=%.1f\n", sTimings.meshMemoryEvictions / 120.0);
 			fprintf(file, "  mesh_welded_vertices_saved=%.1f\n", sTimings.weldedVerticesSaved / 120.0);
+			fprintf(file, "  texture_failures=%.1f texture_memory_evictions=%.1f texture_syncs=%.1f texture_cache_bytes=%u\n",
+			        sTimings.textureFailures / 120.0, sTimings.textureMemoryEvictions / 120.0,
+			        sTimings.textureSyncs / 120.0, sTextureCacheBytes);
 			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
 			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
 			        metrics[PikminPsp::PerformanceMovieConvert] / 120000.0,
@@ -340,7 +347,7 @@ u32 decodeTexturePixel(const u8* source, u32 width, GXTexFmt format, u32 x, u32 
 	{
 		u32 block = ((y / 8) * ((width + 7) / 8) + x / 8) * 32;
 		u8 packed = source[block + (y & 7) * 4 + (x & 7) / 2];
-		red = green = blue = expand4((x & 1) ? packed & 0xf : packed >> 4);
+		red = green = blue = alpha = expand4((x & 1) ? packed & 0xf : packed >> 4);
 		break;
 	}
 	case GX_TF_I8:
@@ -349,7 +356,7 @@ u32 decodeTexturePixel(const u8* source, u32 width, GXTexFmt format, u32 x, u32 
 		u32 block = ((y / 4) * ((width + 7) / 8) + x / 8) * 32;
 		u8 texel = source[block + (y & 3) * 8 + (x & 7)];
 		if (format == GX_TF_I8) {
-			red = green = blue = texel;
+			red = green = blue = alpha = texel;
 		} else {
 			alpha = expand4(texel >> 4);
 			red = green = blue = expand4(texel & 0xf);
@@ -431,6 +438,7 @@ u16 nextPowerOfTwo(u16 value)
 
 void releaseTexture(PspGxTexture& texture)
 {
+	if (sBoundTexture == &texture) sBoundTexture = nullptr;
 	if (texture.pixels) {
 		free(texture.pixels);
 		sTextureCacheBytes -= texture.byteCount;
@@ -443,6 +451,7 @@ PspGxTexture* leastRecentlyUsedTexture()
 	PspGxTexture* result = nullptr;
 	for (u32 i = 0; i < ARRAY_SIZE(sTextureCache); ++i) {
 		if (!sTextureCache[i].pixels) return &sTextureCache[i];
+		if (sTextureCache[i].gpuEpoch == sMeshCacheEpoch) continue;
 		if (!result || sTextureCache[i].lastUse < result->lastUse) result = &sTextureCache[i];
 	}
 	return result;
@@ -453,9 +462,25 @@ PspGxTexture* oldestResidentTexture()
 	PspGxTexture* result = nullptr;
 	for (u32 i = 0; i < ARRAY_SIZE(sTextureCache); ++i) {
 		if (!sTextureCache[i].pixels) continue;
+		if (sTextureCache[i].gpuEpoch == sMeshCacheEpoch) continue;
 		if (!result || sTextureCache[i].lastUse < result->lastUse) result = &sTextureCache[i];
 	}
 	return result;
+}
+
+// Finish only when texture pressure leaves no safe victim. Already queued
+// draws must complete before their texels can be freed/reused. GU state and
+// the current render target persist when the direct list is restarted.
+bool finishTextureUses()
+{
+	if (!sState.listOpen) return false;
+	u32 start = sceKernelGetSystemTimeLow();
+	sceGuFinish(); sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
+	meshCacheGpuIdle();
+	sTimings.listWait += (u32)(sceKernelGetSystemTimeLow() - start);
+	++sTimings.splits; ++sTimings.textureSyncs;
+	sceGuStart(GU_DIRECT, sGxDisplayList);
+	return true;
 }
 
 // GE swizzling groups 16 bytes by eight rows. Keep tiny images linear so
@@ -491,14 +516,25 @@ PspGxTexture* convertTexture(const void* source, u16 width, u16 height, GXTexFmt
 	if (byteCount > kTextureCacheLimit) return nullptr;
 	while (sTextureCacheBytes + byteCount > kTextureCacheLimit) {
 		PspGxTexture* victim = oldestResidentTexture();
-		if (!victim) break;
+		if (!victim && finishTextureUses()) victim = oldestResidentTexture();
+		if (!victim) return nullptr;
 		releaseTexture(*victim);
 	}
 	PspGxTexture* texture = leastRecentlyUsedTexture();
+	if (!texture && finishTextureUses()) texture = leastRecentlyUsedTexture();
 	if (!texture) return nullptr;
 	if (texture->pixels) releaseTexture(*texture);
 
 	u16* pixels = static_cast<u16*>(memalign(16, byteCount));
+	// The game heap can run out before this cache reaches its own budget.
+	// Release old scene textures and retry, while preserving queued GE reads.
+	while (!pixels) {
+		PspGxTexture* victim = oldestResidentTexture();
+		if (!victim && finishTextureUses()) victim = oldestResidentTexture();
+		if (!victim) break;
+		releaseTexture(*victim); ++sTimings.textureMemoryEvictions;
+		pixels = static_cast<u16*>(memalign(16, byteCount));
+	}
 	if (!pixels) return nullptr;
 	memset(pixels, 0, byteCount);
 	const u8* input = static_cast<const u8*>(source);
@@ -794,6 +830,7 @@ void submitVertices(const void* vertices, u32 count, int primitive, const u16* i
 	++sDebugDrawCalls;
 	sDebugVertexCount += count;
 	if (sState.textureEnabled) ++sDebugTexturedDrawCalls;
+	if (sState.textureEnabled && sBoundTexture) sBoundTexture->gpuEpoch = sMeshCacheEpoch;
 	if (sState.textureEnabled) setGuEnabled(GU_TEXTURE_2D, true); else setGuEnabled(GU_TEXTURE_2D, false);
 	const int format = GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF
 	                 | (indices ? GU_INDEX_16BIT : 0)
@@ -1836,6 +1873,7 @@ GXFifoObj* GXInit(void*, u32)
 	memset(&sState, 0, sizeof(sState));
 	sMeshTimingSequence = 0;
 	sState.currentColour = 0xffffffff;
+	sBoundTexture = nullptr;
 	sState.clearColour = 0xff000000;
 	sState.clearDepth = 0;
 	sceGuInit();
@@ -1969,7 +2007,7 @@ void GXSetBlendMode(GXBlendMode mode, GXBlendFactor source, GXBlendFactor destin
 // to camera-facing quads once the indexed-geometry path is enabled.
 void GXSetLineWidth(u8, GXTexOffset) { }
 void GXSetPointSize(u8, GXTexOffset) { }
-void GXSetNumTexGens(u8 count) { sState.textureEnabled = count != 0; }
+void GXSetNumTexGens(u8 count) { sState.textureEnabled = count != 0 && !sState.textureLoadFailed; }
 void GXClearVtxDesc(void)
 {
 	for (u32 i = 0; i < GX_VA_MAX_ATTR; ++i) sState.attributes[i].source = GX_NONE;
@@ -2184,9 +2222,10 @@ void GXSetTevColorOp(GXTevStageID stage, GXTevOp op, GXTevBias bias, GXTevScale 
 void GXSetTevAlphaOp(GXTevStageID, GXTevOp, GXTevBias, GXTevScale, GXBool, GXTevRegID) { }
 void GXSetTevColor(GXTevRegID reg, GXColor colour)
 {
-	sState.currentColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a);
+	// TEV registers and raster material color are independent GX state.
+	// Writing a black environment/konst color must not blacken later draws.
 	if (reg == GX_TEVREG0) {
-		sState.particleColour = sState.currentColour;
+		sState.particleColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a);
 		sState.tevColour0 = (GXColorS10){colour.r, colour.g, colour.b, colour.a};
 	}
 }
@@ -2194,7 +2233,7 @@ void GXSetTevColorS10(GXTevRegID reg, GXColorS10 colour)
 {
 	if (reg == GX_TEVREG0) sState.tevColour0 = colour;
 }
-void GXSetTevKColor(GXTevKColorID, GXColor colour) { sState.currentColour = GU_RGBA(colour.r, colour.g, colour.b, colour.a); }
+void GXSetTevKColor(GXTevKColorID, GXColor) { }
 void GXSetTevKColorSel(GXTevStageID, GXTevKColorSel) { }
 void GXSetTevKAlphaSel(GXTevStageID, GXTevKAlphaSel) { }
 void GXSetTevSwapMode(GXTevStageID, GXTevSwapSel, GXTevSwapSel) { }
@@ -2232,10 +2271,16 @@ void GXLoadTexObj(GXTexObj* object, GXTexMapID id)
 	PspGxTexture* texture = convertTexture(reinterpret_cast<void*>(source->image3), width, height, source->format);
 	if (!texture) {
 		++sDebugTextureFailures;
+		++sTimings.textureFailures;
+		sState.textureLoadFailed = true;
+		sBoundTexture = nullptr;
 		sState.textureEnabled = false;
 		return;
 	}
 	++sDebugTextureLoads;
+	sBoundTexture = texture;
+	texture->gpuEpoch = sMeshCacheEpoch;
+	sState.textureLoadFailed = false;
 	sceGuTexMode(GU_PSM_4444, 0, 0, textureSwizzled(texture->storageWidth, texture->storageHeight) ? GU_TRUE : GU_FALSE);
 	sceGuTexImage(0, texture->storageWidth, texture->storageHeight, texture->storageWidth, texture->pixels);
 	sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);

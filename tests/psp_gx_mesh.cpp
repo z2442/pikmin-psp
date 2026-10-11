@@ -49,6 +49,9 @@ int movieFormat, movieStride, movieWrapU, movieWrapV;
 u32 pictureResidentCalls;
 u32 meshClockReads;
 bool recordingPresentation;
+bool recordingTextureReads;
+struct QueuedTextureRead { const void* pixels; std::vector<u8> bytes; };
+std::vector<QueuedTextureRead> queuedTextureReads;
 u32 displayVcount, vblankWaits, gpuRefreshes;
 void* visibleBuffer;
 void* pendingBuffer;
@@ -898,6 +901,10 @@ void* sceGuGetMemory(int size) { u32 start = used; used += (size + 15) & ~15U; a
 int sceGuCheckList() { return used; }
 int sceGuFinish() { if (recordingPresentation) presentationEvents.push_back(0); return 0; }
 int sceGuSync(int, int) {
+	if (recordingTextureReads) {
+		for (const auto& read : queuedTextureReads) assert(!memcmp(read.pixels, read.bytes.data(), read.bytes.size()));
+		queuedTextureReads.clear();
+	}
 	if (recordingPresentation) { presentationEvents.push_back(1); advanceScanout(gpuRefreshes); }
 	return 0;
 }
@@ -970,6 +977,10 @@ void sceGuBoneMatrix(unsigned int index, const ScePspFMatrix4* matrix) { assert(
 void sceGuDrawArray(int primitive, int format, int count, const void* indexData, const void* vertexData)
 {
 	++drawCalls;
+	if (recordingTextureReads && sState.textureEnabled && sBoundTexture) {
+		const auto* begin = reinterpret_cast<const u8*>(sBoundTexture->pixels);
+		queuedTextureReads.push_back({begin, std::vector<u8>(begin, begin + sBoundTexture->byteCount)});
+	}
 	if (!recordGeometry) return;
 	if (primitive == GU_SPRITES) {
 		assert(format == (GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D));
@@ -1165,6 +1176,11 @@ void titleColourCompatibility()
 	GXSetChanCtrl(GX_COLOR0, GX_TRUE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT0, GX_DF_CLAMP, GX_AF_SPOT);
 	GXSetChanCtrl(GX_ALPHA0, GX_FALSE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT0, GX_DF_CLAMP, GX_AF_NONE);
 	GXSetChanMatColor(GX_COLOR0A0, (GXColor){255,255,229,255});
+	// Black TEV environment/konst writes must not replace raster material
+	// color, including after a particle pass immediately before HUD rendering.
+	GXSetTevColor(GX_TEVREG0, (GXColor){0,0,0,0});
+	GXSetTevColor(GX_TEVREG1, (GXColor){0,0,0,0});
+	GXSetTevKColor(GX_KCOLOR3, (GXColor){0,0,0,0});
 	GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
 	for (int i = 0; i < 3; ++i) GXPosition3f32(i, 0, 0);
 	GXEnd();
@@ -1407,6 +1423,89 @@ void deferredModelMatrices()
 	puts("Deferred model matrices: one upload for 33 rigid draws; skinning, fallback and immediate transitions passed");
 }
 
+void textureTransparency()
+{
+	u8 source[128] = {};
+	// Explicit expectations independent of the decoder: both nibbles,
+	// block boundaries, opacity ramps and independent IA channels.
+	for (u32 value = 0; value < 256; ++value) {
+		source[0] = source[32] = value;
+		u8 hi = (value >> 4) * 17, lo = (value & 15) * 17;
+		assert(decodeTexturePixel(source, 16, GX_TF_I4, 0, 0) == GU_RGBA(hi,hi,hi,hi));
+		assert(decodeTexturePixel(source, 16, GX_TF_I4, 1, 0) == GU_RGBA(lo,lo,lo,lo));
+		assert(decodeTexturePixel(source, 16, GX_TF_I4, 8, 0) == GU_RGBA(hi,hi,hi,hi));
+		assert(decodeTexturePixel(source, 16, GX_TF_I8, 0, 0) == GU_RGBA(value,value,value,value));
+		assert(decodeTexturePixel(source, 16, GX_TF_I8, 8, 0) == GU_RGBA(value,value,value,value));
+		assert(decodeTexturePixel(source, 16, GX_TF_IA4, 0, 0) == GU_RGBA(lo,lo,lo,hi));
+		source[1] = 255 - value;
+		assert(decodeTexturePixel(source, 4, GX_TF_IA8, 0, 0) == GU_RGBA(255-value,255-value,255-value,value));
+	}
+	// Zero-intensity borders contribute no color to alpha-blended particles.
+	memset(source, 0, sizeof(source)); source[20] = 255;
+	auto* texture = convertTexture(source, 8, 8, GX_TF_I8);
+	assert(texture);
+	assert(texture->pixels[texturePixelOffset(0,0,8,8)] == 0);
+	assert(texture->pixels[texturePixelOffset(4,2,8,8)] == 0xffff);
+	releaseTexture(*texture);
+	puts("Particle texture alpha: all I4/I8 values, IA independence, block edges and converted transparent borders passed");
+}
+
+void textureHeapPressure()
+{
+	recordGeometry = false;
+	meshCacheGpuIdle();
+	for (auto& texture : sTextureCache) releaseTexture(texture);
+	resetState(); resetDraws();
+	u8 sources[100][32];
+	for (u32 i = 0; i < 100; ++i) memset(sources[i], i + 1, sizeof(sources[i]));
+	PspGxTexture* a = convertTexture(sources[0], 8, 4, GX_TF_I8);
+	PspGxTexture* b = convertTexture(sources[1], 8, 4, GX_TF_I8);
+	assert(a && b);
+	PspGxVertex vertex = {0,0,0xffffffff,0,0,0};
+	recordingTextureReads = true; sState.textureEnabled = true; sBoundTexture = a;
+	submitVertices(&vertex, 1, GU_POINTS);
+	assert(a->gpuEpoch == sMeshCacheEpoch && queuedTextureReads.size() == 1);
+	const void* pinned = a->pixels;
+	const u64 reclaimed = sTimings.textureMemoryEvictions;
+	allocationFailures = 1;
+	auto* c = convertTexture(sources[2], 8, 4, GX_TF_I8);
+	assert(c && !b->pixels && a->pixels == pinned && sTimings.textureMemoryEvictions == reclaimed + 1);
+	// Outside an open list exhaustion cannot free GPU-pinned texels.
+	c->gpuEpoch = sMeshCacheEpoch;
+	allocationFailures = 1;
+	assert(!convertTexture(sources[3], 8, 4, GX_TF_I8));
+	assert(a->pixels == pinned && c->pixels);
+	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE); meshCacheGpuIdle();
+	for (auto& texture : sTextureCache) releaseTexture(texture);
+	// Every slot is in flight. All reads must complete before storage reuse.
+	sState.listOpen = true;
+	for (u32 i = 0; i < ARRAY_SIZE(sTextureCache); ++i) {
+		auto* texture = convertTexture(sources[i], 8, 4, GX_TF_I8);
+		assert(texture); sBoundTexture = texture;
+		submitVertices(&vertex, 1, GU_POINTS);
+	}
+	assert(queuedTextureReads.size() == ARRAY_SIZE(sTextureCache));
+	u64 syncs = sTimings.textureSyncs;
+	assert(convertTexture(sources[96], 8, 4, GX_TF_I8));
+	assert(sTimings.textureSyncs == syncs + 1 && queuedTextureReads.empty());
+	sState.listOpen = false; recordingTextureReads = false;
+	meshCacheGpuIdle();
+	for (auto& texture : sTextureCache) releaseTexture(texture);
+	// GXSetNumTexGens must not resurrect the previous image after failure.
+	GXTexObjPriv object = {};
+	GXInitTexObj(reinterpret_cast<GXTexObj*>(&object), nullptr, 8, 4, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GXLoadTexObj(reinterpret_cast<GXTexObj*>(&object), GX_TEXMAP0);
+	GXSetNumTexGens(1); assert(!sState.textureEnabled && sState.textureLoadFailed);
+	GXInitTexObj(reinterpret_cast<GXTexObj*>(&object), sources[0], 8, 4, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	a = convertTexture(sources[0], 8, 4, GX_TF_I8); assert(a);
+	a->source = reinterpret_cast<void*>(uintptr_t(object.image3));
+	GXLoadTexObj(reinterpret_cast<GXTexObj*>(&object), GX_TEXMAP0);
+	assert(sState.textureEnabled && !sState.textureLoadFailed && sBoundTexture == a);
+	meshCacheGpuIdle(); releaseTexture(*a);
+	recordGeometry = true;
+	puts("Texture heap pressure: idle reclamation, queued-read lifetime, full-cache sync and failed-upload recovery passed");
+}
+
 void swizzledTextures()
 {
 	const u16 dimensions[][2] = {{1,1}, {4,16}, {16,4}, {8,8}, {13,9}, {32,16}, {64,32}, {512,512}};
@@ -1436,6 +1535,60 @@ void swizzledTextures()
 		}
 		releaseTexture(*texture);
 	}
+}
+
+void textureAssetTest(const char* path)
+{
+	std::ifstream file(path, std::ios::binary);
+	assert(file.good());
+	std::vector<u8> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+	assert(data.size() >= 32);
+	u32 format = data[0], width = (data[2] << 8) | data[3], height = (data[4] << 8) | data[5];
+	const u8* offset = data.data() + 28;
+	u32 imageOffset = readBig32(offset);
+	assert(imageOffset < data.size());
+	const u8* image = data.data() + imageOffset;
+	assert(format == GX_TF_I4 || format == GX_TF_I8 || format == GX_TF_IA4 || format == GX_TF_RGB5A3);
+	meshCacheGpuIdle();
+	auto* texture = convertTexture(image, width, height, GXTexFmt(format));
+	assert(texture);
+	u32 transparent = 0, visible = 0;
+	for (u32 y = 0; y < height; ++y) for (u32 x = 0; x < width; ++x) {
+		u32 r, g, b, a;
+		if (format == GX_TF_RGB5A3) {
+			u32 block = (y/4 * ((width+3)/4) + x/4) * 32;
+			u32 pixel = block + (y%4 * 4 + x%4) * 2;
+			assert(imageOffset + pixel + 1 < data.size());
+			u32 word = (image[pixel] << 8) | image[pixel+1];
+			if (word & 0x8000) {
+				r = ((word >> 10) & 31) * 255 / 31;
+				g = ((word >> 5) & 31) * 255 / 31;
+				b = (word & 31) * 255 / 31; a = 255;
+			} else {
+				r = ((word >> 8) & 15) * 17; g = ((word >> 4) & 15) * 17; b = (word & 15) * 17;
+				a = ((word >> 12) & 7) * 255 / 7;
+			}
+		} else {
+			u32 tileHeight = format == GX_TF_I4 ? 8 : 4;
+			u32 block = (y/tileHeight * ((width+7)/8) + x/8) * 32;
+			u32 pixel = y%tileHeight * 8 + x%8;
+			u32 address = block + (format == GX_TF_I4 ? pixel/2 : pixel);
+			assert(imageOffset + address < data.size());
+			u8 word = image[address];
+			if (format == GX_TF_I4) r = g = b = a = ((pixel&1) ? word&15 : word>>4) * 17;
+			else if (format == GX_TF_I8) r = g = b = a = word;
+			else { r = g = b = (word&15) * 17; a = (word>>4) * 17; }
+		}
+		// Compare the actual stored 4444 texel, including the PSP's precision.
+		u16 expected = ((a>>4)<<12) | ((b>>4)<<8) | ((g>>4)<<4) | (r>>4);
+		u16 actual = texture->pixels[texturePixelOffset(x,y,texture->storageWidth,texture->storageHeight)];
+		assert(actual == expected);
+		if (!(actual & 0xf000)) ++transparent;
+		if ((actual & 0xf000) && (actual & 0x0fff)) ++visible;
+	}
+	assert(transparent && visible);
+	printf("%s: %ux%u BTI matches independent pixel reference; %u transparent, %u visible pixels\n", path,width,height,transparent,visible);
+	releaseTexture(*texture);
 }
 
 void rasterStateReuse()
@@ -1719,6 +1872,8 @@ int main(int argc, char** argv)
 	rasterStateReuse();
 	matrixReuse();
 	swizzledTextures();
+	textureTransparency();
+	textureHeapPressure();
 	resetState();
 	sState.texSource = GX_TG_TEX0;
 	MeshCacheKey ordinary, changed;
@@ -1774,7 +1929,11 @@ int main(int argc, char** argv)
 	animatedTexCoordMeshes();
 	movieFrame();
 	particleColours();
-	for (int i = 1; i < argc; ++i) modelTest(argv[i]);
+	for (int i = 1; i < argc; ++i) {
+		const char* extension = strrchr(argv[i], '.');
+		if (extension && strcmp(extension, ".bti") == 0) textureAssetTest(argv[i]);
+		else modelTest(argv[i]);
+	}
 	if (recordedModels.size() >= 2) {
 		std::vector<ModelDraw> combined = recordedModels[0].draws;
 		combined.insert(combined.end(), recordedModels[1].draws.begin(), recordedModels[1].draws.end());

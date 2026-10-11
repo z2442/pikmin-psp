@@ -844,3 +844,37 @@ shared edges, animated normal/UV/color/matrix/bone seams, source edits, epoch
 wrap, original degenerates and the existing GPU lifetime/heap pressure cases.
 The PSP game build passes; measure this EBOOT on hardware to establish the FPS
 gain and cache-warmup cost.
+
+### Gameplay texture transparency and residency
+
+I4/I8 intensity textures now copy intensity into alpha as well as RGB, matching
+the GameCube decoding used by
+[Dolphin's reference texture decoder](https://github.com/dolphin-emu/dolphin/blob/master/Source/Core/VideoCommon/TextureDecoder_Generic.cpp).
+The previous forced opaque alpha produced square black/gray borders around
+smoke and dust. IA4/IA8 retain their independent alpha channels. Native tests
+check all intensity values and tiled block boundaries independently of the
+production decoder, then verify the swizzled 4444 output of the actual
+`ice_smok.bti`, `p_dust1.bti` and `navi01.bti` assets pixel by pixel.
+
+Texture allocations now reclaim idle converted images when the game heap runs
+out below the cache's 8 MiB budget. Texture bindings and draws pin storage to
+the current GPU epoch. Eviction cannot free texels used by queued draws; when
+every possible victim is pinned, the direct list completes before reclamation
+and restarts with GU state preserved. This extra synchronization occurs only
+under texture pressure and can add a wait in those frames. Failed uploads keep
+texturing disabled even if a subsequent material enables texture generation,
+preventing accidental reuse of the last bound image. Successful uploads restore
+textured rendering. TEV environment/konst writes also stop overwriting raster
+material color; REG0 still supplies particle color and the existing material
+tint path.
+
+The gameplay capture preceding this change has roughly 31 texture misses per
+frame; it did not log failures or residency pressure separately. New counters
+`texture_failures`, `texture_memory_evictions`, `texture_syncs` and
+`texture_cache_bytes` distinguish those cases. Native sanitizer checks inject
+allocation failures, verify the queued texels remain intact until sync, fill
+all 96 texture slots, exercise failed-upload recovery and preserve material
+color across black TEV register writes. Model checks include the Pellet Posy
+alongside the opening/logo, Olimar and ship. Hardware verification of the
+reported flower/portrait artifacts and performance remains necessary; the
+backend still approximates multistage TEV materials with one texture stage.
