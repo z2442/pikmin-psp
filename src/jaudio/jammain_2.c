@@ -1830,6 +1830,11 @@ BOOL Jam_TryInterrupt(seqp_* track)
 	if (track->interruptActive) {
 		return FALSE;
 	}
+#if defined(PLATFORM_PSP)
+	// Most sequence ticks have no eligible interrupt. Avoid scanning all eight
+	// slots while retaining the original priority and pending-bit semantics.
+	if (!(track->interruptEnable & track->pendingInterrupts & 0xffU)) return FALSE;
+#endif
 	for (i = 0; i < 8; ++i) {
 		mask = 1 << i;
 		if ((track->interruptEnable & mask) && (track->pendingInterrupts & mask)) {

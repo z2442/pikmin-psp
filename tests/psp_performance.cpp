@@ -3,8 +3,9 @@
 #include <cstdio>
 
 static unsigned int mockTime;
+static unsigned int clockReads;
 static bool failStatus;
-extern "C" unsigned int sceKernelGetSystemTimeLow(void) { return mockTime; }
+extern "C" unsigned int sceKernelGetSystemTimeLow(void) { ++clockReads; return mockTime; }
 extern "C" int sceKernelReferThreadRunStatus(SceUID id, SceKernelThreadRunStatus* status)
 {
 	assert(status->size == sizeof(*status));
@@ -33,6 +34,18 @@ int main()
 	performanceAdd(PerformanceMesh, 25);
 	assert(performanceCounter(PerformanceMesh) - snapshot == 25);
 	assert(performanceCounter(PerformanceTexture) == 0);
+	clockReads = 0;
+	{
+		PerformanceScope timer(PerformanceMesh, 0);
+		mockTime += 100;
+	}
+	assert(clockReads == 0 && performanceCounter(PerformanceMesh) == snapshot + 25);
+	mockTime = 0xfffffff0U;
+	{
+		PerformanceScope timer(PerformanceMesh, 16);
+		mockTime = 0x20;
+	}
+	assert(clockReads == 2 && performanceCounter(PerformanceMesh) == snapshot + 25 + 48 * 16);
 	sPerformanceMainThread = 7;
 	performanceSetAudioThread(8);
 	assert(performanceThreadMicroseconds(false) == 1234567);

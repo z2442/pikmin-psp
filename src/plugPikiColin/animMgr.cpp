@@ -9,6 +9,9 @@
 #include "sysNew.h"
 #include "system.h"
 #include <string.h>
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspAnimationPath.h"
+#endif
 
 /**
  * @note UNUSED Size: 00009C
@@ -352,6 +355,16 @@ void AnimMgr::loadAnims(immut char* animPath, immut char* bundlePath)
 		// we're missing animations, try loading the bundle.
 		if (missingAnimCount != 0) {
 			gsys->mCurrentShape = mModel;
+#if defined(PLATFORM_PSP)
+			// Replace the model extension in the bundle buffer itself. The old
+			// offset into finalAnimPath relied on adjacent stack-array placement
+			// and can overwrite saved registers when the compiler rearranges it.
+			if (PikminPsp::animationBundlePath(finalBundlePath, sizeof(finalBundlePath), mModel->mName, bundlePath)) {
+				gsys->loadBundle(finalBundlePath, false);
+			} else {
+				OSReport("Pikmin PSP: invalid or oversized animation bundle path\n");
+			}
+#else
 			sprintf(finalBundlePath, bundlePath ? bundlePath : mModel->mName);
 
 			if (!bundlePath) {
@@ -359,6 +372,7 @@ void AnimMgr::loadAnims(immut char* animPath, immut char* bundlePath)
 			}
 
 			gsys->loadBundle(finalBundlePath, false);
+#endif
 		}
 
 		FOREACH_NODE_REUSE(AnimInfo, mAnimList.mChild, info)

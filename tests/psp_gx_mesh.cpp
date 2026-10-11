@@ -35,6 +35,7 @@ std::vector<MovieVertex> sprites;
 const void* moviePixels;
 int movieFormat, movieStride, movieWrapU, movieWrapV;
 u32 pictureResidentCalls;
+u32 meshClockReads;
 
 void transform(PspGxVertex& vertex, const ScePspFMatrix4& matrix)
 {
@@ -103,8 +104,6 @@ u32 compareList(const u8* input, u32 size)
 	assert(drawCalls == 1);
 	assert(triangles.size() == expected.size());
 	for (u32 i = 0; i < triangles.size(); ++i) equalVertex(triangles[i], expected[i]);
-	ScePspFMatrix4 expectedModel = positionMatrix(sState.positionMatrices[sState.currentPositionMatrix]);
-	assert(memcmp(&modelMatrix, &expectedModel, sizeof(expectedModel)) == 0);
 	// A second submission exercises the persistent cache against the same
 	// reference geometry, rather than merely checking that a cache hit occurred.
 	resetDraws();
@@ -577,7 +576,7 @@ void modelTest(const char* path)
 } // namespace
 
 extern "C" {
-unsigned int sceKernelGetSystemTimeLow(void) { return 0; }
+unsigned int sceKernelGetSystemTimeLow(void) { ++meshClockReads; return 0; }
 void sceKernelDcacheWritebackRange(const void*, unsigned int) {}
 void* sceGuGetMemory(int size) { u32 start = used; used += (size + 15) & ~15U; assert(used <= sizeof(memory)); return memory + start; }
 int sceGuCheckList() { return used; }
@@ -967,6 +966,8 @@ void matrixReuse()
 	assert(modelMatrixUploads == 1);
 	matrix[0][3] += 1;
 	GXLoadPosMtxImm(matrix, 0);
+	assert(modelMatrixUploads == 1 && !sState.guPositionMatrixValid);
+	loadGuPositionMatrix(0);
 	assert(modelMatrixUploads == 2);
 	loadGuPositionMatrix(1);
 	assert(modelMatrixUploads == 3);
@@ -979,7 +980,64 @@ void matrixReuse()
 	ScePspFMatrix4 expected = positionMatrix(matrix);
 	assert(!memcmp(&expected, &modelMatrix, sizeof(expected)));
 	GXSetCurrentMtx(0);
+	assert(modelMatrixUploads == 4);
+	// Immediate GX draws still load the current matrix before consumption.
+	GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+	for (int i = 0; i < 3; ++i) GXPosition3f32(i, 0, 0);
+	GXEnd();
 	assert(modelMatrixUploads == 5);
+}
+
+void deferredModelMatrices()
+{
+	clearMeshCache(); resetState(); resetDraws();
+	f32 positions[][3] = {{1,2,3},{4,5,6},{7,8,9}};
+	GXSetVtxDesc(GX_VA_PNMTXIDX, GX_DIRECT);
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	u8 rigid[] = {GX_TRIANGLES,0,3, 3,0, 3,1, 3,2};
+	u8 skinned[] = {GX_TRIANGLES,0,3, 0,0, 3,1, 0,2};
+	assert(drawMeshList(rigid, rigid + sizeof(rigid))); // Warm conversion.
+	assert(drawMeshList(skinned, skinned + sizeof(skinned)));
+	sState.guPositionMatrixValid = false;
+	modelMatrixUploads = 0;
+	for (int draw = 0; draw < 33; ++draw) {
+		// This slot is edited/selected by GX but the rigid list uses slot one.
+		Mtx current;
+		memcpy(current, sState.positionMatrices[0], sizeof(current));
+		current[0][3] += 1;
+		GXSetCurrentMtx(0); GXLoadPosMtxImm(current, 0);
+		assert(modelMatrixUploads == u32(draw == 0 ? 0 : 1));
+		triangles.clear();
+		assert(drawMeshList(rigid, rigid + sizeof(rigid)));
+		assert(modelMatrixUploads == 1);
+		for (int i = 0; i < 3; ++i) {
+			PspGxVertex expected = {}; expected.x = positions[i][0]; expected.y = positions[i][1]; expected.z = positions[i][2];
+			transform(expected, positionMatrix(sState.positionMatrices[1]));
+			assert(triangles[i].x == expected.x && triangles[i].y == expected.y && triangles[i].z == expected.z);
+		}
+	}
+	// Skinning, a CPU-transformed fallback and a following immediate draw must
+	// each consume the correct matrices without relying on eager restoration.
+	triangles.clear(); assert(drawMeshList(skinned, skinned + sizeof(skinned)));
+	assert(modelMatrixUploads == 2 && !sState.guPositionMatrixValid);
+	GXSetCurrentMtx(0);
+	GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+	for (int i = 0; i < 3; ++i) GXPosition3f32(i,0,0);
+	GXEnd(); assert(modelMatrixUploads == 3);
+	ScePspFMatrix4 expectedMatrix = positionMatrix(sState.positionMatrices[0]);
+	assert(!memcmp(&modelMatrix, &expectedMatrix, sizeof(expectedMatrix)));
+	GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+	sState.verticesPretransformed = true;
+	for (int i = 0; i < 3; ++i) GXPosition3f32(i,0,0);
+	GXEnd(); assert(modelMatrixUploads == 4 && !sState.guPositionMatrixValid);
+	GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+	for (int i = 0; i < 3; ++i) GXPosition3f32(i,0,0);
+	GXEnd(); assert(modelMatrixUploads == 5);
+	assert(!memcmp(&modelMatrix, &expectedMatrix, sizeof(expectedMatrix)));
+	clearMeshCache();
+	puts("Deferred model matrices: one upload for 33 rigid draws; skinning, fallback and immediate transitions passed");
 }
 
 void swizzledTextures()
@@ -1072,8 +1130,41 @@ void rasterStateReuse()
 	printf("Repeated material state: %u GU updates -> %u across 606 draws\n", firstCalls * 606, firstCalls);
 }
 
+void sampledMeshTiming()
+{
+	clearMeshCache(); resetState(); resetDraws();
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	u8 list[] = {GX_TRIANGLES,0,3,0,1,2};
+	sMeshTimingSequence = 0;
+	u64 samples = sTimings.meshTimingSamples, hits = sTimings.meshCacheHits;
+	meshClockReads = 0;
+	for (u32 i = 0; i < 33; ++i) GXCallDisplayList(list, sizeof(list));
+	assert(sTimings.meshTimingSamples - samples == 3);
+	assert(meshClockReads == 12); // Four reads only for calls 0, 16 and 32.
+	assert(drawCalls == 33 && triangles.size() == 33 * 3);
+	assert(sTimings.meshCacheHits - hits == 32);
+	// Every draw position is selected exactly once over 16 rotated phases.
+	for (u32 phase = 0; phase < 16; ++phase) {
+		sMeshTimingSequence = phase;
+		meshClockReads = 0;
+		for (u32 draw = 0; draw < 16; ++draw) {
+			u32 before = meshClockReads;
+			GXCallDisplayList(list, sizeof(list));
+			assert(meshClockReads - before == ((draw + phase) % 16 == 0 ? 4 : 0));
+		}
+		assert(meshClockReads == 4);
+	}
+	clearMeshCache();
+	puts("Sampled mesh timing clock count, phase rotation and unchanged submissions checks passed");
+}
+
 int main(int argc, char** argv)
 {
+	deferredModelMatrices();
+	sampledMeshTiming();
 	titleMenuPictureAlpha();
 	rasterStateReuse();
 	matrixReuse();

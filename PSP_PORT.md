@@ -38,6 +38,49 @@ It compiles and links all 384 original high-level C++ files and writes
 playable release: indexed GX mesh lists and basic tiled textures are supported,
 while multi-stage TEV combinations and other GX features remain incomplete.
 
+The regular game build enables main-CPU link-time optimization (LTO):
+
+```sh
+make -f Makefile.psp psp-game -j8
+```
+
+Its EBOOT and symbol ELF use `build/psp/GPIE01_01-game/`. Install that
+EBOOT in the existing PSP game folder alongside `data/dataDir`. LTO allows
+compiler inlining and optimization across main-CPU source files, using the existing `-O2`
+arithmetic and aliasing settings. The ME mixer and stream remain ordinary
+objects so their independent callbacks and cache exchange retain their code
+boundaries. Gprof builds automatically disable LTO. The log identifies an LTO
+build in its first line; measure its hardware FPS and thread CPU times in the
+same scene. A smaller EBOOT does not establish an FPS gain. For a comparison
+without LTO, use `make -f Makefile.psp psp-game PSP_ENABLE_LTO=0 -j8`; switching
+the option automatically rebuilds the objects in the regular game folder.
+
+PSP animation bundle loading replaces the model's extension in the destination
+bundle path itself. The old expression wrote `"anm"` at
+`finalAnimPath + strlen(finalBundlePath) + 253`, outside its 256-byte buffer.
+With the opening model and the first LTO build's stack layout, that address
+was precisely the saved `s2` slot: the resulting `0x006d6e61` value then caused
+an Address Store when `CineShapeObject::init` assigned the manager's name.
+The PSP path now derives `cinemas/opening/opening.anm` and
+`cinemas/titles/logo.anm` with bounded copies, preserves explicit bundle names
+literally, and rejects paths that do not fit. LTO remains enabled by default.
+The regression exercises the production loading block with ASan/UBSan both
+with and without LTO, and reproduces the original overwrite when given the
+old `animMgr.cpp`:
+
+```sh
+python3 tools/check_psp_animation_path.py
+```
+
+Native renderer, audio and movie regressions also support LTO compilation:
+
+```sh
+PIKMIN_PSP_TEST_LTO=1 python3 tools/check_psp_gx.py
+PIKMIN_PSP_TEST_LTO=1 python3 tools/check_psp_audio.py
+PIKMIN_PSP_TEST_LTO=1 python3 tools/check_psp_movies.py \
+  build/psp/GPIE01_01-game/data/dataDir/MovieData/*.h4m
+```
+
 The whole-game target requires `libme-core` and includes the original JAM
 sequencer, bank loader, and scene control. It converts the big-endian bank
 metadata once, then directly decodes the game's AFC/PCM `.aw` samples and
@@ -441,3 +484,48 @@ and approximately 47 ms of main-thread CPU, versus 51 ms before reuse. Steady
 FPS remains around 12; pacing waits increased from roughly 4 ms to 8–10 ms.
 This confirms lower CPU cost but only a small observed frame-rate improvement
 in those captures. Audio CPU remains approximately 28–30 ms per title frame.
+
+### Lower-cost mesh timing and empty audio interrupt checks
+
+The 606-list title previously made 2,424 kernel clock reads per frame just to
+time mesh submission and cache lookup. Detailed mesh timing now samples one
+in 16 list calls, reducing those reads to approximately 152. The sampling phase
+rotates each frame so stable draw positions receive equal coverage over 16
+frames. `mesh_ms` and `cache_validate_ms` are scaled estimates; the log header
+labels them accordingly and reports `mesh_timing_samples` and
+`mesh_timing_interval`. Frame time, render time, thread CPU time and all
+draw/vertex/cache counters remain fully measured. Use these unsampled times
+and FPS to assess hardware speedup, rather than treating a change in the mesh
+estimates as proof. Short-lived or uneven workloads can skew sampled estimates.
+
+On PSP, the sequencer also returns immediately when no enabled interrupt is
+pending, avoiding its eight-slot scan on ordinary ticks. Priority, pending
+bits, saved program counters, nesting and timers retain the original behavior.
+The native audio checker compares all 65,536 enabled/pending combinations in
+three active-interrupt states. Timing tests check disabled scopes, weighted
+clock wraparound, actual mesh clock-read counts and phase rotation; renderer
+checks still exercise real menu opacity and the extracted title models.
+
+The latest menu-open capture preceding this pass has 740 draws per frame and
+roughly 10 FPS, with approximately 56 ms main-thread and 31–33 ms audio-thread
+CPU per frame. Compare the rebuilt EBOOT against the same menu-open scene,
+as well as the title with its menu closed. Hardware testing is required to
+establish the gain from this pass.
+
+### Deferred model matrix uploads
+
+GX matrix edits and selection now update the backend's CPU state. The GU model
+matrix is uploaded when a draw actually consumes it. Cached rigid draws select
+their own live matrix; skinned draws use identity and their live bone slots;
+CPU-transformed fallback draws use identity; immediate/UI draws consume the
+current GX matrix. The renderer no longer uploads/restores an unused current
+matrix around each mesh. Edits to the matrix actually loaded in GU still
+invalidate its reuse, including when GX currently selects a different slot.
+
+`gpu_model_uploads` reports draw-related GU model matrix uploads per presented
+frame. It excludes bone uploads and the initialization identity matrix. Native
+checks verify one upload across 33 repeated rigid draws while an unused slot
+changes, then verify skinned, fallback and immediate transitions. Extracted
+opening/logo geometry and menu opacity pass with ordinary and LTO compilation.
+This proves reduced uploads and preserved geometry; measure PSP frame time and
+main-thread CPU to establish the performance gain.

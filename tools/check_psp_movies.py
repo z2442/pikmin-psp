@@ -8,10 +8,12 @@ import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
+lto_flags = ["-flto=auto"] if os.environ.get("PIKMIN_PSP_TEST_LTO") == "1" else []
 with tempfile.TemporaryDirectory(prefix="pikmin-movies-") as directory:
     binary = str(Path(directory) / "check")
     subprocess.run([
         os.environ.get("CXX", "g++"), "-std=c++17", "-O2", "-g", "-fpermissive", "-w",
+        *lto_flags,
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
         "-DPLATFORM_PSP=1", "-DDTK_CONFIG_NONMATCHING=1", "-I", str(root / "include"),
         str(root / "tests/psp_movie_decode.cpp"), str(root / "src/port/psp/PspMovieDecode.cpp"),
@@ -56,6 +58,7 @@ with tempfile.TemporaryDirectory(prefix="pikmin-movies-") as directory:
         sdk = subprocess.check_output(["psp-config", "--pspsdk-path"], text=True).strip()
         subprocess.run([
             os.environ.get("CXX", "g++"), "-std=c++17", "-O2", "-g", "-fpermissive", "-w",
+            *lto_flags,
             "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
             "-DPLATFORM_PSP=1", "-DDTK_CONFIG_NONMATCHING=1",
             "-I", str(root / "include"), "-I", str(Path(sdk) / "include"),

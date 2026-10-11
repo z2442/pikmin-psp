@@ -4,6 +4,14 @@ PSPDEV := $(shell psp-config --pspdev-path)
 PSP_BUILD ?= bootstrap
 PSP_ENABLE_GPROF ?= 0
 PSP_GPROF_ENABLED := $(filter 1 ON on TRUE true YES yes,$(PSP_ENABLE_GPROF))
+PSP_ENABLE_LTO ?= $(if $(filter game,$(PSP_BUILD)),$(if $(PSP_GPROF_ENABLED),0,1),0)
+PSP_LTO_ENABLED := $(filter 1 ON on TRUE true YES yes,$(PSP_ENABLE_LTO))
+
+ifneq ($(PSP_LTO_ENABLED),)
+ifneq ($(PSP_GPROF_ENABLED),)
+$(error LTO and gprof are separate comparison builds; enable only one)
+endif
+endif
 
 ifeq ($(PSP_BUILD),game)
 BUILD_DIR := build/psp/GPIE01_01-game
@@ -73,6 +81,12 @@ endif
 # psp-fixup-imports requires every generated import NID to retain its matching
 # stub.  Section GC can orphan imports referenced only by compatibility shims.
 LDFLAGS := -Wl,-u,module_info
+ifneq ($(PSP_LTO_ENABLED),)
+# Optimize main-CPU calls across translation units without fast-math or
+# changing the platform ABI. LTO shares the regular game's output directory.
+CFLAGS += -flto=auto -DPIKMIN_PSP_LTO=1
+LDFLAGS += -flto=auto -O2 -fno-strict-aliasing
+endif
 LIBS := -lintrafont -lpspgum -lpspgu -lpsppower -lpsprtc -lm -lstdc++
 ifneq ($(PSP_GPROF_ENABLED),)
 CFLAGS += -DPIKMIN_PSP_GPROF=1 -pg -fno-omit-frame-pointer -fno-optimize-sibling-calls
@@ -95,7 +109,7 @@ endif
 # EBOOT; a PRX loaded by PSPLINK inherits the partition selected by PSPLINK.
 PSP_LARGE_MEMORY := 1
 
-.PHONY: psp-port psp-game psp-port-gprof psp-game-gprof
+.PHONY: psp-port psp-game psp-port-gprof psp-game-gprof psp-build-config-force
 psp-port: all
 
 psp-game:
@@ -123,6 +137,14 @@ $(BUILD_DIR)/obj/hvqm4dec/%.o: src/hvqm4dec/%.c
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -MMD -MP -x c++ -c $< -o $@
 
+# Switching LTO in this shared output directory must rebuild every object.
+# Keep the stamp's time stable when the mode has not changed.
+$(BUILD_DIR)/.lto-enabled: psp-build-config-force | $(BUILD_DIR)
+	@printf '%s\n' '$(if $(PSP_LTO_ENABLED),1,0)' > $@.tmp
+	@if cmp -s $@.tmp $@; then rm $@.tmp; else mv $@.tmp $@; fi
+
+$(OBJS): Makefile.psp $(BUILD_DIR)/.lto-enabled
+
 -include $(OBJS:.o=.d)
 
 include $(PSPSDK)/lib/build.mak
@@ -130,6 +152,12 @@ include $(PSPSDK)/lib/build.mak
 ifneq ($(PSP_GPROF_ENABLED),)
 # ME callbacks and the stream mixer they call cannot use the CPU profiler.
 $(BUILD_DIR)/obj/port/psp/PspAudioMixer.o $(BUILD_DIR)/obj/port/psp/PspAudioStream.o: CXXFLAGS := $(filter-out -pg,$(CXXFLAGS))
+endif
+
+ifneq ($(PSP_LTO_ENABLED),)
+# Preserve the independently executed ME callbacks and their private mixer
+# code as ordinary objects, including weak callback overrides in libme-core.
+$(BUILD_DIR)/obj/port/psp/PspAudioMixer.o $(BUILD_DIR)/obj/port/psp/PspAudioStream.o: CXXFLAGS := $(filter-out -flto=auto,$(CXXFLAGS))
 endif
 
 $(PSP_EBOOT_SFO): | $(BUILD_DIR)

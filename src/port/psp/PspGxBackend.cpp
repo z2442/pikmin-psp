@@ -115,6 +115,8 @@ u32 sDebugListSplits;
 u32 sDebugBatchedPrimitives;
 u64 sMeshCacheEpoch = 1;
 u32 sCachedDrawBatch;
+u32 sMeshTimingSequence;
+const u32 kMeshTimingInterval = 16;
 void meshCacheGpuIdle() { ++sMeshCacheEpoch; sCachedDrawBatch = 0; }
 
 struct FrameTimings {
@@ -122,6 +124,8 @@ struct FrameTimings {
 	u64 presentWait, listWait, copyTime, draws, vertices, copies, splits;
 	u64 cachedDrawKicks, deferredCachedDraws;
 	u64 rasterChanges, rasterReuses;
+	u64 meshTimingSamples;
+	u64 modelMatrixUploads;
 	u64 decodedVertices, skinnedVertices, fallbackLists, textureMisses, meshCacheHits, cachedVertices, meshCacheValidation, arrayValidation;
 	u64 meshMissAbsent, meshMissState, meshMissSource, meshStoreFailures, meshEvictions;
 	bool wroteHeader;
@@ -209,7 +213,12 @@ void recordFrameTimings()
 		FILE* file = fopen(path, sTimings.wroteHeader ? "a" : "w");
 		if (file) {
 			if (!sTimings.wroteHeader) {
-				fputs("Mesh cache: rigid/skinned buffers, material variants and selected texture matrices. GPU: batched cached-draw kicks, matrix reuse and swizzled textures. Audio: active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\n", file);
+#if defined(PIKMIN_PSP_LTO)
+				fputs("Build: main-CPU LTO; ME mixer/stream use ordinary objects.\n", file);
+#else
+				fputs("Build: standard (no LTO).\n", file);
+#endif
+				fputs("Mesh cache: rigid/skinned buffers, material variants and selected texture matrices. GPU: batched cached-draw kicks, matrix reuse and swizzled textures. Audio: active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\nmesh_ms and cache_validate_ms are estimates: one in 16 list calls is timed, with duration scaled by 16 and the sampling phase rotated each frame. Frame/render/CPU times and geometry/cache counters remain exact.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -234,6 +243,9 @@ void recordFrameTimings()
 			        sTimings.cachedDrawKicks / 120.0, sTimings.deferredCachedDraws / 120.0);
 			fprintf(file, "  gpu_state_changes=%.1f gpu_state_reuses=%.1f\n",
 			        sTimings.rasterChanges / 120.0, sTimings.rasterReuses / 120.0);
+			fprintf(file, "  mesh_timing_samples=%.1f mesh_timing_interval=%u\n",
+			        sTimings.meshTimingSamples / 120.0, kMeshTimingInterval);
+			fprintf(file, "  gpu_model_uploads=%.1f\n", sTimings.modelMatrixUploads / 120.0);
 			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
 			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
 			        metrics[PikminPsp::PerformanceMovieConvert] / 120000.0,
@@ -788,6 +800,7 @@ void loadGuPositionMatrix(u32 index)
 	// Draws are submitted with sceGuDrawArray, not sceGumDrawArray.  Send the
 	// matrix directly to the GE rather than only updating GUM's software stack.
 	sceGuSetMatrix(GU_MODEL, &converted);
+	++sTimings.modelMatrixUploads;
 	sState.guPositionMatrix = index;
 	sState.guPositionMatrixValid = true;
 }
@@ -805,6 +818,7 @@ bool loadMeshMatrices(u32 mask, u32 rigidMatrix)
 	if (skinned) {
 		ScePspFMatrix4 identity = identityMatrix();
 		sceGuSetMatrix(GU_MODEL, &identity);
+		++sTimings.modelMatrixUploads;
 		sState.guPositionMatrixValid = false;
 		u32 slot = 0;
 		for (u32 i = 0; i < 10; ++i) if (mask & (1U << i)) {
@@ -1177,15 +1191,15 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 // Retail model lists contain thousands of short strips. Submit a whole list
 // as indexed triangles. Positions stay in model space: the GE transforms and
 // clips them. Rigid meshes use GU_MODEL, while mixed matrices use GE bones.
-bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
+bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timingWeight = 1)
 {
 	const u8* listStart = input;
 	MeshCacheKey key;
 	if (useCache) {
 		meshCacheKey(key);
-		u32 validationStart = sceKernelGetSystemTimeLow();
+		u32 validationStart = timingWeight ? sceKernelGetSystemTimeLow() : 0;
 		MeshCacheEntry* cached = findCachedMesh(input, end - input, key);
-		sTimings.meshCacheValidation += (u32)(sceKernelGetSystemTimeLow() - validationStart);
+		if (timingWeight) sTimings.meshCacheValidation += (u32)(sceKernelGetSystemTimeLow() - validationStart) * timingWeight;
 		if (cached) {
 			reserveDisplayListMemory(0);
 			u8* vertices = cached->storage + kMeshCacheDataOffset;
@@ -1193,7 +1207,6 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 			u16* indices = reinterpret_cast<u16*>(vertices + cached->vertexCount * cached->vertexSize);
 			bool skinned = loadMeshMatrices(cached->matrixMask, cached->rigidMatrix);
 			submitVertices(vertices, cached->indexCount, GU_TRIANGLES, indices, skinned, true);
-			if (skinned || cached->rigidMatrix != sState.currentPositionMatrix) loadGuPositionMatrix(sState.currentPositionMatrix);
 			sDebugBatchedPrimitives += cached->primitiveCount;
 			++sTimings.meshCacheHits;
 			sTimings.cachedVertices += cached->vertexCount;
@@ -1304,7 +1317,6 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true)
 	                         vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize);
 	loadMeshMatrices(matrixMask, rigidMatrix);
 	submitVertices(vertices, indexCount, GU_TRIANGLES, indices, skinned);
-	if (skinned || rigidMatrix != sState.currentPositionMatrix) loadGuPositionMatrix(sState.currentPositionMatrix);
 	sDebugBatchedPrimitives += primitiveCount;
 	return true;
 }
@@ -1463,8 +1475,9 @@ void PspGXEnd(void)
 	if (sState.verticesPretransformed) {
 		ScePspFMatrix4 identity = identityMatrix();
 		sceGuSetMatrix(GU_MODEL, &identity);
+		++sTimings.modelMatrixUploads;
 		sState.guPositionMatrixValid = false;
-	}
+	} else loadGuPositionMatrix(sState.currentPositionMatrix);
 	if (sState.primitive == GX_QUADS) {
 		u32 sourceCount = sState.vertexCount;
 		PspGxVertex* source = sState.vertices;
@@ -1482,7 +1495,6 @@ void PspGXEnd(void)
 	} else {
 		submitVertices(sState.vertices, sState.vertexCount, guPrimitive(sState.primitive));
 	}
-	if (sState.verticesPretransformed) loadGuPositionMatrix(sState.currentPositionMatrix);
 	sState.inPrimitive = false;
 	sState.verticesPretransformed = false;
 }
@@ -1494,6 +1506,7 @@ GXFifoObj* GXInit(void*, u32)
 	snapshotPerformanceCounters();
 	sTimings.start = sceKernelGetSystemTimeLow();
 	memset(&sState, 0, sizeof(sState));
+	sMeshTimingSequence = 0;
 	sState.currentColour = 0xffffffff;
 	sState.clearColour = 0xff000000;
 	sState.clearDepth = 0;
@@ -1554,7 +1567,8 @@ void GXLoadPosMtxImm(const Mtx matrix, u32 id)
 		memcpy(sState.positionMatrices[index], matrix, sizeof(Mtx));
 		if (sState.guPositionMatrix == index) sState.guPositionMatrixValid = false;
 	}
-	if (index == sState.currentPositionMatrix) loadGuPositionMatrix(index);
+	// Publish the selected matrix only when geometry consumes it. A rigid
+	// mesh can select another slot and skinning uses identity plus GE bones.
 }
 
 void GXLoadNrmMtxImm(const Mtx, u32) { }
@@ -1568,7 +1582,6 @@ void GXLoadTexMtxImm(const Mtx matrix, u32 id, GXTexMtxType type) {
 void GXSetCurrentMtx(u32 id)
 {
 	sState.currentPositionMatrix = MIN(id / 3, 9U);
-	loadGuPositionMatrix(sState.currentPositionMatrix);
 }
 
 void GXSetViewport(f32 left, f32 top, f32 width, f32 height, f32, f32)
@@ -1690,6 +1703,8 @@ void GXCopyDisp(void*, GXBool clear)
 		         sDebugBatchedPrimitives);
 	}
 	++sDebugFrameCount;
+	// Rotate the phase so a stable draw order samples all material positions.
+	sMeshTimingSequence = sDebugFrameCount;
 	u32 waitStart = sceKernelGetSystemTimeLow();
 	sceGuFinish();
 	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
@@ -1931,10 +1946,12 @@ u32 GXEndDisplayList(void) { return 0; }
 void GXCallDisplayList(void* displayList, u32 byteCount)
 {
 	if (!displayList || byteCount == 0) return;
-	PikminPsp::PerformanceScope timing(PikminPsp::PerformanceMesh);
+	const u32 timingWeight = (sMeshTimingSequence++ % kMeshTimingInterval) == 0 ? kMeshTimingInterval : 0;
+	if (timingWeight) ++sTimings.meshTimingSamples;
+	PikminPsp::PerformanceScope timing(PikminPsp::PerformanceMesh, timingWeight);
 	const u8* input = static_cast<const u8*>(displayList);
 	const u8* end = input + byteCount;
-	if (drawMeshList(input, end)) return;
+	if (drawMeshList(input, end, true, timingWeight)) return;
 	++sTimings.fallbackLists;
 	while (input < end) {
 		u8 command = *input++;
