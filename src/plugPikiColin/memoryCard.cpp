@@ -7,6 +7,9 @@
 #include "gameflow.h"
 #include "system.h"
 #include <string.h>
+#if defined(PLATFORM_PSP)
+#include "endianness.h"
+#endif
 
 /**
  * @todo: Documentation
@@ -444,8 +447,15 @@ u32 MemoryCard::calcChecksum(void* dataptr, u32 length)
 {
 	u32 sum = 0x32546532;
 	for (int i = 0; i < length >> 2; i++) {
+#if defined(PLATFORM_PSP)
+		u32 i2 = (u8)i;
+		u32 val;
+		memcpy(&val, static_cast<const u8*>(dataptr) + i * 4, sizeof(val));
+		val = BE2H32(val);
+#else
 		u8 i2   = i;
 		u32 val = *((u32*)dataptr + i);
+#endif
 		sum += (i2 << 24) | (((i2 + 1) & 0xFF) << 16) | (((i2 - 1) & 0xFF) << 8) | ((i2 + 2) & 0xFF);
 		sum += val;
 	}
@@ -460,9 +470,17 @@ bool MemoryCard::hasCardFinished()
 {
 	bool res = !CardUtilIsCardBusy();
 	if (res) {
+#if defined(PLATFORM_PSP)
+		// Unmounting reports its own success; retain the save operation's error.
+		s32 operationResult = CardUtilResultCode();
+#endif
 		CardUtilUnmount(0);
 		CardUtilIdleWhileBusy();
-		if (CardUtilResultCode() < -1) {
+		if (CardUtilResultCode() < -1
+#if defined(PLATFORM_PSP)
+		    || operationResult < -1
+#endif
+		) {
 			mDidSaveFail = true;
 		}
 	}
@@ -476,7 +494,11 @@ bool MemoryCard::hasCardFinished()
  */
 void MemoryCard::waitPolling()
 {
-	while (!hasCardFinished()) { }
+	while (!hasCardFinished()) {
+#if defined(PLATFORM_PSP)
+		CardUtilIdleWhileBusy();
+#endif
+	}
 }
 
 /**
@@ -591,6 +613,10 @@ s32 MemoryCard::waitWhileBusy(int chan)
  */
 bool MemoryCard::getCardStatus(int channel)
 {
+#if defined(PLATFORM_PSP)
+	// A queued save/unmount must finish before another thread mounts the card.
+	CardUtilIdleWhileBusy();
+#endif
 	if (CARDProbe(channel)) {
 		if (CARDMountAsync(channel, &CardWorkArea, nullptr, nullptr) < 0) {
 			mErrorCode = CARD_RESULT_WRONGDEVICE;
@@ -734,7 +760,9 @@ s32 MemoryCard::getMemoryCardState(bool flag)
 
 		if (flag && mCardChannel >= 0 && mSaveFileIndex != -2) {
 			loadCurrentFile();
+#if !defined(PLATFORM_PSP)
 			mErrorCode = CARD_RESULT_READY;
+#endif
 		} else if (mTempFileIndex != -1) {
 			CardUtilMount(channel, &CardWorkArea);
 			CardUtilIdleWhileBusy();
@@ -753,11 +781,29 @@ s32 MemoryCard::getMemoryCardState(bool flag)
  */
 void MemoryCard::loadCurrentFile()
 {
+#if defined(PLATFORM_PSP)
+	if (mSaveFileIndex < 0) return;
+#endif
 	CardUtilMount(0, &CardWorkArea);
 	CardUtilIdleWhileBusy();
+#if defined(PLATFORM_PSP)
+	s32 status = CardUtilResultCode();
+	if (status == CARD_RESULT_READY) status = CARDGetStatus(0, mSaveFileIndex, &cst);
+	if (status < 0 || cst.length != CARD_DATA_SIZE) {
+		CardUtilUnmount(0); CardUtilIdleWhileBusy();
+		mErrorCode = status < 0 ? status : CARD_RESULT_BROKEN;
+		mDidSaveFail = true;
+		return;
+	}
+#else
 	CARDGetStatus(0, mSaveFileIndex, &cst);
+#endif
 	CardUtilOpen(0, mSaveFileIndex, &cardData);
 	CardUtilIdleWhileBusy();
+#if defined(PLATFORM_PSP)
+	mErrorCode = CardUtilResultCode();
+	if ((s32)mErrorCode < 0) mDidSaveFail = true;
+#endif
 	CardUtilUnmount(0);
 	CardUtilIdleWhileBusy();
 

@@ -2,6 +2,11 @@
 
 #include "DebugLog.h"
 #include "gameflow.h"
+#if defined(PLATFORM_PSP)
+#include "port/psp/PspCard.h"
+#include <pspthreadman.h>
+static bool sCardThreadReady;
+#endif
 
 /// Global thread for async card operations called directly by the game code.
 CardUtilThread CardThread;
@@ -495,6 +500,15 @@ static s32 DoSave(s32 chan, CARDStat* fileState, void* fileData)
 		CardControl.mOperationSize += 0x4000;
 	}
 
+#if defined(PLATFORM_PSP)
+	// Commit the entire replacement while retaining the previous save on disk.
+	// The GC delete-then-rename sequence has a power-loss gap on a Memory Stick.
+	s32 savedFileNo = -1;
+	s32 resSave = PikminPsp::saveCardFile(chan, fileState, fileData, &savedFileNo);
+	if (resSave < 0) return resSave;
+	if (savedFileNo < 0) return CARD_RESULT_FATAL_ERROR;
+	newFileNo = savedFileNo;
+#else
 	// try and create temp file
 	int resCreate = CARDCreate(chan, tempFileName, fileState->length, &info);
 	if (resCreate < 0) {
@@ -527,6 +541,7 @@ static s32 DoSave(s32 chan, CARDStat* fileState, void* fileData)
 		// throw error
 		return resRename;
 	}
+#endif
 
 	// if no directory list, update our free space counters and return
 	if (!CardControl.mDirentList) {
@@ -560,13 +575,21 @@ static s32 DoSave(s32 chan, CARDStat* fileState, void* fileData)
 
 	// copy comment data from save buffer, if present
 	if (fileState->commentAddr <= fileState->length - CARD_COMMENT_SIZE) {
+#if defined(PLATFORM_PSP)
+		memmove(entry->mFileCommentData, static_cast<const u8*>(fileData) + fileState->commentAddr, CARD_COMMENT_SIZE);
+#else
 		memmove(entry->mFileCommentData, (void*)((u32)fileData + fileState->commentAddr), CARD_COMMENT_SIZE);
+#endif
 	}
 
 	// handle icon/banner data, if present
 	entry->mAnimTotalFrames = 0;
 	if (fileState->bannerFormat || fileState->iconFormat) {
+#if defined(PLATFORM_PSP)
+		memmove(entry, static_cast<const u8*>(fileData) + fileState->iconAddr, fileState->offsetData - fileState->iconAddr);
+#else
 		memmove(entry, (void*)((u32)fileData + fileState->iconAddr), fileState->offsetData - fileState->iconAddr);
+#endif
 		DCFlushRange(entry, fileState->offsetData - fileState->iconAddr);
 
 		int iconCnt;
@@ -618,10 +641,38 @@ static s32 DoSave(s32 chan, CARDStat* fileState, void* fileData)
  * @param length Length for write operations.
  * @return CARD result code from last operation hit - 0 or 1 if no error, negative if error.
  */
-static s32 CardUtilCommand(s32 chan, s32 command, s32 file, void* workBuffer, u32 offset, u32 length)
+static s32 CardUtilCommand(s32 chan, s32 command,
+#if defined(PLATFORM_PSP)
+                          intptr_t file,
+#else
+                          s32 file,
+#endif
+                          void* workBuffer, u32 offset, u32 length)
 {
 	OSLockMutex(&CardControl.mMutex);
 	int res;
+#if defined(PLATFORM_PSP)
+	if (!sCardThreadReady) {
+		// Saving must remain available if PSP cannot allocate/start the worker.
+		// Execute the same operation on the caller instead of rejecting every save.
+		s32 result = CARD_RESULT_FATAL_ERROR;
+		switch (command) {
+		case CARDCMD_Mount: result = DoMount(chan, workBuffer); break;
+		case CARDCMD_Unmount: result = DoUnmount(chan); break;
+		case CARDCMD_Format: result = DoFormat(chan); break;
+		case CARDCMD_List: result = DoList(chan, static_cast<CardUtilDirent*>(workBuffer)); break;
+		case CARDCMD_Erase: result = DoErase(chan, (s32)file); break;
+		case CARDCMD_Open: result = DoOpen(chan, (s32)file, workBuffer); break;
+		case CARDCMD_Save: result = DoSave(chan, reinterpret_cast<CARDStat*>(file), workBuffer); break;
+		case CARDCMD_Write: result = DoWrite(chan, (s32)file, workBuffer, length, offset); break;
+		}
+		CardControl.mResultCode = result;
+		if (result < 0 && (command == CARDCMD_Save || command == CARDCMD_Write))
+			gameflow.mMemoryCard.mDidSaveFail = true;
+		OSUnlockMutex(&CardControl.mMutex);
+		return result;
+	}
+#endif
 	if (CardControl.mChannel != -1) {
 		// card thread is busy
 		res = CardControl.mResultCode;
@@ -651,7 +702,14 @@ static s32 CardUtilCommand(s32 chan, s32 command, s32 file, void* workBuffer, u3
  */
 s32 CardUtilResultCode()
 {
+#if defined(PLATFORM_PSP)
+	OSLockMutex(&CardControl.mMutex);
+	s32 result = CardControl.mResultCode;
+	OSUnlockMutex(&CardControl.mMutex);
+	return result;
+#else
 	return CardControl.mResultCode;
+#endif
 }
 
 /**
@@ -699,7 +757,14 @@ void CardUtilFormat(s32 chan)
  */
 bool CardUtilIsCardBusy()
 {
+#if defined(PLATFORM_PSP)
+	OSLockMutex(&CardControl.mMutex);
+	bool busy = CardControl.mChannel != -1;
+	OSUnlockMutex(&CardControl.mMutex);
+	return busy;
+#else
 	return CardControl.mChannel != -1;
+#endif
 }
 
 /**
@@ -708,7 +773,12 @@ bool CardUtilIsCardBusy()
 void CardUtilIdleWhileBusy()
 {
 	while (CardUtilIsCardBusy()) {
+#if defined(PLATFORM_PSP)
+		// Let the lower-priority card worker run while the caller is waiting.
+		sceKernelDelayThread(1000);
+#else
 		OSYieldThread();
+#endif
 	}
 }
 
@@ -741,8 +811,12 @@ void CardUtilOpen(s32 chan, s32 fileNo, void* workBuffer)
  */
 void CardUtilSave(s32 chan, CARDStat* fileState, void* data)
 {
+#if defined(PLATFORM_PSP)
+	CardUtilCommand(chan, CARDCMD_Save, reinterpret_cast<intptr_t>(fileState), data, 0, 0);
+#else
 	// no clue why they needed to force the CARDStat pointer in as a long
 	CardUtilCommand(chan, CARDCMD_Save, (s32)fileState, data, 0, 0);
+#endif
 }
 
 /**
@@ -797,6 +871,9 @@ static void* CardUtilMain(void*)
 		OSUnlockMutex(&CardControl.mMutex);
 
 		// execute command
+#if defined(PLATFORM_PSP)
+		res = CARD_RESULT_FATAL_ERROR;
+#endif
 		switch (cmd) {
 		case CARDCMD_Mount:
 		{
@@ -871,6 +948,10 @@ static void* CardUtilMain(void*)
 		if (res == CARD_RESULT_IOERROR) {
 			gameflow.mMemoryCard.mDidSaveFail = true;
 		}
+#if defined(PLATFORM_PSP)
+		if (res < 0 && (cmd == CARDCMD_Save || cmd == CARDCMD_Write))
+			gameflow.mMemoryCard.mDidSaveFail = true;
+#endif
 		CardControl.mResultCode = res;
 		// mark card as idle
 		CardControl.mChannel = -1;
@@ -890,11 +971,20 @@ static void* CardUtilMain(void*)
  */
 void CardUtilInit(void* stack, u32 stackSize, s32 prio)
 {
+#if defined(PLATFORM_PSP)
+	CardControl.mChannel = -1;
+	CardControl.mResultCode = CARD_RESULT_READY;
+#endif
 	OSInitMutex(&CardControl.mMutex);
 	OSInitMutex(&CardControl.mDirMutex);
 	OSInitCond(&CardControl.mCondition);
+#if defined(PLATFORM_PSP)
+	sCardThreadReady = OSCreateThread(&CardThread.mThread, CardUtilMain, nullptr, stack, stackSize, prio, OS_THREAD_ATTR_DETACH);
+	if (sCardThreadReady) sCardThreadReady = OSResumeThread(&CardThread.mThread) >= 0;
+#else
 	OSCreateThread(&CardThread.mThread, CardUtilMain, nullptr, stack, stackSize, prio, OS_THREAD_ATTR_DETACH);
 	OSResumeThread(&CardThread.mThread);
+#endif
 }
 
 /**

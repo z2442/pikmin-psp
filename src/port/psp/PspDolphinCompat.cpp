@@ -1,5 +1,4 @@
 #include "Dolphin/ar.h"
-#include "Dolphin/card.h"
 #include "Dolphin/hio.h"
 #include "Dolphin/pad.h"
 #include "Dolphin/vi.h"
@@ -24,11 +23,6 @@ u8* aramAddress(u32 address, u32 length)
 		return nullptr;
 	}
 	return sAram + (address - kAramBase);
-}
-
-void cardCallback(CARDCallback callback, s32 channel, s32 result)
-{
-	if (callback) callback(channel, result);
 }
 
 } // namespace
@@ -67,51 +61,6 @@ void ARQPostRequest(ARQRequest* request, u32 owner, u32 type, u32 priority, u32 
 	}
 	if (callback) callback(reinterpret_cast<u32>(request));
 }
-
-void CARDInit(void) { }
-BOOL CARDProbe(s32) { return FALSE; }
-s32 CARDGetResultCode(s32) { return CARD_RESULT_NOCARD; }
-s32 CARDCheck(s32) { return CARD_RESULT_NOCARD; }
-s32 CARDCheckAsync(s32 channel, CARDCallback callback)
-{
-	cardCallback(callback, channel, CARD_RESULT_NOCARD);
-	return CARD_RESULT_NOCARD;
-}
-s32 CARDMount(s32, CARDMemoryCard*, CARDCallback) { return CARD_RESULT_NOCARD; }
-s32 CARDMountAsync(s32 channel, CARDMemoryCard*, CARDCallback, CARDCallback callback)
-{
-	cardCallback(callback, channel, CARD_RESULT_NOCARD);
-	return CARD_RESULT_NOCARD;
-}
-s32 CARDUnmount(s32) { return CARD_RESULT_READY; }
-s32 CARDFormat(s32) { return CARD_RESULT_NOCARD; }
-s32 CARDFormatAsync(s32 channel, CARDCallback callback)
-{
-	cardCallback(callback, channel, CARD_RESULT_NOCARD);
-	return CARD_RESULT_NOCARD;
-}
-s32 CARDFreeBlocks(s32, s32* bytes, s32* files)
-{
-	if (bytes) *bytes = 0;
-	if (files) *files = 0;
-	return CARD_RESULT_NOCARD;
-}
-s32 CARDGetSectorSize(s32, u32* size)
-{
-	if (size) *size = 8192;
-	return CARD_RESULT_NOCARD;
-}
-s32 CARDOpen(s32, const char*, CARDFileInfo*) { return CARD_RESULT_NOCARD; }
-s32 CARDFastOpen(s32, s32, CARDFileInfo*) { return CARD_RESULT_NOCARD; }
-s32 CARDClose(CARDFileInfo*) { return CARD_RESULT_READY; }
-s32 CARDCreate(s32, const char*, u32, CARDFileInfo*) { return CARD_RESULT_NOCARD; }
-s32 CARDRead(CARDFileInfo*, void*, s32, s32) { return CARD_RESULT_NOCARD; }
-s32 CARDWrite(CARDFileInfo*, void*, s32, s32) { return CARD_RESULT_NOCARD; }
-s32 CARDGetXferredBytes(s32) { return 0; }
-s32 CARDFastDelete(s32, s32) { return CARD_RESULT_NOCARD; }
-s32 CARDRename(s32, const char*, const char*) { return CARD_RESULT_NOCARD; }
-s32 CARDGetStatus(s32, s32, CARDStat*) { return CARD_RESULT_NOCARD; }
-s32 CARDSetStatus(s32, s32, CARDStat*) { return CARD_RESULT_NOCARD; }
 
 BOOL HIOEnumDevices(HIOEnumCallback) { return FALSE; }
 BOOL HIOInit(s32, HIOCallback) { return FALSE; }

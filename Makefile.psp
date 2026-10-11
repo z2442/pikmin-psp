@@ -63,6 +63,7 @@ PSP_PORT_SOURCES := \
 	src/port/psp/PspGxBackend.cpp \
 	src/port/psp/PspDolphinOs.cpp \
 	src/port/psp/PspDolphinDvd.cpp \
+	src/port/psp/PspDolphinCard.cpp \
 	src/port/psp/PspDolphinCompat.cpp \
 	src/port/psp/PspDolphinMtx.cpp \
 	$(PSP_AUDIO_SOURCES)

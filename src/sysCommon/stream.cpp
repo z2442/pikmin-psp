@@ -100,9 +100,13 @@ void Stream::readString(String& str)
  */
 void Stream::writeInt(int i)
 {
+#if defined(PLATFORM_PSP)
+	u32 result = H2BE32((u32)i);
+#else
 	int result = i;
-#if defined(WIN32) || defined(PLATFORM_PSP)
+#if defined(WIN32)
 	result = (((result & 0xFF000000) >> 24) | ((result & 0xFF0000) >> 8) | ((result & 0xFF00) << 8) | (result << 24));
+#endif
 #endif
 	write(&result, sizeof(result));
 }
@@ -120,9 +124,13 @@ void Stream::writeByte(u8 c)
  */
 void Stream::writeShort(short _s)
 {
+#if defined(PLATFORM_PSP)
+	u16 s = H2BE16((u16)_s);
+#else
 	short s = _s;
-#if defined(WIN32) || defined(PLATFORM_PSP)
+#if defined(WIN32)
 	s = (((s & 0xFF00) >> 8) | (s << 8));
+#endif
 #endif
 	write(&s, sizeof(short));
 }

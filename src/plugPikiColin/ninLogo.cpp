@@ -43,8 +43,8 @@ struct NinLogoSetupSection : public Node {
 		mController   = new Controller(1);
 		progresWindow = nullptr;
 
-#if defined(VERSION_GPIP01)
-		// no progressive mode for PAL
+#if defined(PLATFORM_PSP) || defined(VERSION_GPIP01)
+		// PSP uses its fixed LCD output; PAL has no progressive mode choice.
 #else
 		if ((VIGetDTVStatus() && OSGetProgressiveMode()) || (VIGetDTVStatus() && gsys->mControllerMgr.keyDown(KBBTN_DPAD_RIGHT))) {
 			progresWindow = new zen::DrawProgre();

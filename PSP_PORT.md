@@ -390,11 +390,99 @@ milestone is reached, so it does not add continuous Memory Stick traffic.
 The bootstrap currently uses the analog nub to move the red Pikmin and Circle
 to exit.
 
+## PSP boot and save storage
+
+PSP builds skip the GameCube progressive-scan selection at boot. The PSP LCD
+uses the port's fixed output mode, and boot proceeds to the title screen.
+The original GameCube/PAL conditions remain for other builds.
+
+The existing in-game memory-card menus use a virtual card stored beside the
+game executable. Card A is created automatically under `saves/card_a/`;
+Card B uses `saves/card_b/`. Direct launches store these on Memory Stick or
+PSP Go internal storage. PSPLink `host0:` launches store them in the host's
+mapped game directory. Detection checks/creates these save directories;
+it does not require inspecting `ms0:/` or `ef0:/`, or redirect a host launch
+to another filesystem. Synchronization targets the selected save filesystem.
+Each card exposes 2 MiB with the original five
+reserved sectors, 8 KiB sectors and up to 127 files. The game's single card file
+contains its original three save slots, spare game block and options copies.
+Numbered `.pcs` files contain a versioned header, display metadata and game
+data. Back up the entire `saves` directory to preserve progress and options.
+These containers are specific to the PSP port, rather than GameCube card images.
+
+Full saves and partial block writes stage a complete file, verify transfer
+results and close it, request filesystem synchronization, and read back its
+header and payload CRCs before promotion. They preserve the previous file
+as `.bak`, request synchronization for that backup, and promote the staged file. Mounting checks
+header and payload CRCs and restores a valid backup if the current file is
+missing or corrupt. Corrupt current files are retained as `.bad` when recovery
+is possible; incomplete `.new` files are ignored. An unrecoverable file reports
+a broken card through the game's existing error/format flow. Formatting only
+removes the virtual card's numbered files and their transaction companions.
+HostFS renames pass the destination basename, which its driver rebases onto
+the source directory. The PSP kernel expands the source path but forwards
+the destination verbatim; a full `host0:/...` destination produces an invalid
+host path. This handling covers promotion, backups, rollback and recovery.
+
+Game utility requests run on the existing card worker when it starts; if PSP
+cannot allocate or start it, the same operations execute on the calling thread
+so saving remains available. PSP waits
+sleep while that worker is busy, protect shared completion state with its
+mutex, and preserve a save error before unmounting. Save creation/replacement
+uses one backend transaction instead of deleting the old save before renaming
+a temporary GameCube file. Load sizes are checked against the game buffer.
+PSP integer/short writes use unsigned endian conversion, and card checksums
+read big-endian words with unsigned arithmetic, including with LTO enabled.
+
+Memory Stick synchronization tries `ms0:`, the SDK-documented `msfat0:`, and
+`fatms0:` endpoints. Unsupported device, operation or device-wide synchronization
+permissions do not reject a successfully closed and verified save. Other sync
+errors still fail the save. Both errno-family errors and native PSP kernel
+device-control errors (`0x80020321`, `0x80020324`, `0x80020325`, and permission
+error `0x800200d1`) are handled; treating the latter as errno values rejects
+valid saves before the staged file can be promoted. Failed writes/reads/closes
+and a full filesystem still fail the operation.
+USB HostFS returns plain `-1` for an unsupported sync devctl. This result is
+accepted only for `host*` save devices, after checked writes and closes; staged
+header/payload verification still runs before promotion. The same `-1` remains
+an error on Memory Stick/internal storage. A real PSPLink user-mode backend
+test reproduced `sync=-1`, `save=-5` before this change and verified a complete
+0x26000-byte save, byte-for-byte reads, cold remount/reload and deletion after it.
+The native shim exercises each endpoint and unsupported sync, and corrupts a
+staged payload to require verification to reject it while retaining the old save.
+It also checks saving without a worker. Startup checks wait for queued card
+utility work before mounting; the regression runs the game's actual empty-card
+detection path before creating any save. It creates the default save with the
+game's banner, icons and all seven blocks while sync returns the native PSP
+unsupported-operation error, then reopens it and runs the game's corruption
+checks after a cold card restart.
+The PSPLink regression models the firmware's unexpanded rename destination
+and USB HostFS path handling: the old host-relative backend fails immediately
+after successfully reading an empty card. The regression also rejects storage
+root stat calls to reproduce the subsequent detection regression caused by
+redirecting saves. With the redirect removed and the HostFS rename corrected,
+it detects an empty virtual card, creates and reloads all game blocks, replaces
+files, restores backups and deletes files in the mapped host game directory.
+
+Run `python3 tools/check_psp_card.py` for the native LTO sanitizer regression.
+It exercises the production storage and card utility save/list/write helpers,
+all seven game block writes, persistence across processes, metadata offsets,
+short transfers, byte/file capacity, callbacks, channel isolation, injected I/O
+failures and termination after each mutation in a save transaction. It also
+checks backup recovery, broken-card formatting, actual primitive serialization,
+a golden game checksum and the game's save-result/polling methods.
+`tests/psp_card_hardware.cpp` is the isolated user-mode PSPLink backend test;
+its 16-word `cardHardwareResults` array records completion, probe/mount, raw
+sync, save, file index, read/compare, cold mount/open/read/compare and deletion
+results for inspection with PSPLink. It uses only `build/psp/checks/saves` for
+its temporary file, deletes the file on success, and leaves no game logger.
+Full in-game save/load and Memory Stick durability still need hardware checks.
+
 ## Porting stages
 
 1. PSP platform bootstrap and portable compiler definitions (present).
 2. Dolphin OS replacements: filesystem, timing, basic threads/messages/mutexes,
-   and controller are present; save data still needs integration.
+   controller and Memory Stick-backed virtual cards are present.
 3. GX-to-GU renderer: immediate vertices, matrices, depth/blend/cull, basic
    texture decoding, and indexed mesh lists (present); full TEV support remains.
 4. Original `PlugPikiApp` loop and experimental ME-backed JAudio playback
