@@ -763,3 +763,47 @@ across projective thresholds, identity/invalid selectors, weights and constant
 denominators, in addition to the existing animated-model tests. Ordinary and
 LTO renderer checks preserve the real opening/logo, Olimar and ship geometry.
 Measure the rebuilt EBOOT on PSP to establish FPS, scanout and playback behavior.
+
+### Native PSP strips, byte weights and heap pressure
+
+The latest steady title capture reports 14.23 FPS, 26.00 ms main-thread CPU,
+37.13 ms render wall time and 25.61 ms final GPU wait. Pacing is already zero
+and all 606 meshes are cached. This pass reduces native GE input work.
+
+Lists containing only triangle strips now use one indexed GE triangle-strip
+draw when it needs fewer indices than triangle expansion. Repeated endpoint
+indices join strips without rasterized connecting triangles; an extra duplicate
+after an odd prefix preserves the original winding. Mixed primitive lists and
+short strips that would cost more keep indexed triangles. Model/bone matrices,
+draw order, geometry, colors, UVs, cache validation and GPU pinning remain live.
+The extracted opening/logo replay keeps every original triangle but submits
+98,168 mesh indices instead of 134,652 per frame: 36,484 fewer (27.1%). This is
+an input-count reduction, not a hardware FPS result. `mesh_strip_draws` and
+`mesh_strip_indices_saved` report the selected path and savings per frame.
+
+Weighted vertices now use `GU_WEIGHT_8BIT`. The backend's matrix selectors
+need only zero/unit weights, encoded exactly as 0/128. This matches the PSP
+byte-weight normalization implemented by
+[PPSSPP's vertex decoder](https://github.com/hrydgard/ppsspp/blob/master/GPU/Common/VertexDecoderCommon.cpp#L258).
+Each weighted vertex shrinks from 56 to 32 bytes, retaining float positions/UVs
+and RGBA8888 colors. Bone uploads and their slot ordering remain unchanged.
+The native recorder decodes byte weights using that normalization and compares
+transformed triangles to the original per-vertex reference.
+
+Later gameplay in the same capture reports approximately 62 mesh-store failures
+per frame with no evictions. Native allocation can fail before the mesh cache
+reaches its own 4 MiB budget. On allocation failure the renderer now reclaims
+the oldest GPU-idle entry and retries, allowing unused title geometry to leave
+the heap. It never evicts an entry still used by queued GE commands; exhaustion
+with all entries pinned keeps the uncached fallback. `mesh_memory_evictions`
+distinguishes this reclamation from byte-budget/set replacement.
+
+Ordinary and LTO sanitizer checks exercise 432 rigid/skinned strip combinations
+with odd/even joins, exact triangle order/winding, animation, source edits,
+cache reuse and the 16-bit draw-count boundary. They replay the real opening,
+logo, Olimar and ship models, check packed-weight UV refresh and force allocation
+failures to verify both idle reclamation and pinned-buffer protection. A native
+30,000-index strip now remains batched instead of overflowing its triangle
+expansion. The large auxiliary-UV fallback fixture uses 45,000 vertices because
+the previous 30,000-vertex case now fits after weight packing. Build with the
+usual `make -f Makefile.psp psp-game -j8` and compare the same scenes on PSP.

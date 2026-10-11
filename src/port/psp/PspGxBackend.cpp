@@ -28,9 +28,12 @@ struct PspGxVertex {
 };
 
 struct PspGxSkinnedVertex {
-	f32 weights[8];
+	// GX matrix selectors use exactly one bone per converted vertex. PSP
+	// unsigned byte weights encode 0/1 exactly as 0/128; no quantization.
+	u8 weights[8];
 	PspGxVertex vertex;
 };
+static_assert(sizeof(PspGxSkinnedVertex) == 32, "Packed PSP weighted vertex layout");
 
 struct PspGxAttribute {
 	GXAttrType source;
@@ -135,6 +138,8 @@ struct FrameTimings {
 	u64 meshKeyBuilds;
 	u64 compiledMeshDraws;
 	u32 pacingBypasses;
+	u64 stripDraws, stripIndicesSaved;
+	u64 meshMemoryEvictions;
 	bool wroteHeader;
 };
 FrameTimings sTimings;
@@ -228,6 +233,7 @@ void recordFrameTimings()
 				fputs("Mesh cache: live-state validation, compact lookup tags, rigid/skinned buffers and animated UV refresh. GPU: inline compiled mesh words, batched cached-draw kicks, matrix reuse and swizzled textures. Audio: sampled detail timing, active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\nmesh_ms and cache_validate_ms are estimates: one in 16 list calls is timed, with duration scaled by 16 and the sampling phase rotated each frame. Frame/render/CPU times and geometry/cache counters remain exact.\n", file);
 				fputs("audio_sequence_ms, audio_channels_ms, audio_stream_ms, audio_mix_ms and audio_movie_ms are estimates: one rotating tick per eight is timed. Audio work/lock/ME-wait and thread CPU times remain exact.\n", file);
 				fputs("Presentation: triple-buffered 480x272 RGBA8888; GPU completion before pacing, no extra refresh wait for late frames. Animated UV refresh copies geometry and generates coordinates in one pass.\n", file);
+				fputs("Geometry: joined native GE triangle strips when cheaper than triangle expansion; exact unsigned-byte bone weights; idle mesh reclamation on heap pressure.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -260,6 +266,9 @@ void recordFrameTimings()
 			fprintf(file, "  mesh_key_builds=%.1f\n", sTimings.meshKeyBuilds / 120.0);
 			fprintf(file, "  gpu_compiled_mesh_draws=%.1f\n", sTimings.compiledMeshDraws / 120.0);
 			fprintf(file, "  pacing_bypass_frames=%u\n", sTimings.pacingBypasses);
+			fprintf(file, "  mesh_strip_draws=%.1f mesh_strip_indices_saved=%.1f\n",
+			        sTimings.stripDraws / 120.0, sTimings.stripIndicesSaved / 120.0);
+			fprintf(file, "  mesh_memory_evictions=%.1f\n", sTimings.meshMemoryEvictions / 120.0);
 			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
 			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
 			        metrics[PikminPsp::PerformanceMovieConvert] / 120000.0,
@@ -785,7 +794,7 @@ void submitVertices(const void* vertices, u32 count, int primitive, const u16* i
 	if (sState.textureEnabled) setGuEnabled(GU_TEXTURE_2D, true); else setGuEnabled(GU_TEXTURE_2D, false);
 	const int format = GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF
 	                 | (indices ? GU_INDEX_16BIT : 0)
-	                 | (skinned ? GU_WEIGHT_32BITF | GU_WEIGHTS(8) : 0)
+	                 | (skinned ? GU_WEIGHT_8BIT | GU_WEIGHTS(8) : 0)
 	                 | (sState.transform3D ? GU_TRANSFORM_3D : GU_TRANSFORM_2D);
 	if (persistent && (sCachedDrawBatch++ & 15)) {
 		++sTimings.deferredCachedDraws;
@@ -1059,6 +1068,7 @@ struct MeshCacheEntry {
 	const u8* list;
 	u8* storage;
 	u32 listBytes, nativeBytes, allocationBytes, indexCount, vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize;
+	u32 drawPrimitive, indicesSaved;
 	u64 lastUse, gpuEpoch;
 	MeshInputRange inputs[4];
 	bool hasTexCoordInputs;
@@ -1162,6 +1172,14 @@ void releaseMeshCacheEntry(MeshCacheEntry& entry)
 	meshCacheTag(entry) = {};
 	if (entry.storage) { free(entry.storage); sMeshCacheBytes -= entry.allocationBytes; }
 	entry = {};
+}
+
+MeshCacheEntry* oldestUnpinnedMesh()
+{
+	MeshCacheEntry* oldest = nullptr;
+	for (auto& set : sMeshCache) for (auto& entry : set)
+		if (entry.storage && entry.gpuEpoch != sMeshCacheEpoch && (!oldest || entry.lastUse < oldest->lastUse)) oldest = &entry;
+	return oldest;
 }
 
 void clearMeshCache()
@@ -1302,7 +1320,7 @@ MeshCacheEntry* findCachedMesh(const u8* list, u32 bytes)
 
 void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const MeshInputRange (&inputs)[4],
                const void* vertices, u32 nativeBytes, u32 indexCount, u32 vertexCount, u32 primitives, u32 matrix,
-               u32 matrixMask, u32 vertexSize, bool hasTexCoordInputs)
+               u32 matrixMask, u32 vertexSize, bool hasTexCoordInputs, u32 drawPrimitive, u32 indicesSaved)
 {
 	MeshInputRange savedInputs[4];
 	memcpy(savedInputs, inputs, sizeof(savedInputs));
@@ -1330,20 +1348,28 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 	if (slot->storage) ++sTimings.meshEvictions;
 	releaseMeshCacheEntry(*slot);
 	while (sMeshCacheBytes + total > kMeshCacheLimit) {
-		MeshCacheEntry* oldest = nullptr;
-		for (auto& set : sMeshCache) for (auto& entry : set)
-			if (entry.storage && entry.gpuEpoch != sMeshCacheEpoch && (!oldest || entry.lastUse < oldest->lastUse)) oldest = &entry;
+		MeshCacheEntry* oldest = oldestUnpinnedMesh();
 		if (!oldest) { ++sTimings.meshStoreFailures; return; }
 		++sTimings.meshEvictions;
 		releaseMeshCacheEntry(*oldest);
 	}
 	u8* storage = static_cast<u8*>(memalign(64, total));
+	// PSP heap pressure can precede the cache's own byte limit. Reclaim idle
+	// geometry (including old title models) instead of retrying an uncached
+	// conversion forever while those allocations occupy the remaining heap.
+	while (!storage) {
+		MeshCacheEntry* oldest = oldestUnpinnedMesh();
+		if (!oldest) break;
+		++sTimings.meshEvictions; ++sTimings.meshMemoryEvictions;
+		releaseMeshCacheEntry(*oldest);
+		storage = static_cast<u8*>(memalign(64, total));
+	}
 	if (!storage) { ++sTimings.meshStoreFailures; return; }
 	memcpy(storage, &key, meshCacheKeyBytes(key));
 	memcpy(storage + kMeshCacheDataOffset, vertices, nativeBytes);
 	u32* commands = reinterpret_cast<u32*>(storage + kMeshCacheDataOffset + meshCacheAlignedSize(nativeBytes));
 	const int format = GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_INDEX_16BIT | GU_TRANSFORM_3D
-	    | (vertexSize == sizeof(PspGxSkinnedVertex) ? GU_WEIGHT_32BITF | GU_WEIGHTS(8) : 0);
+	    | (vertexSize == sizeof(PspGxSkinnedVertex) ? GU_WEIGHT_8BIT | GU_WEIGHTS(8) : 0);
 	uintptr_t vertexAddress = reinterpret_cast<uintptr_t>(storage + kMeshCacheDataOffset);
 	uintptr_t indexAddress = vertexAddress + vertexCount * vertexSize;
 	// Same six words as queueCachedDraw, stored once and emitted inline.
@@ -1352,7 +1378,7 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 	commands[2] = 0x02000000 | (indexAddress & 0x00ffffff);
 	commands[3] = 0x10000000 | ((vertexAddress >> 8) & 0x000f0000);
 	commands[4] = 0x01000000 | (vertexAddress & 0x00ffffff);
-	commands[5] = 0x04000000 | (GU_TRIANGLES << 16) | indexCount;
+	commands[5] = 0x04000000 | (drawPrimitive << 16) | indexCount;
 	sceKernelDcacheWritebackRange(storage + kMeshCacheDataOffset, meshCacheAlignedSize(nativeBytes) + kMeshCacheCommandBytes);
 	u8* snapshot = reinterpret_cast<u8*>(commands) + kMeshCacheCommandBytes;
 	if (snapshotListBytes) memcpy(snapshot, list, snapshotListBytes);
@@ -1365,15 +1391,16 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 	slot->allocationBytes = total; slot->indexCount = indexCount; slot->vertexCount = vertexCount;
 	slot->primitiveCount = primitives; slot->rigidMatrix = matrix; slot->lastUse = ++sMeshCacheUse;
 	slot->matrixMask = matrixMask; slot->vertexSize = vertexSize;
+	slot->drawPrimitive = drawPrimitive; slot->indicesSaved = indicesSaved;
 	slot->hasTexCoordInputs = hasTexCoordInputs;
 	memcpy(slot->inputs, savedInputs, sizeof(slot->inputs));
 	sMeshCacheBytes += total;
 	meshCacheTag(*slot) = {list, listBytes};
 }
 
-// Retail model lists contain thousands of short strips. Submit a whole list
-// as indexed triangles. Positions stay in model space: the GE transforms and
-// clips them. Rigid meshes use GU_MODEL, while mixed matrices use GE bones.
+// Retail lists contain thousands of short strips. Join compatible strips
+// with degenerate indices when that uses fewer vertices than triangle
+// expansion. Keep one draw per list; positions/matrices remain GE inputs.
 bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timingWeight = 1)
 {
 	const u8* listStart = input;
@@ -1401,8 +1428,11 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 				sTimings.texCoordRefreshVertices += cached->vertexCount;
 			}
 			bool skinned = loadMeshMatrices(cached->matrixMask, cached->rigidMatrix);
-			submitVertices(vertices, cached->indexCount, GU_TRIANGLES, indices, skinned, !refresh,
+			submitVertices(vertices, cached->indexCount, cached->drawPrimitive, indices, skinned, !refresh,
 			               refresh ? nullptr : meshCacheCommands(*cached));
+			if (cached->drawPrimitive == GU_TRIANGLE_STRIP) {
+				++sTimings.stripDraws; sTimings.stripIndicesSaved += cached->indicesSaved;
+			}
 			sDebugBatchedPrimitives += cached->primitiveCount;
 			++sTimings.meshCacheHits;
 			sTimings.cachedVertices += cached->vertexCount;
@@ -1412,7 +1442,8 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 	MeshLayout layout;
 	if (!meshLayout(layout)) return false;
 	MeshInputRange inputs[4] = {};
-	u32 vertexCount = 0, indexCount = 0, primitiveCount = 0, matrixMask = 0;
+	u32 vertexCount = 0, indexCount = 0, stripIndexCount = 0, primitiveCount = 0, matrixMask = 0;
+	bool allStrips = true;
 	for (const u8* scan = input; scan < end;) {
 		u8 command = *scan++;
 		if (command == GX_CMD_NOP) continue;
@@ -1422,12 +1453,22 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 		if (!indices || (u32)(end - scan) / layout.stride < count) return false;
 		vertexCount += count;
 		indexCount += indices;
+		allStrips = allStrips && (command & GX_OPCODE_MASK) == GX_TRIANGLESTRIP;
+		// Duplicate the old last and new first index. For an odd prefix, one
+		// extra duplicate makes the new strip start with its original winding.
+		if (primitiveCount) stripIndexCount += 2 + (stripIndexCount & 1);
+		stripIndexCount += count;
 		++primitiveCount;
-		if (vertexCount > 65535 || indexCount > 65535) return false;
+		if (vertexCount > 65535) return false;
 		for (u32 i = 0; i < count; ++i) matrixMask |= 1U << meshMatrixIndex(scan + i * layout.stride, layout);
 		scan += count * layout.stride;
 	}
 	if (!vertexCount) return true;
+	const bool joinedStrips = allStrips && stripIndexCount < indexCount;
+	const u32 indicesSaved = joinedStrips ? indexCount - stripIndexCount : 0;
+	if (joinedStrips) indexCount = stripIndexCount;
+	if (indexCount > 65535) return false;
+	const u32 drawPrimitive = joinedStrips ? GU_TRIANGLE_STRIP : GU_TRIANGLES;
 	u8 boneSlots[10] = {};
 	u32 matrixCount = 0, rigidMatrix = 0;
 	for (u32 i = 0; i < 10; ++i) if (matrixMask & (1U << i)) {
@@ -1467,7 +1508,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 			if (skinned) {
 				PspGxSkinnedVertex* weighted = reinterpret_cast<PspGxSkinnedVertex*>(destination);
 				memset(weighted->weights, 0, sizeof(weighted->weights));
-				weighted->weights[boneSlots[meshMatrixIndex(input, layout)]] = 1.0f;
+				weighted->weights[boneSlots[meshMatrixIndex(input, layout)]] = 128;
 				destination = reinterpret_cast<u8*>(&weighted->vertex);
 			}
 			PspGxVertex& out = *reinterpret_cast<PspGxVertex*>(destination);
@@ -1503,7 +1544,16 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 				}
 			}
 		}
-		if (primitive == GX_TRIANGLES) {
+		if (joinedStrips) {
+			if (index) {
+				u16 last = indices[index - 1];
+				bool oddPrefix = index & 1;
+				indices[index++] = last;
+				if (oddPrefix) indices[index++] = last;
+				indices[index++] = base;
+			}
+			for (u32 i = 0; i < count; ++i) indices[index++] = base + i;
+		} else if (primitive == GX_TRIANGLES) {
 			for (u32 i = 0; i < count; ++i) indices[index++] = base + i;
 		} else if (primitive == GX_QUADS) {
 			for (u32 i = 0; i < count; i += 4) {
@@ -1520,9 +1570,10 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 		base += count;
 	}
 	if (cacheable) cacheMesh(listStart, end - listStart, key, inputs, vertices, byteCount, indexCount,
-	                         vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize, saveTexCoords);
+	                         vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize, saveTexCoords, drawPrimitive, indicesSaved);
 	loadMeshMatrices(matrixMask, rigidMatrix);
-	submitVertices(vertices, indexCount, GU_TRIANGLES, indices, skinned);
+	submitVertices(vertices, indexCount, drawPrimitive, indices, skinned);
+	if (joinedStrips) { ++sTimings.stripDraws; sTimings.stripIndicesSaved += indicesSaved; }
 	sDebugBatchedPrimitives += primitiveCount;
 	return true;
 }

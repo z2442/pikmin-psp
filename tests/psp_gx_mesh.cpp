@@ -1,6 +1,14 @@
 // Native GU command recorder: verify the backend against the old per-vertex
 // transform, including the retail title lists when extracted data is present.
+#include <malloc.h>
+static unsigned int allocationFailures;
+static void* testMemalign(size_t alignment, size_t bytes) {
+	if (allocationFailures) { --allocationFailures; return nullptr; }
+	return memalign(alignment, bytes);
+}
+#define memalign testMemalign
 #include "../src/port/psp/PspGxBackend.cpp"
+#undef memalign
 #include "../src/port/psp/PspDolphinCompat.cpp"
 namespace std { using ::sqrtf; }
 #include "../src/plugPikiYamashita/P2DPicture.cpp"
@@ -200,6 +208,55 @@ void syntheticLists()
 	compareList(list, sizeof(list));
 }
 
+void nativeStripParity()
+{
+	u32 cases = 0;
+	for (bool skinned : {false, true}) for (u32 a = 3; a <= 8; ++a)
+	for (u32 b = 3; b <= 8; ++b) for (u32 c = 3; c <= 8; ++c) {
+		clearMeshCache(); resetState();
+		sState.texSource = GX_TG_TEX0;
+		f32 positions[24][3];
+		for (u32 i = 0; i < 24; ++i) {
+			positions[i][0] = i % 4; positions[i][1] = i / 4; positions[i][2] = (i % 3) * 0.125f;
+		}
+		GXSetVtxDesc(GX_VA_PNMTXIDX, GX_DIRECT);
+		GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+		GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+		GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+		std::vector<u8> list;
+		u32 vertex = 0, expanded = 0, joined = 0;
+		for (u32 count : {a,b,c}) {
+			list.insert(list.end(), {GX_TRIANGLESTRIP,0,u8(count)});
+			if (joined) joined += 2 + (joined & 1);
+			joined += count; expanded += (count - 2) * 3;
+			for (u32 i = 0; i < count; ++i, ++vertex) list.insert(list.end(), {u8(skinned ? (vertex % 3) * 12 : 6),u8(vertex)});
+		}
+		compareList(list.data(), list.size());
+		auto* entry = findCachedMesh(list.data(), list.size());
+		assert(entry && entry->indexCount == (joined < expanded ? joined : expanded));
+		assert(entry->drawPrimitive == (joined < expanded ? GU_TRIANGLE_STRIP : GU_TRIANGLES));
+		assert(entry->indicesSaved == (joined < expanded ? expanded - joined : 0));
+		assert(entry->vertexSize == (skinned ? 32 : sizeof(PspGxVertex)));
+		++cases;
+	}
+	// A strip can fit the GE's 16-bit count even when triangle expansion would
+	// exceed it. This must remain a single native draw, including cached reuse.
+	clearMeshCache(); resetState(); resetDraws();
+	sState.texSource = GX_TG_TEX0;
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	std::vector<u8> longStrip = {GX_TRIANGLESTRIP,u8(30000 >> 8),u8(30000)};
+	for (u32 i = 0; i < 30000; ++i) longStrip.push_back(i % 3);
+	compareList(longStrip.data(), longStrip.size());
+	auto* entry = findCachedMesh(longStrip.data(), longStrip.size());
+	assert(entry && entry->indexCount == 30000 && entry->drawPrimitive == GU_TRIANGLE_STRIP);
+	assert(entry->indicesSaved == 59994);
+	clearMeshCache();
+	printf("Native PSP strips: %u rigid/skinned parity cases preserve triangle order and winding; 30,000-index strip stays batched\n", cases);
+}
+
 void meshCacheInvalidation()
 {
 	clearMeshCache();
@@ -266,6 +323,42 @@ void meshCacheInvalidation()
 	clearMeshCache();
 	assert(sMeshCacheBytes == 0);
 	checkMeshCacheTags();
+}
+
+void meshHeapPressure()
+{
+	clearMeshCache(); resetState(); resetDraws();
+	sState.texSource = GX_TG_TEX0;
+	f32 positions[][3] = {{0,0,0},{1,0,0},{0,1,0},{1,1,0}};
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	u8 a[] = {GX_TRIANGLES,0,3,0,1,2};
+	u8 b[] = {GX_TRIANGLES,0,3,1,2,3};
+	u8 c[] = {GX_TRIANGLES,0,3,0,2,3};
+	assert(drawMeshList(a, a + sizeof(a)) && drawMeshList(b, b + sizeof(b)));
+	meshCacheGpuIdle();
+	assert(drawMeshList(a, a + sizeof(a))); // A stays pinned; B may be reclaimed.
+	auto* pinned = findCachedMesh(a, sizeof(a));
+	const u8* storage = pinned->storage;
+	std::vector<u8> bytes(storage, storage + pinned->allocationBytes);
+	u64 evictions = sTimings.meshMemoryEvictions;
+	allocationFailures = 1;
+	assert(drawMeshList(c, c + sizeof(c)));
+	assert(findCachedMesh(c, sizeof(c)) && !findCachedMesh(b, sizeof(b)));
+	assert(sTimings.meshMemoryEvictions == evictions + 1);
+	assert(pinned->storage == storage && !memcmp(storage, bytes.data(), bytes.size()));
+	// With every remaining entry pinned, failed allocation must draw uncached
+	// and stop retrying, without freeing storage used by queued GPU commands.
+	assert(drawMeshList(c, c + sizeof(c)));
+	u64 failures = sTimings.meshStoreFailures;
+	allocationFailures = 1;
+	assert(drawMeshList(b, b + sizeof(b)));
+	assert(sTimings.meshStoreFailures == failures + 1 && !findCachedMesh(b, sizeof(b)));
+	assert(pinned->storage == storage && !memcmp(storage, bytes.data(), bytes.size()));
+	assert(allocationFailures == 0);
+	checkMeshCacheTags(); clearMeshCache();
+	puts("PSP heap pressure: idle cache reclamation succeeds; pinned geometry survives and exhausted heaps fall back safely");
 }
 
 void sharedMeshArrays()
@@ -518,14 +611,17 @@ void animatedTexCoordMeshes()
 	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
 	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
 	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
-	std::vector<u8> large = {GX_TRIANGLES, u8(30000 >> 8), u8(30000)};
-	for (u32 i = 0; i < 30000; ++i) large.insert(large.end(), {u8((i & 1) * 3), u8(i % 3)});
+	// Byte weights let the old 30,000-vertex fixture fit its UV inputs now.
+	// Keep this case beyond the GU list budget to exercise the fallback.
+	const u32 largeVertexCount = 45000;
+	std::vector<u8> large = {GX_TRIANGLES, u8(largeVertexCount >> 8), u8(largeVertexCount)};
+	for (u32 i = 0; i < largeVertexCount; ++i) large.insert(large.end(), {u8((i & 1) * 3), u8(i % 3)});
 	Mtx matrix = {{0.5f,0,0,0.5f},{0,0.5f,0,0.5f},{0,0,0,1}};
 	GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
 	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX2X4, GX_TG_POS, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
 	assert(drawMeshList(large.data(), large.data() + large.size()));
 	auto* entry = findCachedMesh(large.data(), large.size());
-	assert(entry && !entry->hasTexCoordInputs && entry->vertexCount == 30000);
+	assert(entry && !entry->hasTexCoordInputs && entry->vertexCount == largeVertexCount);
 	matrix[0][3] += 1;
 	GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
 	assert(!findCachedMesh(large.data(), large.size())); // Full validation remains for this path.
@@ -581,13 +677,15 @@ void benchmarkModels(const std::vector<ModelDraw>& modelDraws)
 	for (bool cached : {false, true}) {
 		clearMeshCache();
 		const u64 revision = PikminPsp::nextMeshRevision();
-		u64 beforeDecoded = 0, beforeHits = 0;
+		u64 beforeDecoded = 0, beforeHits = 0, beforeSaved = 0;
+		u32 beforeSubmitted = 0;
 		std::chrono::steady_clock::time_point start;
 		for (u32 frame = 0; frame < 13; ++frame) {
 			meshCacheGpuIdle();
 			if (frame == 1) {
 				start = std::chrono::steady_clock::now();
 				beforeDecoded = sTimings.decodedVertices; beforeHits = sTimings.meshCacheHits;
+				beforeSaved = sTimings.stripIndicesSaved; beforeSubmitted = sDebugVertexCount;
 			}
 			PikminPsp::MeshValidationScope validation;
 			PikminPsp::bindMeshRevision(revision);
@@ -600,6 +698,8 @@ void benchmarkModels(const std::vector<ModelDraw>& modelDraws)
 		printf("  %s: native conversion %.3f ms/frame, decoded %.0f, cache hits %.0f, cache bytes %u\n",
 		       cached ? "cached" : "uncached", milliseconds[cached],
 		       (sTimings.decodedVertices - beforeDecoded) / 12.0, (sTimings.meshCacheHits - beforeHits) / 12.0, sMeshCacheBytes);
+		printf("  mesh indices %.0f/frame, saved %.0f/frame through native strips\n",
+		       (u32)(sDebugVertexCount - beforeSubmitted) / 12.0, (sTimings.stripIndicesSaved - beforeSaved) / 12.0);
 	}
 	printf("  native conversion ratio: %.2fx (not PSP FPS)\n", milliseconds[0] / milliseconds[1]);
 	recordGeometry = true;
@@ -785,11 +885,14 @@ void sceGuDrawArray(int primitive, int format, int count, const void* indexData,
 		u32 index = indexData ? static_cast<const u16*>(indexData)[i] : i;
 		PspGxVertex v;
 		if (format & GU_WEIGHT_BITS) {
+			assert((format & GU_WEIGHT_BITS) == GU_WEIGHT_8BIT);
 			const auto& source = static_cast<const PspGxSkinnedVertex*>(vertexData)[index];
 			v = source.vertex; v.x = v.y = v.z = 0;
 			for (int b = 0; b < 8; ++b) if (source.weights[b]) {
+				assert(source.weights[b] == 128);
 				PspGxVertex part = source.vertex; transform(part, bones[b]);
-				v.x += part.x * source.weights[b]; v.y += part.y * source.weights[b]; v.z += part.z * source.weights[b];
+				f32 weight = source.weights[b] * (1.0f / 128.0f);
+				v.x += part.x * weight; v.y += part.y * weight; v.z += part.z * weight;
 			}
 		} else v = static_cast<const PspGxVertex*>(vertexData)[index];
 		transform(v, modelMatrix);
@@ -799,6 +902,13 @@ void sceGuDrawArray(int primitive, int format, int count, const void* indexData,
 	else {
 		assert(primitive == GU_TRIANGLE_STRIP || primitive == GU_TRIANGLE_FAN);
 		for (int i = 2; i < count; ++i) {
+			if (primitive == GU_TRIANGLE_STRIP && indexData) {
+				const auto* indices = static_cast<const u16*>(indexData);
+				// Repeated native indices are the stitching triangles, which
+				// rasterize no pixels. Preserve original geometric degenerates
+				// whose distinct indices happen to have equal positions.
+				if (indices[i-2] == indices[i-1] || indices[i-2] == indices[i] || indices[i-1] == indices[i]) continue;
+			}
 			triangles.push_back(vertices[primitive == GU_TRIANGLE_FAN ? 0 : i - 2 + (i & 1)]);
 			triangles.push_back(vertices[primitive == GU_TRIANGLE_FAN ? i - 1 : i - 1 - (i & 1)]);
 			triangles.push_back(vertices[i]);
@@ -1477,7 +1587,7 @@ void streamingUvRefresh()
 			u32 offset = skinned ? offsetof(PspGxSkinnedVertex, vertex) : 0;
 			if (skinned) {
 				auto* v = reinterpret_cast<PspGxSkinnedVertex*>(source.data() + i * stride);
-				for (u32 b = 0; b < 8; ++b) v->weights[b] = b == i ? 1 : 0;
+				for (u32 b = 0; b < 8; ++b) v->weights[b] = b == i ? 128 : 0;
 			}
 			auto* v = reinterpret_cast<PspGxVertex*>(source.data() + i * stride + offset);
 			*v = {0.125f,-0.25f,0xff405060 + i,f32(i),f32(i+1),f32(i+2)};
@@ -1555,7 +1665,9 @@ int main(int argc, char** argv)
 	titleColourCompatibility();
 	shadowCopies();
 	syntheticLists();
+	nativeStripParity();
 	meshCacheInvalidation();
+	meshHeapPressure();
 	sharedMeshArrays();
 	revisionedMeshes();
 	animatedCachedMeshes();
