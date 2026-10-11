@@ -128,6 +128,7 @@ struct FrameTimings {
 	u64 modelMatrixUploads;
 	u64 decodedVertices, skinnedVertices, fallbackLists, textureMisses, meshCacheHits, cachedVertices, meshCacheValidation, arrayValidation;
 	u64 meshMissAbsent, meshMissState, meshMissSource, meshStoreFailures, meshEvictions;
+	u64 texCoordRefreshes, texCoordRefreshVertices;
 	bool wroteHeader;
 };
 FrameTimings sTimings;
@@ -218,7 +219,7 @@ void recordFrameTimings()
 #else
 				fputs("Build: standard (no LTO).\n", file);
 #endif
-				fputs("Mesh cache: rigid/skinned buffers, material variants and selected texture matrices. GPU: batched cached-draw kicks, matrix reuse and swizzled textures. Audio: active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\nmesh_ms and cache_validate_ms are estimates: one in 16 list calls is timed, with duration scaled by 16 and the sampling phase rotated each frame. Frame/render/CPU times and geometry/cache counters remain exact.\n", file);
+				fputs("Mesh cache: compact lookup tags, rigid/skinned buffers and animated UV refresh. GPU: batched cached-draw kicks, matrix reuse and swizzled textures. Audio: active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\nmesh_ms and cache_validate_ms are estimates: one in 16 list calls is timed, with duration scaled by 16 and the sampling phase rotated each frame. Frame/render/CPU times and geometry/cache counters remain exact.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -246,6 +247,8 @@ void recordFrameTimings()
 			fprintf(file, "  mesh_timing_samples=%.1f mesh_timing_interval=%u\n",
 			        sTimings.meshTimingSamples / 120.0, kMeshTimingInterval);
 			fprintf(file, "  gpu_model_uploads=%.1f\n", sTimings.modelMatrixUploads / 120.0);
+			fprintf(file, "  mesh_uv_refreshes=%.1f mesh_uv_vertices=%.1f\n",
+			        sTimings.texCoordRefreshes / 120.0, sTimings.texCoordRefreshVertices / 120.0);
 			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
 			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
 			        metrics[PikminPsp::PerformanceMovieConvert] / 120000.0,
@@ -1022,7 +1025,12 @@ struct MeshCacheEntry {
 	u32 listBytes, nativeBytes, allocationBytes, indexCount, vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize;
 	u64 lastUse, gpuEpoch;
 	MeshInputRange inputs[4];
+	bool hasTexCoordInputs;
 };
+
+// Keep the inputs to generated UVs so animated reflection/projection matrices
+// can update UVs without decoding lists, rebuilding indices or replacing buffers.
+struct MeshTexCoordInput { f32 x, y, z; u32 matrix; };
 
 const u32 kMeshCacheLimit = 4 * 1024 * 1024;
 const u32 kMeshCacheDataOffset = (sizeof(MeshCacheKey) + 63) & ~63U;
@@ -1030,11 +1038,23 @@ u64 meshCacheAlignedSize(u64 bytes) { return (bytes + 63) & ~63ULL; }
 // The title has 606 lists; eight ways avoid repeatedly rebuilding lists that
 // collide in the same bucket despite fitting comfortably in the byte budget.
 MeshCacheEntry sMeshCache[256][8];
+// Eight address/length tags occupy 64 bytes on PSP. A failed probe need not
+// fetch a large geometry/lifetime entry just to reject its list.
+struct MeshCacheTag { const u8* list; u32 bytes; };
+alignas(64) MeshCacheTag sMeshCacheTags[256][8];
 u32 sMeshCacheBytes;
 u64 sMeshCacheUse;
 
+MeshCacheTag& meshCacheTag(MeshCacheEntry& entry)
+{
+	// Entries passed here always belong to the fixed cache table.
+	uintptr_t index = (reinterpret_cast<uintptr_t>(&entry) - reinterpret_cast<uintptr_t>(sMeshCache)) / sizeof(MeshCacheEntry);
+	return sMeshCacheTags[index / 8][index % 8];
+}
+
 void releaseMeshCacheEntry(MeshCacheEntry& entry)
 {
+	meshCacheTag(entry) = {};
 	if (entry.storage) { free(entry.storage); sMeshCacheBytes -= entry.allocationBytes; }
 	entry = {};
 }
@@ -1101,10 +1121,15 @@ u32 meshCacheSet(const u8* list)
 MeshCacheEntry* findCachedMesh(const u8* list, u32 bytes, const MeshCacheKey& key)
 {
 	bool foundList = false, foundState = false;
-	for (auto& entry : sMeshCache[meshCacheSet(list)]) {
-		if (!entry.storage || entry.list != list || entry.listBytes != bytes) continue;
+	const u32 set = meshCacheSet(list);
+	for (u32 way = 0; way < 8; ++way) {
+		const MeshCacheTag& tag = sMeshCacheTags[set][way];
+		if (!tag.list || tag.list != list || tag.bytes != bytes) continue;
+		MeshCacheEntry& entry = sMeshCache[set][way];
 		foundList = true;
-		if (!meshBytesEqual(entry.storage, &key, meshCacheKeyBytes(key))) continue;
+		const u32 keyBytes = entry.hasTexCoordInputs && key.generatedTexCoords
+		    ? offsetof(MeshCacheKey, textureMatrices) : meshCacheKeyBytes(key);
+		if (!meshBytesEqual(entry.storage, &key, keyBytes)) continue;
 		foundState = true;
 		if (key.modelRevision) { entry.lastUse = ++sMeshCacheUse; return &entry; }
 		const u8* snapshot = entry.storage + kMeshCacheDataOffset + meshCacheAlignedSize(entry.nativeBytes);
@@ -1133,7 +1158,7 @@ MeshCacheEntry* findCachedMesh(const u8* list, u32 bytes, const MeshCacheKey& ke
 
 void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const MeshInputRange (&inputs)[4],
                const void* vertices, u32 nativeBytes, u32 indexCount, u32 vertexCount, u32 primitives, u32 matrix,
-               u32 matrixMask, u32 vertexSize)
+               u32 matrixMask, u32 vertexSize, bool hasTexCoordInputs)
 {
 	MeshInputRange savedInputs[4];
 	memcpy(savedInputs, inputs, sizeof(savedInputs));
@@ -1184,8 +1209,10 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 	slot->allocationBytes = total; slot->indexCount = indexCount; slot->vertexCount = vertexCount;
 	slot->primitiveCount = primitives; slot->rigidMatrix = matrix; slot->lastUse = ++sMeshCacheUse;
 	slot->matrixMask = matrixMask; slot->vertexSize = vertexSize;
+	slot->hasTexCoordInputs = hasTexCoordInputs;
 	memcpy(slot->inputs, savedInputs, sizeof(slot->inputs));
 	sMeshCacheBytes += total;
+	meshCacheTag(*slot) = {list, listBytes};
 }
 
 // Retail model lists contain thousands of short strips. Submit a whole list
@@ -1201,12 +1228,31 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 		MeshCacheEntry* cached = findCachedMesh(input, end - input, key);
 		if (timingWeight) sTimings.meshCacheValidation += (u32)(sceKernelGetSystemTimeLow() - validationStart) * timingWeight;
 		if (cached) {
-			reserveDisplayListMemory(0);
-			u8* vertices = cached->storage + kMeshCacheDataOffset;
+			const u32 matrixOffset = offsetof(MeshCacheKey, textureMatrices);
+			const bool refresh = cached->hasTexCoordInputs && !meshBytesEqual(cached->storage + matrixOffset,
+			    key.textureMatrices, meshCacheKeyBytes(key) - matrixOffset);
+			const u32 vertexBytes = cached->vertexCount * cached->vertexSize;
+			reserveDisplayListMemory(refresh ? vertexBytes : 0);
+			u8* storedVertices = cached->storage + kMeshCacheDataOffset;
+			u8* vertices = storedVertices;
 			cached->gpuEpoch = sMeshCacheEpoch;
-			u16* indices = reinterpret_cast<u16*>(vertices + cached->vertexCount * cached->vertexSize);
+			u16* indices = reinterpret_cast<u16*>(storedVertices + vertexBytes);
+			if (refresh) {
+				vertices = static_cast<u8*>(sceGuGetMemory(vertexBytes));
+				memcpy(vertices, storedVertices, vertexBytes);
+				const u32 inputOffset = (vertexBytes + cached->indexCount * sizeof(u16) + 3) & ~3U;
+				const auto* inputs = reinterpret_cast<const MeshTexCoordInput*>(storedVertices + inputOffset);
+				u8* vertex = vertices + (cached->vertexSize == sizeof(PspGxSkinnedVertex)
+				    ? offsetof(PspGxSkinnedVertex, vertex) : 0);
+				for (u32 i = 0; i < cached->vertexCount; ++i, vertex += cached->vertexSize) {
+					generateTexCoord(*reinterpret_cast<PspGxVertex*>(vertex), inputs[i].x, inputs[i].y, inputs[i].z,
+					                 sState.texSource, inputs[i].matrix);
+				}
+				++sTimings.texCoordRefreshes;
+				sTimings.texCoordRefreshVertices += cached->vertexCount;
+			}
 			bool skinned = loadMeshMatrices(cached->matrixMask, cached->rigidMatrix);
-			submitVertices(vertices, cached->indexCount, GU_TRIANGLES, indices, skinned, true);
+			submitVertices(vertices, cached->indexCount, GU_TRIANGLES, indices, skinned, !refresh);
 			sDebugBatchedPrimitives += cached->primitiveCount;
 			++sTimings.meshCacheHits;
 			sTimings.cachedVertices += cached->vertexCount;
@@ -1243,12 +1289,18 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 	const bool cacheable = useCache;
 	u32 vertexSize = skinned ? sizeof(PspGxSkinnedVertex) : sizeof(PspGxVertex);
 	u32 byteCount = vertexCount * vertexSize + indexCount * sizeof(u16);
+	// Align the auxiliary float inputs even when there is an odd index count.
+	const u32 texCoordOffset = (byteCount + 3) & ~3U;
+	const bool saveTexCoords = cacheable && key.generatedTexCoords
+	    && texCoordOffset + vertexCount * sizeof(MeshTexCoordInput) + 8 + kDisplayListCommandReserve <= sizeof(sGxDisplayList);
+	if (saveTexCoords) byteCount = texCoordOffset + vertexCount * sizeof(MeshTexCoordInput);
 	if (byteCount + 8 + kDisplayListCommandReserve > sizeof(sGxDisplayList)) return false;
 	reserveDisplayListMemory(byteCount);
 	u8* vertices = static_cast<u8*>(sceGuGetMemory(byteCount));
 	sTimings.decodedVertices += vertexCount;
 	if (skinned) sTimings.skinnedVertices += vertexCount;
 	u16* indices = reinterpret_cast<u16*>(vertices + vertexCount * vertexSize);
+	auto* texCoordInputs = saveTexCoords ? reinterpret_cast<MeshTexCoordInput*>(vertices + texCoordOffset) : nullptr;
 	u32 base = 0, index = 0;
 	const bool tintVertices = prepareMaterialTint();
 	const PspGxAttribute& pos = sState.attributes[GX_VA_POS];
@@ -1286,6 +1338,8 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 			}
 			u32 textureMatrix = layout.offset[GX_VA_TEX0MTXIDX] >= 0
 			    ? meshIndex(input, layout, GX_VA_TEX0MTXIDX) : sState.texMatrix;
+			if (texCoordInputs) texCoordInputs[base + i] = {out.x, out.y, out.z,
+			    sState.texSource == GX_TG_POS ? textureMatrix : (u32)GX_IDENTITY};
 			generateTexCoord(out, out.x, out.y, out.z, GX_TG_POS, textureMatrix);
 			if (sState.texSource == GX_TG_NRM) {
 				GXAttr normalAttr = layout.offset[GX_VA_NBT] >= 0 ? GX_VA_NBT : GX_VA_NRM;
@@ -1293,6 +1347,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 				if (layout.offset[normalAttr] >= 0 && normal.array && normal.componentType == GX_F32) {
 					const f32* n = reinterpret_cast<const f32*>(normal.array + meshIndex(input, layout, normalAttr) * normal.stride);
 					generateTexCoord(out, n[0], n[1], n[2], GX_TG_NRM, textureMatrix);
+					if (texCoordInputs) texCoordInputs[base + i] = {n[0], n[1], n[2], textureMatrix};
 					if (cacheable) inputs[3].include(n, 12);
 				}
 			}
@@ -1314,7 +1369,7 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 		base += count;
 	}
 	if (cacheable) cacheMesh(listStart, end - listStart, key, inputs, vertices, byteCount, indexCount,
-	                         vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize);
+	                         vertexCount, primitiveCount, rigidMatrix, matrixMask, vertexSize, saveTexCoords);
 	loadMeshMatrices(matrixMask, rigidMatrix);
 	submitVertices(vertices, indexCount, GU_TRIANGLES, indices, skinned);
 	sDebugBatchedPrimitives += primitiveCount;

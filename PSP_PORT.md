@@ -529,3 +529,43 @@ changes, then verify skinned, fallback and immediate transitions. Extracted
 opening/logo geometry and menu opacity pass with ordinary and LTO compilation.
 This proves reduced uploads and preserved geometry; measure PSP frame time and
 main-thread CPU to establish the performance gain.
+
+### Compact mesh lookup and animated texture coordinates
+
+The following hardware capture reached approximately 14 FPS in the steady
+title, with 37 ms of main-thread CPU and 26 ms of audio-thread CPU per frame.
+Later gameplay windows dropped to approximately 8 FPS with 12,000 vertices
+converted per frame and approximately 54 material-state misses. GPU presentation
+waits remained below 0.1 ms in those gameplay windows. This makes repeated mesh
+conversion a useful target alongside title submission overhead.
+
+Cache lookup now checks a separate, 64-byte-aligned table of display-list
+addresses and lengths before accessing geometry and lifetime metadata. The
+tags occupy 16 KiB on PSP; replacement, failed insertion and clearing remove
+the corresponding tag. Exact material checks, source validation, model lifetime
+revisions and GPU pinning remain in place.
+
+Meshes using position- or normal-generated texture coordinates retain their
+generation inputs alongside native geometry. When only texture matrices change,
+the renderer copies native vertices into GU list memory and updates their UVs.
+It reuses triangle indices and bone weights, avoids list decoding and persistent
+buffer replacement, and pins the indices until GPU completion. Matching matrices
+still draw the cached buffer directly. Geometry, tint, bindings, selectors,
+generation mode and model revisions still participate in validation. Auxiliary
+inputs stay within the existing 4 MiB cache budget. Large meshes that cannot fit
+the additional inputs in GU list memory keep their original full conversion path.
+
+`mesh_uv_refreshes` and `mesh_uv_vertices` report these refreshes per frame.
+They count as cache hits and cached vertices, but do not increment
+`decoded_vertices`; matrix-only reuse is distinct from complete geometry
+conversion. Refresh draws use the SDK submission path because their vertices
+are transient. They are excluded from the persistent cached-draw kick counters.
+
+Native sanitizer tests with LTO check 16 rigid/skinned, position/normal,
+uniform/per-vertex and affine/projective combinations across 20 animation frames,
+including zero projective denominators and identity selectors. They compare UVs,
+colors, positions and triangles to the reference, verify persistent buffers stay
+unchanged and pinned, and require source edits to invalidate geometry. They also
+check oversized meshes, tag consistency, eviction, menu opacity and both real
+title models. Repeat the same PSP scenes to establish the FPS improvement;
+native conversion measurements do not establish hardware frame rate.

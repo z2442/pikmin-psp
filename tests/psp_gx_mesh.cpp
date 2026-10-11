@@ -84,9 +84,24 @@ void referenceList(const u8* input, const u8* end)
 	assert(input == end);
 }
 
+void checkMeshCacheTags()
+{
+	for (u32 set = 0; set < 256; ++set) for (u32 way = 0; way < 8; ++way) {
+		const auto& entry = sMeshCache[set][way];
+		const auto& tag = sMeshCacheTags[set][way];
+		if (!entry.storage) { assert(!tag.list && !tag.bytes); continue; }
+		assert(tag.list == entry.list && tag.bytes == entry.listBytes);
+		assert(meshCacheSet(tag.list) == set);
+		assert(&meshCacheTag(sMeshCache[set][way]) == &tag);
+	}
+}
+
 void equalVertex(const PspGxVertex& a, const PspGxVertex& b)
 {
 	assert(a.colour == b.colour);
+	if (a.u != b.u || a.v != b.v)
+		fprintf(stderr, "UV mismatch: got %.9g,%.9g expected %.9g,%.9g (source %u, matrix %u, refreshes %llu)\n",
+		        a.u, a.v, b.u, b.v, (u32)sState.texSource, sState.texMatrix, (unsigned long long)sTimings.texCoordRefreshes);
 	assert(a.u == b.u && a.v == b.v);
 	assert(fabsf(a.x - b.x) < 0.005f);
 	assert(fabsf(a.y - b.y) < 0.005f);
@@ -114,6 +129,7 @@ u32 compareList(const u8* input, u32 size)
 	// only one in sixteen needs a direct SDK draw/stall update.
 	if (sTimings.meshCacheHits && !expected.empty()) {
 		u64 hits = sTimings.meshCacheHits;
+		u64 refreshes = sTimings.texCoordRefreshes;
 		resetDraws();
 		for (u32 draw = 0; draw < 33; ++draw) {
 			triangles.clear();
@@ -121,8 +137,10 @@ u32 compareList(const u8* input, u32 size)
 			assert(triangles.size() == expected.size());
 			for (u32 i = 0; i < triangles.size(); ++i) equalVertex(triangles[i], expected[i]);
 		}
-		if (sTimings.meshCacheHits - hits == 33) assert(deferredDrawCalls == 30);
+		if (sTimings.meshCacheHits - hits == 33 && sTimings.texCoordRefreshes == refreshes)
+			assert(deferredDrawCalls == 30);
 	}
+	checkMeshCacheTags();
 	return oldDraws;
 }
 
@@ -228,6 +246,7 @@ void meshCacheInvalidation()
 	assert(sMeshCacheBytes > 0 && sMeshCacheBytes <= kMeshCacheLimit);
 	clearMeshCache();
 	assert(sMeshCacheBytes == 0);
+	checkMeshCacheTags();
 }
 
 void sharedMeshArrays()
@@ -390,7 +409,7 @@ void meshMaterialVariants()
 		compareList(list, sizeof(list));
 		assert(sTimings.decodedVertices == afterProjection + (frame == 0 ? 3 : 0));
 	}
-	assert(sTimings.decodedVertices == decoded + 63);
+	assert(sTimings.decodedVertices == decoded + 6); // Two geometry variants, regardless of matrix animation.
 	// Nonzero uniform selectors use the packed single-matrix key too.
 	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3X4, GX_TG_POS, GX_TEXMTX1, GX_FALSE, GX_PTIDENTITY);
 	compareList(list, sizeof(list));
@@ -401,7 +420,7 @@ void meshMaterialVariants()
 	assert(sTimings.decodedVertices == decoded);
 	GXLoadTexMtxImm(projection, GX_TEXMTX1, GX_MTX3x4);
 	compareList(list, sizeof(list));
-	assert(sTimings.decodedVertices == decoded + 3);
+	assert(sTimings.decodedVertices == decoded);
 	// Per-vertex selectors still require every selectable texture matrix.
 	GXSetVtxDesc(GX_VA_TEX0MTXIDX, GX_DIRECT);
 	u8 selected[] = {GX_TRIANGLES,0,3, GX_TEXMTX0,0, GX_TEXMTX1,1, GX_TEXMTX0,2};
@@ -410,8 +429,92 @@ void meshMaterialVariants()
 	projection[0][3] += 0.5f;
 	GXLoadTexMtxImm(projection, GX_TEXMTX1, GX_MTX3x4);
 	compareList(selected, sizeof(selected));
-	assert(sTimings.decodedVertices == decoded + 3);
+	assert(sTimings.decodedVertices == decoded);
 	clearMeshCache();
+}
+
+void animatedTexCoordMeshes()
+{
+	u64 conversions = 0, refreshes = sTimings.texCoordRefreshes;
+	for (bool skinned : {false, true}) for (bool selected : {false, true})
+	for (GXTexGenSrc source : {GX_TG_POS, GX_TG_NRM}) for (bool projected : {false, true}) {
+		clearMeshCache(); resetState();
+		f32 positions[][3] = {{1,2,3},{4,5,6},{7,8,9}};
+		f32 normals[][3] = {{0,0,1},{0,1,0},{1,0,0}};
+		GXSetVtxDesc(GX_VA_PNMTXIDX, GX_DIRECT);
+		GXSetVtxDesc(GX_VA_TEX0MTXIDX, selected ? GX_DIRECT : GX_NONE);
+		GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+		GXSetVtxDesc(GX_VA_NRM, GX_INDEX16);
+		GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+		GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+		GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+		GXSetArray(GX_VA_NRM, normals, sizeof(normals[0]));
+		std::vector<u8> list = {GX_TRIANGLES,0,3};
+		for (u8 i = 0; i < 3; ++i) {
+			list.push_back(skinned ? (i == 2 ? 27 : i * 12) : 6);
+			if (selected) list.push_back(i == 2 ? GX_IDENTITY : GX_TEXMTX0 + i * 3);
+			list.insert(list.end(), {0,i,0,i});
+		}
+		Mtx matrix = {{0.5f,0.25f,0,0.5f},{0,0.5f,0.25f,0.5f},{0,0,0,1}};
+		GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
+		GXLoadTexMtxImm(matrix, GX_TEXMTX1, GX_MTX3x4);
+		GXSetTexCoordGen2(GX_TEXCOORD0, projected ? GX_TG_MTX3X4 : GX_TG_MTX2X4,
+		                 source, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+		u64 decoded = sTimings.decodedVertices;
+		compareList(list.data(), list.size());
+		conversions += sTimings.decodedVertices - decoded;
+		assert(sTimings.decodedVertices == decoded + 3);
+		MeshCacheKey key; meshCacheKey(key);
+		auto* entry = findCachedMesh(list.data(), list.size(), key);
+		assert(entry && !findCachedMesh(list.data(), list.size() - 1, key));
+		const u8* storage = entry->storage;
+		std::vector<u8> original(storage, storage + entry->allocationBytes);
+		for (u32 frame = 0; frame < 20; ++frame) {
+			meshCacheGpuIdle();
+			matrix[0][3] += 0.0625f;
+			matrix[1][0] -= 0.03125f;
+			matrix[2][3] = frame % 3 == 0 ? 0.0f : 0.5f; // Projective division and zero-q handling.
+			GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
+			matrix[1][3] += 0.125f;
+			GXLoadTexMtxImm(matrix, GX_TEXMTX1, GX_MTX3x4);
+			sState.positionMatrices[9][0][3] += 1;
+			compareList(list.data(), list.size());
+			assert(sTimings.decodedVertices == decoded + 3);
+			assert(entry->storage == storage && !memcmp(storage, original.data(), original.size()));
+			assert(entry->gpuEpoch == sMeshCacheEpoch); // Persistent indices remain GPU-pinned.
+		}
+		// Real source edits still require conversion, even after a matrix-only hit.
+		if (source == GX_TG_NRM) normals[1][0] += 0.5f;
+		else positions[1][0] += 0.5f;
+		compareList(list.data(), list.size());
+		assert(sTimings.decodedVertices == decoded + 6);
+		assert(!memcmp(storage, original.data(), original.size()));
+		clearMeshCache(); checkMeshCacheTags();
+	}
+	printf("Animated projection/reflection: %llu initial conversions across 16 variants; %llu UV refresh draws without geometry rebuilds\n",
+	       (unsigned long long)conversions, (unsigned long long)(sTimings.texCoordRefreshes - refreshes));
+	// Auxiliary UV inputs must not turn a previously supported large mesh
+	// into a per-primitive fallback merely because they exceed the GU list.
+	clearMeshCache(); resetState(); resetDraws();
+	f32 positions[][3] = {{1,2,3},{4,5,6},{7,8,9}};
+	GXSetVtxDesc(GX_VA_PNMTXIDX, GX_DIRECT);
+	GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GXSetArray(GX_VA_POS, positions, sizeof(positions[0]));
+	std::vector<u8> large = {GX_TRIANGLES, u8(30000 >> 8), u8(30000)};
+	for (u32 i = 0; i < 30000; ++i) large.insert(large.end(), {u8((i & 1) * 3), u8(i % 3)});
+	Mtx matrix = {{0.5f,0,0,0.5f},{0,0.5f,0,0.5f},{0,0,0,1}};
+	GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
+	GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX2X4, GX_TG_POS, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+	assert(drawMeshList(large.data(), large.data() + large.size()));
+	MeshCacheKey key; meshCacheKey(key);
+	auto* entry = findCachedMesh(large.data(), large.size(), key);
+	assert(entry && !entry->hasTexCoordInputs && entry->vertexCount == 30000);
+	matrix[0][3] += 1;
+	GXLoadTexMtxImm(matrix, GX_TEXMTX0, GX_MTX3x4);
+	meshCacheKey(key);
+	assert(!findCachedMesh(large.data(), large.size(), key)); // Full validation remains for this path.
+	checkMeshCacheTags(); clearMeshCache();
 }
 
 void movieFrame()
@@ -668,12 +771,18 @@ extern "C" void sceGuSendCommandi(int command, int argument)
 		// cache, verifying that both encoded addresses select the same entry.
 		const void* vertices = nullptr;
 		const u16* indices = nullptr;
+		u64 latestUse = 0;
 		for (auto& set : sMeshCache) for (auto& entry : set) {
 			if (!entry.storage) continue;
 			auto* v = entry.storage + kMeshCacheDataOffset;
 			auto* i = reinterpret_cast<u16*>(v + entry.vertexCount * entry.vertexSize);
 			if ((reinterpret_cast<uintptr_t>(v) & 0xfffffff) == vertexAddress
-			    && (reinterpret_cast<uintptr_t>(i) & 0xfffffff) == indexAddress) {
+			    && (reinterpret_cast<uintptr_t>(i) & 0xfffffff) == indexAddress
+			    && entry.lastUse > latestUse) {
+				// ASan puts different allocation sizes in separate 64-bit address
+				// regions whose low GE address bits can alias. The current lookup
+				// has the newest use serial; PSP addresses have no such ambiguity.
+				latestUse = entry.lastUse;
 				assert(entry.gpuEpoch == sMeshCacheEpoch);
 				vertices = v; indices = i;
 			}
@@ -1163,6 +1272,7 @@ void sampledMeshTiming()
 
 int main(int argc, char** argv)
 {
+	setvbuf(stdout, nullptr, _IOLBF, 0);
 	deferredModelMatrices();
 	sampledMeshTiming();
 	titleMenuPictureAlpha();
@@ -1218,6 +1328,7 @@ int main(int argc, char** argv)
 	revisionedMeshes();
 	animatedCachedMeshes();
 	meshMaterialVariants();
+	animatedTexCoordMeshes();
 	movieFrame();
 	particleColours();
 	for (int i = 1; i < argc; ++i) modelTest(argv[i]);
