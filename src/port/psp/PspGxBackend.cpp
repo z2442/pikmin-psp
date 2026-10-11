@@ -50,7 +50,7 @@ struct GuRasterState {
 	u32 textureFunction[2], textureEnvironment[1];
 };
 
-struct MaterialStage { u8 colour[4], op, bias, scale, output, texCoord, texMap, channel; bool ordered; };
+struct MaterialStage { u8 colour[4], op, bias, scale, output, texCoord, channel; u16 texMap; bool ordered; };
 struct MaterialTexGen { GXTexGenType type; GXTexGenSrc source; u32 matrix; };
 struct MaterialTexture { GXTexObjPriv object; bool valid; };
 

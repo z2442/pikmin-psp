@@ -1331,7 +1331,7 @@ void nativeMaterialPasses()
 		assert(drawCalls == 3 && triangles[3].u == uv1[0][0]*0.5f+secondMatrix[0][3]);
 		assert(sTimings.decodedVertices == decoded);
 	}
-	recordingTextureReads = false; sceGuSync(GU_SYNC_FINISH,GU_SYNC_WHAT_DONE);
+	sceGuSync(GU_SYNC_FINISH,GU_SYNC_WHAT_DONE); recordingTextureReads = false;
 	// Transparent geometry must retain its comparison and disable depth writes.
 	GXSetZMode(GX_TRUE,GX_LEQUAL,GX_FALSE);
 	GXSetChanMatColor(GX_COLOR0A0,(GXColor){200,100,50,128});
@@ -1344,6 +1344,25 @@ void nativeMaterialPasses()
 	resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 1);
 	GXSetTevOp(GX_TEVSTAGE1,GX_BLEND);
 	GXSetNumTevStages(2); assert(secondaryTexturePass(sState.stages[1]) == MaterialWhiten);
+	resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 2);
+	GXSetTevColorIn(GX_TEVSTAGE1,GX_CC_ZERO,GX_CC_TEXC,GX_CC_CPREV,GX_CC_ZERO);
+	GXSetChanMatColor(GX_COLOR0A0,(GXColor){200,100,50,255});
+	resetDraws(); GXCallDisplayList(list,sizeof(list));
+	assert(drawCalls == 2 && materialDraws[1].pass == MaterialMultiply);
+	assert(materialDraws[1].raster.blend[1] == GU_DST_COLOR && materialDraws[1].raster.blend[2] == GU_FIX);
+	assert(materialDraws[1].raster.blend[4] == 0 && materialDraws[1].components == GU_TCC_RGB);
+	GXSetChanMatColor(GX_COLOR0A0,(GXColor){200,100,50,128});
+	resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 1);
+	GXSetTevOp(GX_TEVSTAGE1,GX_DECAL);
+	GXSetTevOrder(GX_TEVSTAGE1,GX_TEXCOORD1,GXTexMapID(GX_TEX_DISABLE|GX_TEXMAP1),GX_COLOR0A0);
+	resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 1);
+	GXSetTevOrder(GX_TEVSTAGE1,GX_TEXCOORD1,GX_TEXMAP1,GX_COLOR0A0);
+	GXTexObjPriv bad = {};
+	GXInitTexObj(reinterpret_cast<GXTexObj*>(&bad),nullptr,8,8,GX_TF_I8,GX_CLAMP,GX_CLAMP,GX_FALSE);
+	GXLoadTexObj(reinterpret_cast<GXTexObj*>(&bad),GX_TEXMAP1);
+	resetDraws(); GXCallDisplayList(list,sizeof(list));
+	assert(drawCalls == 1 && sBoundTexture == originalTexture && sState.textureEnabled && !sState.textureLoadFailed);
+	GXLoadTexObj(reinterpret_cast<GXTexObj*>(&objects[1]),GX_TEXMAP1);
 	resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 2);
 	GXSetNumTevStages(1); resetDraws(); GXCallDisplayList(list,sizeof(list)); assert(drawCalls == 1);
 	recordMaterials = false; clearMeshCache();
@@ -1448,7 +1467,7 @@ void pelletTextureLayers(const char* path)
 				memcpy(stage.colour,v+8,4); stage.op=v[12]; stage.bias=v[13]; stage.scale=v[14]; stage.output=v[16];
 				stage.texCoord=v[0]; stage.texMap=v[1]; stage.channel=v[2]; stage.ordered=true; stages.push_back(stage);
 			}
-			assert(r.read32() & MATFLAG_PVW); r.pos += 12; // Texture index, RGBA, TEV index.
+			assert(r.read32() & 1); r.pos += 12; // PVW flag, texture index, RGBA, TEV index.
 			r.pos += 12; u32 keys = r.read32(); r.pos += keys*40; keys = r.read32(); r.pos += keys*16;
 			r.pos += 24; // Lighting and PE state.
 			r.pos += 16; count = r.read32(); u32 matrix = GX_TEXMTX0;
@@ -1460,7 +1479,7 @@ void pelletTextureLayers(const char* path)
 			count = r.read32();
 			for (u32 i = 0; i < count; ++i) {
 				bindings.push_back(r.read32()); r.pos += 48;
-				for (u32 anim = 0; anim < 3; ++anim) { keys = r.read32(); r.pos += keys*16; }
+				for (u32 anim = 0; anim < 3; ++anim) { keys = r.read32(); r.pos += keys*40; }
 			}
 		}
 		r.pos = next;

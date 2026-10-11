@@ -939,8 +939,8 @@ texture environment and the animated REG0 color as the vertex color.
 register/selected konst result. This mapping follows the native blend formula
 in [PPSSPP's fragment generator](https://github.com/hrydgard/ppsspp/blob/master/GPU/Common/FragmentShaderGenerator.cpp).
 The authored REG0 alpha is retained (200 in the initial pellet materials),
-including fades and konst changes. The remaining reflection/highlight stages
-continue to use the backend's existing single-texture approximation.
+including fades and konst changes. The additional decal and reflection stages
+now use the native material passes described below.
 
 Cached mesh keys include the effective palette color/alpha, preserving separate
 red, yellow and blue variants without rebuilding every frame. Texture function
@@ -956,3 +956,43 @@ opacity at zero intensity, animated cached colors, konst alpha/fractions,
 unsupported final alpha equations and restoration of the ordinary texture path.
 Native/LTO sanitizer checks and the PSP game build pass; verify pellet color
 and opacity with the rebuilt EBOOT on hardware.
+
+### Secondary textures and shine
+
+The PSP backend retains eight GX sampler/texgen descriptions and the active
+TEV color recipes. Supported secondary stages draw the same cached mesh again
+with their own UV/color stream. This follows the extra-pass approach in the
+local OOT PSP renderer (`src/port/psp/gfx/gfx_fast3d.c`, `gfx_flush`) and its GU
+overlay depth/state handling (`gfx_scegu.c`). Texture conversion remains lazy:
+unused samplers do not consume cache storage or trigger uploads.
+
+Supported neutral ADD/PREV recipes are texture-alpha interpolation, additive
+texture color, opaque multiplication, and grayscale interpolation toward white.
+Pellets use the actual sampler order: sphere shading, IA number decal, and a
+normal-generated reflection texture. Normal-based coordinates follow the
+model's matrix slots; ordinary UVs now apply their authored texture matrices
+too. Mesh keys distinguish the selected UV array/matrix and effective pass
+color. Animated matrices refresh UVs without rebuilding cached geometry.
+
+Onion/Pikmin materials that add channel-1 specular color get a separate native
+additive pass. Its 256-by-8 intensity texture encodes light-7 attenuation, while
+normal matrices and the light's half-vector generate animated coordinates.
+Eight small lookup buffers (32 KiB total pixel storage) retain immutable curves
+until their queued GE draws finish. Diffuse material tint and specular material
+color are tracked independently.
+
+Overlays disable depth writes; opaque depth-writing surfaces use EQUAL, while
+transparent surfaces retain their comparison. They preserve framebuffer alpha
+and restore the main texture, blend, fog, alpha test and depth state afterward.
+This supports selected material recipes rather than arbitrary GX TEV programs;
+texture interpolation on translucent surfaces and fogged highlights remain
+approximations. Multiplication is restricted to opaque materials. Extra passes
+add GPU work, so `secondary_texture_draws` and `specular_draws` are captured in
+`performance.log` for hardware measurement.
+
+Native sanitizer checks cover independent UV arrays/selectors, texture-matrix
+animation, normal/bone highlight animation, queued texture lifetimes, pinned
+lookup curves and restoration of ordinary draws. Retail `white1.mod` through
+`white4.mod` replay their authored sampler/stage order across red/yellow/blue
+variants; steady frames require no geometry rebuilds or texture misses. Visual
+appearance and FPS still need confirmation with the rebuilt EBOOT on PSP.
