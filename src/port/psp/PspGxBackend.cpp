@@ -133,7 +133,7 @@ struct FrameTimings {
 	u64 meshMissAbsent, meshMissState, meshMissSource, meshStoreFailures, meshEvictions;
 	u64 texCoordRefreshes, texCoordRefreshVertices;
 	u64 meshKeyBuilds;
-	u64 compiledMeshCalls;
+	u64 compiledMeshDraws;
 	u32 pacingBypasses;
 	bool wroteHeader;
 };
@@ -225,7 +225,7 @@ void recordFrameTimings()
 #else
 				fputs("Build: standard (no LTO).\n", file);
 #endif
-				fputs("Mesh cache: live-state validation, compact lookup tags, rigid/skinned buffers and animated UV refresh. GPU: compiled mesh calls, batched cached-draw kicks, matrix reuse and swizzled textures. Audio: sampled detail timing, active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\nmesh_ms and cache_validate_ms are estimates: one in 16 list calls is timed, with duration scaled by 16 and the sampling phase rotated each frame. Frame/render/CPU times and geometry/cache counters remain exact.\n", file);
+				fputs("Mesh cache: live-state validation, compact lookup tags, rigid/skinned buffers and animated UV refresh. GPU: inline compiled mesh words, batched cached-draw kicks, matrix reuse and swizzled textures. Audio: sampled detail timing, active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\nmesh_ms and cache_validate_ms are estimates: one in 16 list calls is timed, with duration scaled by 16 and the sampling phase rotated each frame. Frame/render/CPU times and geometry/cache counters remain exact.\n", file);
 				fputs("audio_sequence_ms, audio_channels_ms, audio_stream_ms, audio_mix_ms and audio_movie_ms are estimates: one rotating tick per eight is timed. Audio work/lock/ME-wait and thread CPU times remain exact.\n", file);
 				fputs("Presentation: triple-buffered 480x272 RGBA8888; GPU completion before pacing, no extra refresh wait for late frames. Animated UV refresh copies geometry and generates coordinates in one pass.\n", file);
 			}
@@ -258,7 +258,7 @@ void recordFrameTimings()
 			fprintf(file, "  mesh_uv_refreshes=%.1f mesh_uv_vertices=%.1f\n",
 			        sTimings.texCoordRefreshes / 120.0, sTimings.texCoordRefreshVertices / 120.0);
 			fprintf(file, "  mesh_key_builds=%.1f\n", sTimings.meshKeyBuilds / 120.0);
-			fprintf(file, "  gpu_compiled_mesh_calls=%.1f\n", sTimings.compiledMeshCalls / 120.0);
+			fprintf(file, "  gpu_compiled_mesh_draws=%.1f\n", sTimings.compiledMeshDraws / 120.0);
 			fprintf(file, "  pacing_bypass_frames=%u\n", sTimings.pacingBypasses);
 			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
 			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
@@ -790,12 +790,16 @@ void submitVertices(const void* vertices, u32 count, int primitive, const u16* i
 	if (persistent && (sCachedDrawBatch++ & 15)) {
 		++sTimings.deferredCachedDraws;
 		if (commands && sState.transform3D) {
-			// The immutable geometry/address commands already live in pinned
-			// cache storage. Emit only BASE/CALL; RET resumes the parent list.
-			uintptr_t address = reinterpret_cast<uintptr_t>(commands);
-			sceGuSendCommandi(0x10, (address >> 8) & 0x000f0000);
-			sceGuSendCommandi(0x0a, address & 0x00ffffff);
-			++sTimings.compiledMeshCalls;
+			// Keep the precompiled addresses/format, but inline their words.
+			// GE CALL/RET saved CPU emissions while adding a GPU control-flow
+			// and RAM fetch dependency for every tiny mesh in the title.
+			sceGuSendCommandi(0x12, commands[0] & 0x00ffffff);
+			sceGuSendCommandi(0x10, commands[1] & 0x00ffffff);
+			sceGuSendCommandi(0x02, commands[2] & 0x00ffffff);
+			sceGuSendCommandi(0x10, commands[3] & 0x00ffffff);
+			sceGuSendCommandi(0x01, commands[4] & 0x00ffffff);
+			sceGuSendCommandi(0x04, commands[5] & 0x00ffffff);
+			++sTimings.compiledMeshDraws;
 		} else queueCachedDraw(vertices, count, primitive, indices, format);
 	} else {
 		if (!persistent) sCachedDrawBatch = 0;
@@ -1342,14 +1346,13 @@ void cacheMesh(const u8* list, u32 listBytes, const MeshCacheKey& key, const Mes
 	    | (vertexSize == sizeof(PspGxSkinnedVertex) ? GU_WEIGHT_32BITF | GU_WEIGHTS(8) : 0);
 	uintptr_t vertexAddress = reinterpret_cast<uintptr_t>(storage + kMeshCacheDataOffset);
 	uintptr_t indexAddress = vertexAddress + vertexCount * vertexSize;
-	// Same six words as queueCachedDraw, followed by a normal GE return.
+	// Same six words as queueCachedDraw, stored once and emitted inline.
 	commands[0] = 0x12000000 | format;
 	commands[1] = 0x10000000 | ((indexAddress >> 8) & 0x000f0000);
 	commands[2] = 0x02000000 | (indexAddress & 0x00ffffff);
 	commands[3] = 0x10000000 | ((vertexAddress >> 8) & 0x000f0000);
 	commands[4] = 0x01000000 | (vertexAddress & 0x00ffffff);
 	commands[5] = 0x04000000 | (GU_TRIANGLES << 16) | indexCount;
-	commands[6] = 0x0b000000;
 	sceKernelDcacheWritebackRange(storage + kMeshCacheDataOffset, meshCacheAlignedSize(nativeBytes) + kMeshCacheCommandBytes);
 	u8* snapshot = reinterpret_cast<u8*>(commands) + kMeshCacheCommandBytes;
 	if (snapshotListBytes) memcpy(snapshot, list, snapshotListBytes);

@@ -149,7 +149,7 @@ u32 compareList(const u8* input, u32 size)
 	if (sTimings.meshCacheHits && !expected.empty()) {
 		u64 hits = sTimings.meshCacheHits;
 		u64 refreshes = sTimings.texCoordRefreshes;
-		u64 compiled = sTimings.compiledMeshCalls;
+		u64 compiled = sTimings.compiledMeshDraws;
 		resetDraws();
 		for (u32 draw = 0; draw < 33; ++draw) {
 			triangles.clear();
@@ -159,7 +159,7 @@ u32 compareList(const u8* input, u32 size)
 		}
 		if (sTimings.meshCacheHits - hits == 33 && sTimings.texCoordRefreshes == refreshes) {
 			assert(deferredDrawCalls == 30);
-			assert(sTimings.compiledMeshCalls - compiled == (sState.transform3D ? 30 : 0));
+			assert(sTimings.compiledMeshDraws - compiled == (sState.transform3D ? 30 : 0));
 		}
 	}
 	checkMeshCacheTags();
@@ -493,9 +493,9 @@ void animatedTexCoordMeshes()
 			matrix[1][3] += 0.125f;
 			GXLoadTexMtxImm(matrix, GX_TEXMTX1, GX_MTX3x4);
 			sState.positionMatrices[9][0][3] += 1;
-			u64 compiled = sTimings.compiledMeshCalls;
+			u64 compiled = sTimings.compiledMeshDraws;
 			compareList(list.data(), list.size());
-			assert(sTimings.compiledMeshCalls == compiled); // Refreshed vertices are transient.
+			assert(sTimings.compiledMeshDraws == compiled); // Refreshed vertices are transient.
 			assert(sTimings.decodedVertices == decoded + 3);
 			assert(entry->storage == storage && !memcmp(storage, original.data(), original.size()));
 			assert(entry->gpuEpoch == sMeshCacheEpoch); // Persistent indices remain GPU-pinned.
@@ -816,25 +816,6 @@ extern "C" void sceGuSendCommandi(int command, int argument)
 	case 0x10: base = (argument & 0xf0000) << 8; break;
 	case 0x01: vertexAddress = base | (argument & 0xffffff); break;
 	case 0x02: indexAddress = base | (argument & 0xffffff); break;
-	case 0x0a: {
-		const u32 address = base | (argument & 0xffffff);
-		const u32* commands = nullptr;
-		u64 latestUse = 0;
-		for (auto& set : sMeshCache) for (auto& entry : set) {
-			if (!entry.storage || (reinterpret_cast<uintptr_t>(meshCacheCommands(entry)) & 0xfffffff) != address
-			    || entry.lastUse <= latestUse) continue;
-			assert(entry.gpuEpoch == sMeshCacheEpoch);
-			commands = meshCacheCommands(entry); latestUse = entry.lastUse;
-		}
-		assert(commands && !(reinterpret_cast<uintptr_t>(commands) & 63));
-		assert(commands[6] == 0x0b000000); // RET, not END/FINISH: parent must resume.
-		const u8 opcodes[] = {0x12,0x10,0x02,0x10,0x01,0x04};
-		for (u32 i = 0; i < 6; ++i) {
-			assert((commands[i] >> 24) == opcodes[i]);
-			sceGuSendCommandi(commands[i] >> 24, commands[i] & 0xffffff);
-		}
-		break;
-	}
 	case 0x04: {
 		// Host pointers are wider than GE addresses. Resolve through the live
 		// cache, verifying that both encoded addresses select the same entry.
@@ -1351,18 +1332,18 @@ void compiledMeshModeChanges()
 	u8 list[] = {GX_TRIANGLES,0,3,0,1,2};
 	compareList(list, sizeof(list));
 	// Native positions can be reused in 2D, but the compiled 3D command list
-	// must not be called. Exercise the original dynamic-format command path.
+	// must not be used. Exercise the original dynamic-format command path.
 	sState.transform3D = false;
 	recordGeometry = false; resetDraws();
-	u64 compiled = sTimings.compiledMeshCalls, hits = sTimings.meshCacheHits;
+	u64 compiled = sTimings.compiledMeshDraws, hits = sTimings.meshCacheHits;
 	for (u32 draw = 0; draw < 33; ++draw) assert(drawMeshList(list, list + sizeof(list)));
-	assert(sTimings.compiledMeshCalls == compiled && sTimings.meshCacheHits - hits == 33);
+	assert(sTimings.compiledMeshDraws == compiled && sTimings.meshCacheHits - hits == 33);
 	assert(drawCalls == 33 && deferredDrawCalls == 30);
 	recordGeometry = true;
 	sState.transform3D = true;
 	compareList(list, sizeof(list)); // Restoring 3D reuses the compiled list.
 	clearMeshCache();
-	puts("Compiled mesh CALL/RET, 2D mode changes, batch boundaries and transient UV submissions checks passed");
+	puts("Inline compiled mesh words, 2D mode changes, batch boundaries and transient UV submissions checks passed");
 }
 
 void liveMeshStateValidation()

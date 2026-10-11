@@ -694,9 +694,9 @@ key builds after warmup. Its windows include transitions between scenes, so
 their FPS cannot be treated as a like-for-like steady-title comparison. They
 still show substantial main-thread rendering and audio CPU costs.
 
-Each cached mesh now stores its six immutable GE draw words and a RET in an
-aligned 64-byte block alongside its vertices/indices. Deferred 3D submissions
-emit BASE/CALL instead of regenerating all six words. The first and every
+The previous build stored six immutable GE draw words and a RET in an
+aligned 64-byte block alongside each mesh's vertices/indices. Deferred 3D submissions
+emitted BASE/CALL instead of regenerating all six words. The first and every
 sixteenth cached submission still use the SDK draw to publish pending work.
 Matrices and raster state are applied in the parent list before the call.
 The command block shares the geometry's lifetime, GPU pinning and 4 MiB budget;
@@ -720,3 +720,46 @@ waits and thread CPU measurements remain exact. Native timing checks verify
 the clock-read reduction, weighted accounting, phase coverage and wraparound.
 Renderer and audio checks pass with LTO; actual FPS and audio playback still
 need a PSP capture using this EBOOT.
+
+### Late-frame presentation and streaming UV refresh
+
+The latest title window reports 13.36 FPS, 32.23 ms main-thread CPU, 25.92 ms
+audio-thread CPU, 12.44 ms of final GPU wait and 8.14 ms in retrace pacing.
+Later gameplay windows report roughly 35 ms of mesh work with 118 UV refresh
+draws and 18,009 refreshed vertices per frame. Lower main-thread CPU time alone
+has not established a comparable FPS improvement.
+
+Cached draw words now emit inline through the original six-command path.
+This retains precomputed formats/addresses while removing per-mesh GE CALL/RET
+and its additional command-buffer fetch. `gpu_compiled_mesh_draws` replaces
+the former `gpu_compiled_mesh_calls` counter; it counts reuse of precompiled
+words, not GPU subroutine calls.
+
+Presentation now completes the GPU list before deciding whether a refresh
+wait remains necessary. Frames that have already passed their target refresh
+interval still dispatch retrace callbacks and can queue their display swap
+without waiting for another blank. Fast frames retain the requested 60/30 FPS
+refresh interval. Three RGBA8888 color buffers and one 16-bit depth buffer use
+1,949,696 of the PSP's 2,097,152 VRAM bytes. The spare buffer lets a new frame
+start while the just-finished frame is pending NEXTFRAME scanout. At least one
+refresh passes between swaps before a previously displayed buffer is recycled.
+Color format, resolution, geometry and material behavior are preserved.
+
+`pacing_bypass_frames` counts frames that needed no additional refresh wait
+in each 120-frame window. Native checks run the production presentation path
+with simulated CPU/GPU refreshes, checking completion/pacing/swap/clear order
+and forbidding writes to both the visible and pending display buffers. Separate
+retrace checks cover 60/30 FPS targets, missed targets, zero intervals, callbacks
+and counter wraparound. A previous pacing wait could overlap GPU work, so its
+elimination is not necessarily an equal reduction in total frame time.
+
+Animated UV refresh now copies geometry/weights and calculates coordinates in
+one streaming pass instead of copying the whole vertex buffer and revisiting
+it to overwrite UVs. Uniform/per-vertex and rigid/skinned paths select their
+matrix work once per draw. Reflection matrices with constant q=1 avoid two
+unnecessary divisions per vertex; other projective matrices keep the original
+division and rounding. Native checks compare all output bytes for 1,120 vertices
+across projective thresholds, identity/invalid selectors, weights and constant
+denominators, in addition to the existing animated-model tests. Ordinary and
+LTO renderer checks preserve the real opening/logo, Olimar and ship geometry.
+Measure the rebuilt EBOOT on PSP to establish FPS, scanout and playback behavior.
