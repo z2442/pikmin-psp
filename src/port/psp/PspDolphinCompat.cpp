@@ -3,6 +3,7 @@
 #include "Dolphin/pad.h"
 #include "Dolphin/vi.h"
 #include "port/psp/PspPerformance.h"
+#include "port/psp/PspPlatform.h"
 
 #include <pspdisplay.h>
 
@@ -16,6 +17,12 @@ const u32 kAramSize = 0x00800000;
 u8* sAram;
 VIRetraceCallback sPreRetrace;
 VIRetraceCallback sPostRetrace;
+
+void dispatchRetrace(u32 count)
+{
+	if (sPreRetrace) sPreRetrace(count);
+	if (sPostRetrace) sPostRetrace(count);
+}
 
 u8* aramAddress(u32 address, u32 length)
 {
@@ -97,9 +104,24 @@ void VIWaitForRetrace(void)
 {
 	PikminPsp::PerformanceScope timing(PikminPsp::PerformancePacing);
 	sceDisplayWaitVblankStart();
-	u32 retraceCount = VIGetRetraceCount();
-	if (sPreRetrace) sPreRetrace(retraceCount);
-	if (sPostRetrace) sPostRetrace(retraceCount);
+	dispatchRetrace(VIGetRetraceCount());
 }
 
 } // extern "C"
+
+namespace PikminPsp {
+u32 waitForFrameRetrace(u32 previousRetrace, u32 refreshes)
+{
+	// At least one refresh must pass between swaps: NEXTFRAME must latch
+	// before the following swap can recycle its formerly displayed buffer.
+	if (!refreshes) refreshes = 1;
+	u32 waits = 0;
+	while ((u32)(VIGetRetraceCount() - previousRetrace) < refreshes) {
+		VIWaitForRetrace();
+		++waits;
+	}
+	// Slow frames still service DVD/loading callbacks, without adding a wait.
+	if (!waits) dispatchRetrace(VIGetRetraceCount());
+	return waits;
+}
+}

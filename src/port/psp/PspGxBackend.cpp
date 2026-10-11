@@ -134,6 +134,7 @@ struct FrameTimings {
 	u64 texCoordRefreshes, texCoordRefreshVertices;
 	u64 meshKeyBuilds;
 	u64 compiledMeshCalls;
+	u32 pacingBypasses;
 	bool wroteHeader;
 };
 FrameTimings sTimings;
@@ -226,6 +227,7 @@ void recordFrameTimings()
 #endif
 				fputs("Mesh cache: live-state validation, compact lookup tags, rigid/skinned buffers and animated UV refresh. GPU: compiled mesh calls, batched cached-draw kicks, matrix reuse and swizzled textures. Audio: sampled detail timing, active-voice jobs and ME idle backoff.\nAverages over 120 frames. CPU columns are thread runtime; other times are overlapping wall-time scopes, not additive. Render includes mesh and texture work. Audio work includes lock/ME waits, excludes hardware output wait. submitted_indices includes reused vertices.\nmesh_ms and cache_validate_ms are estimates: one in 16 list calls is timed, with duration scaled by 16 and the sampling phase rotated each frame. Frame/render/CPU times and geometry/cache counters remain exact.\n", file);
 				fputs("audio_sequence_ms, audio_channels_ms, audio_stream_ms, audio_mix_ms and audio_movie_ms are estimates: one rotating tick per eight is timed. Audio work/lock/ME-wait and thread CPU times remain exact.\n", file);
+				fputs("Presentation: triple-buffered 480x272 RGBA8888; GPU completion before pacing, no extra refresh wait for late frames. Animated UV refresh copies geometry and generates coordinates in one pass.\n", file);
 			}
 			fprintf(file, "frame=%u fps=%.2f frame_ms=%.2f present_wait_ms=%.2f list_wait_ms=%.2f copy_ms=%.2f draws=%.1f submitted_indices=%.1f copies=%.1f splits=%.1f\n",
 			        (unsigned)sDebugFrameCount, elapsed ? 120000000.0 / elapsed : 0.0, elapsed / 120000.0,
@@ -257,6 +259,7 @@ void recordFrameTimings()
 			        sTimings.texCoordRefreshes / 120.0, sTimings.texCoordRefreshVertices / 120.0);
 			fprintf(file, "  mesh_key_builds=%.1f\n", sTimings.meshKeyBuilds / 120.0);
 			fprintf(file, "  gpu_compiled_mesh_calls=%.1f\n", sTimings.compiledMeshCalls / 120.0);
+			fprintf(file, "  pacing_bypass_frames=%u\n", sTimings.pacingBypasses);
 			fprintf(file, "  movie_decode_ms=%.2f movie_convert_ms=%.2f movie_publish_ms=%.2f\n",
 			        metrics[PikminPsp::PerformanceMovieDecode] / 120000.0,
 			        metrics[PikminPsp::PerformanceMovieConvert] / 120000.0,
@@ -280,6 +283,19 @@ const int kBufferWidth  = 512;
 const int kScreenWidth  = 480;
 const int kScreenHeight = 272;
 const int kFrameBytes   = kBufferWidth * kScreenHeight * 4;
+const int kDepthBytes   = kBufferWidth * kScreenHeight * 2;
+static_assert(kFrameBytes * 3 + kDepthBytes <= 2 * 1024 * 1024, "PSP color/depth buffers must fit in 2 MiB VRAM");
+void* sSpareFrameBuffer;
+u32 sPresentationRetrace;
+u32 sPresentationInterval = 1;
+
+void swapTripleBuffers(void** display, void** render)
+{
+	void* finished = *render;
+	*render = sSpareFrameBuffer;
+	sSpareFrameBuffer = *display;
+	*display = finished;
+}
 const u32 kTextureCacheLimit = 8 * 1024 * 1024;
 const u32 kDisplayListCommandReserve = 4096;
 
@@ -1048,6 +1064,69 @@ struct MeshCacheEntry {
 // can update UVs without decoding lists, rebuilding indices or replacing buffers.
 struct MeshTexCoordInput { f32 x, y, z; u32 matrix; };
 
+struct MeshUvTransform {
+	const f32* matrix;
+	bool projective;
+	void initialise(u32 selector) {
+		matrix = selector >= GX_TEXMTX0 && selector < GX_IDENTITY
+		    ? &sState.textureMatrices[(selector - GX_TEXMTX0) / 3][0][0] : nullptr;
+		projective = matrix && sState.texType == GX_TG_MTX3X4;
+		// Reflection matrices commonly have q=1. Preserve the existing
+		// division/rounding for all other projective matrices.
+		if (projective && matrix[8] == 0 && matrix[9] == 0 && matrix[10] == 0
+		    && (matrix[11] == 1 || fabsf(matrix[11]) <= 1e-8f)) projective = false;
+	}
+	void apply(PspGxVertex& out, const MeshTexCoordInput& in) const {
+		const f32* m = matrix;
+		out.u = m[0]*in.x + m[1]*in.y + m[2]*in.z + m[3];
+		out.v = m[4]*in.x + m[5]*in.y + m[6]*in.z + m[7];
+		if (projective) {
+			f32 q = m[8]*in.x + m[9]*in.y + m[10]*in.z + m[11];
+			if (fabsf(q) > 1e-8f) { out.u /= q; out.v /= q; }
+		}
+	}
+};
+
+template <bool Skinned, bool Selected>
+void refreshMeshTexCoords(u8* output, const u8* stored, const MeshTexCoordInput* inputs, u32 count)
+{
+	MeshUvTransform uniform, transforms[10];
+	if (Selected) for (u32 i = 0; i < 10; ++i) transforms[i].initialise(GX_TEXMTX0 + i * 3);
+	else uniform.initialise(sState.texMatrix);
+	const u32 vertexSize = Skinned ? sizeof(PspGxSkinnedVertex) : sizeof(PspGxVertex);
+	for (u32 i = 0; i < count; ++i, output += vertexSize, stored += vertexSize) {
+		u32 offset = 0;
+		if (Skinned) {
+			memcpy(output, stored, sizeof(PspGxSkinnedVertex::weights));
+			offset = offsetof(PspGxSkinnedVertex, vertex);
+		}
+		auto& out = *reinterpret_cast<PspGxVertex*>(output + offset);
+		const auto& source = *reinterpret_cast<const PspGxVertex*>(stored + offset);
+		// Copy geometry/weights and generate UVs in a single streaming pass.
+		out.colour = source.colour;
+		out.x = source.x; out.y = source.y; out.z = source.z;
+		const MeshUvTransform* transform = nullptr;
+		u32 selector = inputs[i].matrix;
+		if (Selected) {
+			if (selector >= GX_TEXMTX0 && selector < GX_IDENTITY) transform = &transforms[(selector - GX_TEXMTX0) / 3];
+		} else if (selector == sState.texMatrix && uniform.matrix) transform = &uniform;
+		if (transform) transform->apply(out, inputs[i]);
+		else { out.u = source.u; out.v = source.v; }
+	}
+}
+
+void refreshMeshVertices(u8* output, const u8* stored, const MeshTexCoordInput* inputs, u32 count, bool skinned)
+{
+	const bool selected = sState.attributes[GX_VA_TEX0MTXIDX].source != GX_NONE;
+	if (skinned) {
+		if (selected) refreshMeshTexCoords<true, true>(output, stored, inputs, count);
+		else refreshMeshTexCoords<true, false>(output, stored, inputs, count);
+	} else {
+		if (selected) refreshMeshTexCoords<false, true>(output, stored, inputs, count);
+		else refreshMeshTexCoords<false, false>(output, stored, inputs, count);
+	}
+}
+
 const u32 kMeshCacheLimit = 4 * 1024 * 1024;
 const u32 kMeshCacheDataOffset = (sizeof(MeshCacheKey) + 63) & ~63U;
 const u32 kMeshCacheCommandBytes = 64;
@@ -1311,15 +1390,10 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 			u16* indices = reinterpret_cast<u16*>(storedVertices + vertexBytes);
 			if (refresh) {
 				vertices = static_cast<u8*>(sceGuGetMemory(vertexBytes));
-				memcpy(vertices, storedVertices, vertexBytes);
 				const u32 inputOffset = (vertexBytes + cached->indexCount * sizeof(u16) + 3) & ~3U;
 				const auto* inputs = reinterpret_cast<const MeshTexCoordInput*>(storedVertices + inputOffset);
-				u8* vertex = vertices + (cached->vertexSize == sizeof(PspGxSkinnedVertex)
-				    ? offsetof(PspGxSkinnedVertex, vertex) : 0);
-				for (u32 i = 0; i < cached->vertexCount; ++i, vertex += cached->vertexSize) {
-					generateTexCoord(*reinterpret_cast<PspGxVertex*>(vertex), inputs[i].x, inputs[i].y, inputs[i].z,
-					                 sState.texSource, inputs[i].matrix);
-				}
+				refreshMeshVertices(vertices, storedVertices, inputs, cached->vertexCount,
+				                    cached->vertexSize == sizeof(PspGxSkinnedVertex));
 				++sTimings.texCoordRefreshes;
 				sTimings.texCoordRefreshVertices += cached->vertexCount;
 			}
@@ -1453,6 +1527,8 @@ bool drawMeshList(const u8* input, const u8* end, bool useCache = true, u32 timi
 } // namespace
 
 namespace PikminPsp {
+void setPresentationInterval(u32 refreshes) { sPresentationInterval = refreshes ? refreshes : 1; }
+
 MeshValidationScope::MeshValidationScope() : previous(sMeshValidationScope), arrays{}, modelRevision(0) { sMeshValidationScope = this; }
 MeshValidationScope::~MeshValidationScope() { sMeshValidationScope = previous; }
 
@@ -1645,7 +1721,10 @@ GXFifoObj* GXInit(void*, u32)
 	sceGuStart(GU_DIRECT, sGxDisplayList);
 	sceGuDrawBuffer(GU_PSM_8888, (void*)0, kBufferWidth);
 	sceGuDispBuffer(kScreenWidth, kScreenHeight, (void*)kFrameBytes, kBufferWidth);
-	sceGuDepthBuffer((void*)(kFrameBytes * 2), kBufferWidth);
+	sceGuDepthBuffer((void*)(kFrameBytes * 3), kBufferWidth);
+	sSpareFrameBuffer = (void*)(kFrameBytes * 2);
+	guSwapBuffersCallback(swapTripleBuffers);
+	guSwapBuffersBehaviour(PSP_DISPLAY_SETBUF_NEXTFRAME);
 	sceGuOffset(2048 - kScreenWidth / 2, 2048 - kScreenHeight / 2);
 	sceGuViewport(2048, 2048, kScreenWidth, kScreenHeight);
 	sceGuDepthRange(65535, 0);
@@ -1669,6 +1748,8 @@ GXFifoObj* GXInit(void*, u32)
 	sceGuDisplay(GU_TRUE);
 	void* displayBuffer = reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(sceGeEdramGetAddr()) | 0x40000000U) + kFrameBytes);
 	sceDisplaySetFrameBuf(displayBuffer, kBufferWidth, GU_PSM_8888, PSP_DISPLAY_SETBUF_NEXTFRAME);
+	sPresentationRetrace = sceDisplayGetVcount();
+	sPresentationInterval = 1;
 	sceGuStart(GU_DIRECT, sGxDisplayList);
 	sState.guInitialised = true;
 	sState.listOpen = true;
@@ -1843,7 +1924,9 @@ void GXCopyDisp(void*, GXBool clear)
 	sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
 	meshCacheGpuIdle();
 	sTimings.presentWait += (u32)(sceKernelGetSystemTimeLow() - waitStart);
+	if (!PikminPsp::waitForFrameRetrace(sPresentationRetrace, sPresentationInterval)) ++sTimings.pacingBypasses;
 	sState.drawBufferOffset = reinterpret_cast<uintptr_t>(sceGuSwapBuffers());
+	sPresentationRetrace = sceDisplayGetVcount();
 	if (!sState.displayEnabled) {
 		sceGuDisplay(GU_TRUE);
 		sState.displayEnabled = true;

@@ -1,6 +1,7 @@
 // Native GU command recorder: verify the backend against the old per-vertex
 // transform, including the retail title lists when extracted data is present.
 #include "../src/port/psp/PspGxBackend.cpp"
+#include "../src/port/psp/PspDolphinCompat.cpp"
 namespace std { using ::sqrtf; }
 #include "../src/plugPikiYamashita/P2DPicture.cpp"
 
@@ -14,6 +15,9 @@ namespace std { using ::sqrtf; }
 
 namespace PikminPsp {
 void performanceAdd(PerformanceMetric, u32) {}
+u32 performanceCounter(PerformanceMetric) { return 0; }
+u32 performanceThreadMicroseconds(bool) { return 0; }
+bool resolvePath(char*, u32, const char*) { return false; }
 }
 
 namespace {
@@ -36,6 +40,21 @@ const void* moviePixels;
 int movieFormat, movieStride, movieWrapU, movieWrapV;
 u32 pictureResidentCalls;
 u32 meshClockReads;
+bool recordingPresentation;
+u32 displayVcount, vblankWaits, gpuRefreshes;
+void* visibleBuffer;
+void* pendingBuffer;
+void* sdkDisplayBuffer;
+void* sdkRenderBuffer;
+GuSwapBuffersCallback swapCallback;
+std::vector<int> presentationEvents;
+
+bool pendingSwap;
+void advanceScanout(u32 refreshes)
+{
+	displayVcount += refreshes;
+	if (refreshes && pendingSwap) { visibleBuffer = pendingBuffer; pendingSwap = false; }
+}
 
 void transform(PspGxVertex& vertex, const ScePspFMatrix4& matrix)
 {
@@ -679,9 +698,44 @@ unsigned int sceKernelGetSystemTimeLow(void) { ++meshClockReads; return 0; }
 void sceKernelDcacheWritebackRange(const void*, unsigned int) {}
 void* sceGuGetMemory(int size) { u32 start = used; used += (size + 15) & ~15U; assert(used <= sizeof(memory)); return memory + start; }
 int sceGuCheckList() { return used; }
-int sceGuFinish() { return 0; }
-int sceGuSync(int, int) { return 0; }
-int sceGuStart(int, void*) { used = 0; return 0; }
+int sceGuFinish() { if (recordingPresentation) presentationEvents.push_back(0); return 0; }
+int sceGuSync(int, int) {
+	if (recordingPresentation) { presentationEvents.push_back(1); advanceScanout(gpuRefreshes); }
+	return 0;
+}
+int sceGuStart(int, void*) {
+	used = 0;
+	if (recordingPresentation) {
+		presentationEvents.push_back(4);
+		assert(sdkRenderBuffer != visibleBuffer && (!pendingSwap || sdkRenderBuffer != pendingBuffer));
+	}
+	return 0;
+}
+unsigned int sceDisplayGetVcount() { return displayVcount; }
+int sceDisplayWaitVblankStart() {
+	++vblankWaits;
+	if (recordingPresentation) presentationEvents.push_back(2);
+	advanceScanout(1);
+	return 0;
+}
+void guSwapBuffersCallback(GuSwapBuffersCallback callback) { swapCallback = callback; }
+void* sceGuSwapBuffers() {
+	assert(recordingPresentation && swapCallback);
+	presentationEvents.push_back(3);
+	swapCallback(&sdkDisplayBuffer, &sdkRenderBuffer);
+	pendingBuffer = sdkDisplayBuffer; pendingSwap = true;
+	return sdkRenderBuffer;
+}
+int sceGuDisplay(int) { return 0; }
+void sceGuClearColor(unsigned int) {}
+void sceGuClearDepth(unsigned int) {}
+void sceGuClear(int) {
+	if (recordingPresentation) {
+		presentationEvents.push_back(5);
+		assert(sState.drawBufferOffset == reinterpret_cast<uintptr_t>(sdkRenderBuffer));
+		assert(sdkRenderBuffer != visibleBuffer && (!pendingSwap || sdkRenderBuffer != pendingBuffer));
+	}
+}
 void sceGuEnable(int state) { guEnabled[state] = true; ++rasterCalls; }
 void sceGuDisable(int state) { guEnabled[state] = false; ++rasterCalls; }
 void sceGuDepthMask(int mask) { guDepthMask = mask; ++rasterCalls; }
@@ -1382,9 +1436,92 @@ void liveMeshStateValidation()
 	printf("Live mesh validation: %u state mutations match canonical key comparisons; cached draws build no keys\n", checks);
 }
 
+void tripleBufferedPresentation()
+{
+	clearMeshCache(); resetState();
+	sState.listOpen = sState.displayEnabled = true;
+	sDebugFrameCount = 0; sTimings = {};
+	displayVcount = sPresentationRetrace = 100;
+	sdkRenderBuffer = nullptr;
+	visibleBuffer = sdkDisplayBuffer = reinterpret_cast<void*>(kFrameBytes);
+	sSpareFrameBuffer = reinterpret_cast<void*>(kFrameBytes * 2);
+	pendingSwap = false;
+	guSwapBuffersCallback(swapTripleBuffers);
+	recordingPresentation = true;
+	const u32 scenarios[][3] = {{0,0,1},{0,0,2},{5,0,1},{0,5,2},{1,0,2},{2,0,2},{0,0,0},{0,4,1},{4,0,2}};
+	for (const auto& scenario : scenarios) {
+		advanceScanout(scenario[0]);
+		gpuRefreshes = scenario[1];
+		PikminPsp::setPresentationInterval(scenario[2]);
+		u32 before = sPresentationRetrace, waitsBefore = vblankWaits;
+		u32 interval = scenario[2] ? scenario[2] : 1;
+		u32 elapsed = displayVcount - before + gpuRefreshes;
+		presentationEvents.clear();
+		void* completed = sdkRenderBuffer;
+		GXCopyDisp(nullptr, GX_TRUE);
+		assert(sdkDisplayBuffer == completed && sPresentationRetrace == displayVcount);
+		assert(vblankWaits - waitsBefore == (elapsed >= interval ? 0 : interval - elapsed));
+		assert(presentationEvents[0] == 0 && presentationEvents[1] == 1); // Finish/sync before pacing.
+		assert(presentationEvents[presentationEvents.size()-3] == 3);
+		assert(presentationEvents[presentationEvents.size()-2] == 4);
+		assert(presentationEvents.back() == 5); // Swap/start before clearing the spare buffer.
+		assert(sdkDisplayBuffer != sdkRenderBuffer && sSpareFrameBuffer != sdkRenderBuffer
+		    && sSpareFrameBuffer != sdkDisplayBuffer);
+	}
+	recordingPresentation = false;
+	guSwapBuffersCallback(nullptr);
+	sPresentationInterval = 1;
+	puts("Triple-buffered presentation: GPU completion before pacing, no extra wait on late frames, and safe pending scanout checks passed");
+}
+
+void streamingUvRefresh()
+{
+	u32 comparisons = 0;
+	for (bool skinned : {false, true}) for (bool selected : {false, true})
+	for (GXTexGenType type : {GX_TG_MTX2X4, GX_TG_MTX3X4}) for (bool constantQ : {false, true})
+	for (f32 q : {0.0f, -0.0f, 1e-9f, -1e-8f, 1e-8f, 1.0f, 1.000001f, 0.999999f, 2.0f, -2.0f}) {
+		resetState();
+		GXSetTexCoordGen2(GX_TEXCOORD0, type, GX_TG_NRM, GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
+		GXSetVtxDesc(GX_VA_TEX0MTXIDX, selected ? GX_DIRECT : GX_NONE);
+		for (u32 i = 0; i < 10; ++i) {
+			Mtx matrix = {{0.5f,0.25f,-0.5f,0.5f},{-0.25f,0.5f,0.25f,-0.5f},{0,0,0,q}};
+			if (!constantQ) { matrix[2][0] = 0.25f; matrix[2][1] = -0.5f; }
+			matrix[0][3] += i * 0.0625f;
+			GXLoadTexMtxImm(matrix, GX_TEXMTX0 + i * 3, GX_MTX3x4);
+		}
+		const u32 count = 7, stride = skinned ? sizeof(PspGxSkinnedVertex) : sizeof(PspGxVertex);
+		std::vector<u8> source(count * stride), expected(count * stride), actual(count * stride);
+		MeshTexCoordInput inputs[count];
+		for (u32 i = 0; i < count; ++i) {
+			u32 offset = skinned ? offsetof(PspGxSkinnedVertex, vertex) : 0;
+			if (skinned) {
+				auto* v = reinterpret_cast<PspGxSkinnedVertex*>(source.data() + i * stride);
+				for (u32 b = 0; b < 8; ++b) v->weights[b] = b == i ? 1 : 0;
+			}
+			auto* v = reinterpret_cast<PspGxVertex*>(source.data() + i * stride + offset);
+			*v = {0.125f,-0.25f,0xff405060 + i,f32(i),f32(i+1),f32(i+2)};
+			inputs[i] = {f32(i)*0.5f, f32(i)*-0.25f, f32(i)*0.125f,
+			    selected ? u32(GX_TEXMTX0) + i * 4 : u32(GX_TEXMTX0)};
+			if (i == 5) inputs[i].matrix = GX_IDENTITY;
+			if (i == 6) inputs[i].matrix = 29;
+		}
+		memcpy(expected.data(), source.data(), source.size());
+		for (u32 i = 0; i < count; ++i) {
+			auto* v = reinterpret_cast<PspGxVertex*>(expected.data() + i * stride + (skinned ? offsetof(PspGxSkinnedVertex, vertex) : 0));
+			generateTexCoord(*v, inputs[i].x, inputs[i].y, inputs[i].z, GX_TG_NRM, inputs[i].matrix);
+		}
+		refreshMeshVertices(actual.data(), source.data(), inputs, count, skinned);
+		assert(!memcmp(expected.data(), actual.data(), actual.size()));
+		comparisons += count;
+	}
+	printf("Streaming UV refresh: %u vertices bit-identical to copy-plus-generation, including projective thresholds, weights and identity selectors\n", comparisons);
+}
+
 int main(int argc, char** argv)
 {
 	setvbuf(stdout, nullptr, _IOLBF, 0);
+	tripleBufferedPresentation();
+	streamingUvRefresh();
 	deferredModelMatrices();
 	sampledMeshTiming();
 	compiledMeshModeChanges();

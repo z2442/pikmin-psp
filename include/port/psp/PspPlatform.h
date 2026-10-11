@@ -24,6 +24,11 @@ const char* executableRoot();
 bool resolvePath(char* output, u32 outputSize, const char* relativePath);
 bool dataReady();
 
+// Presentation uses three color buffers. A missed frame need not wait for
+// another vblank, but a fast frame must let the prior display swap latch.
+void setPresentationInterval(u32 refreshes);
+u32 waitForFrameRetrace(u32 previousRetrace, u32 refreshes);
+
 } // namespace PikminPsp
 
 #endif

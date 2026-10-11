@@ -8,6 +8,7 @@
 #if defined(PLATFORM_PSP)
 #include "port/psp/PspPerformance.h"
 #include "port/psp/PspGxMeshCache.h"
+#include "port/psp/PspPlatform.h"
 static u32 sPspRenderStart;
 #endif
 
@@ -558,7 +559,13 @@ void DGXGraphics::doneRender()
  */
 void DGXGraphics::waitRetrace()
 {
+#if defined(PLATFORM_PSP)
+	// Pace after the GE finishes, using refreshes that passed during render
+	// and GPU work. Triple buffering protects pending scanout on slow frames.
+	PikminPsp::setPresentationInterval(mSystemFrameRate);
+#else
 	waitPostRetrace();
+#endif
 	if (sFirstFrame) {
 		sFirstFrame--;
 		if (sFirstFrame == 0) {
@@ -570,7 +577,9 @@ void DGXGraphics::waitRetrace()
 		}
 	}
 	VIFlush();
+#if !defined(PLATFORM_PSP)
 	VIWaitForRetrace();
+#endif
 	GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 
 	bool set = (gsys->mIsLoadScreenActive || gsys->mSoftResetPending) ? false : true;
